@@ -4,3 +4,6 @@
 if(WASMEDGE_USE_LLVM)
   add_subdirectory(blake3)
 endif()
+if(WASMEDGE_BUILD_IR_JIT)
+  add_subdirectory(ir)
+endif()

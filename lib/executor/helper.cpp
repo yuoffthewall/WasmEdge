@@ -7,6 +7,10 @@
 #include "system/fault.h"
 #include "system/stacktrace.h"
 
+#ifdef WASMEDGE_BUILD_IR_JIT
+#include "vm/ir_jit_engine.h"
+#endif
+
 #include <cstdint>
 #include <utility>
 #include <vector>
@@ -205,7 +209,109 @@ Executor::enterFunction(Runtime::StackManager &StackMgr,
     // For compiled function case, the continuation will be the continuation
     // from the popped frame.
     return StackMgr.popFrame();
-  } else {
+  }
+#ifdef WASMEDGE_BUILD_IR_JIT
+  else if (Func.isIRJitFunction()) {
+    // IR JIT compiled function case: Execute the JIT compiled code.
+
+    // Push frame.
+    StackMgr.pushFrame(Func.getModule(), // Module instance
+                       RetIt,            // Return PC
+                       ArgsN,            // Only args, no locals in stack
+                       RetsN,            // Returns num
+                       IsTailCall        // For tail-call
+    );
+
+    // Prepare arguments and returns.
+    Span<ValVariant> Args = StackMgr.getTopSpan(ArgsN);
+    std::vector<ValVariant> Rets(RetsN);
+
+    // Get module instance for runtime data
+    const auto *ModInst = Func.getModule();
+    
+    // Get function table (for call/call_indirect)
+    // Build function table from ModInst's function instances
+    static thread_local std::vector<void*> FuncTableStorage;
+    void **FuncTable = nullptr;
+    uint32_t FuncTableSize = 0;
+    
+    if (ModInst) {
+      auto FuncInsts = ModInst->getFunctionInstances();
+      FuncTableSize = static_cast<uint32_t>(FuncInsts.size());
+      
+      if (FuncTableSize > 0) {
+        FuncTableStorage.resize(FuncTableSize);
+        
+        for (uint32_t I = 0; I < FuncTableSize; ++I) {
+          const auto *Func = FuncInsts[I];
+          if (Func->isIRJitFunction()) {
+            // IR JIT compiled function - use native pointer
+            FuncTableStorage[I] = Func->getIRJitNativeFunc();
+          } else if (Func->isCompiledFunction()) {
+            // AOT compiled function - use symbol
+            FuncTableStorage[I] = Func->getSymbol().get();
+          } else {
+            // Interpreter or host function - set to nullptr
+            // These require special handling via trampoline (future work)
+            FuncTableStorage[I] = nullptr;
+          }
+        }
+        FuncTable = FuncTableStorage.data();
+      }
+    }
+    
+    // Get globals base (for global.get/set)
+    // Build array of pointers to global values
+    static thread_local std::vector<ValVariant*> GlobalPtrStorage;
+    void *GlobalBase = nullptr;
+    if (ModInst) {
+      auto GlobInsts = ModInst->getGlobalInstances();
+      if (!GlobInsts.empty()) {
+        GlobalPtrStorage.resize(GlobInsts.size());
+        for (size_t I = 0; I < GlobInsts.size(); ++I) {
+          GlobalPtrStorage[I] = const_cast<ValVariant*>(&GlobInsts[I]->getValue());
+        }
+        GlobalBase = reinterpret_cast<void*>(GlobalPtrStorage.data());
+      }
+    }
+    
+    // Get memory instance for memory operations
+    void *MemoryBase = nullptr;
+    uint32_t MemorySize = 0;
+    if (ModInst) {
+      auto MemInsts = ModInst->getMemoryInstances();
+      if (!MemInsts.empty() && MemInsts[0]) {
+        MemoryBase = MemInsts[0]->getDataPtr();
+        // getPageSize() returns number of pages, each page is 64KB
+        MemorySize = MemInsts[0]->getPageSize() * 
+                     static_cast<uint32_t>(Runtime::Instance::MemoryInstance::kPageSize);
+      }
+    }
+
+    // Get IR JIT engine (global instance - simplified for POC)
+    static VM::IRJitEngine IREngine;
+
+    // Invoke the JIT compiled function
+    auto Res = IREngine.invoke(Func.getIRJitNativeFunc(), FuncType, Args, Rets,
+                               FuncTable, FuncTableSize, GlobalBase,
+                               MemoryBase, MemorySize);
+
+    if (!Res) {
+      spdlog::error(Res.error());
+      return Unexpect(Res);
+    }
+
+    // Push returns back to stack.
+    for (uint32_t I = 0; I < Rets.size(); ++I) {
+      StackMgr.push(Rets[I]);
+    }
+
+    // For IR JIT function case, the continuation will be the continuation from
+    // the popped frame.
+    return StackMgr.popFrame();
+  }
+#endif
+  else {
     // Native function case: Jump to the start of the function body.
 
     // Push local variables into the stack.

@@ -6,6 +6,11 @@
 #include "common/errinfo.h"
 #include "common/spdlog.h"
 
+#ifdef WASMEDGE_BUILD_IR_JIT
+#include "vm/ir_builder.h"
+#include "vm/ir_jit_engine.h"
+#endif
+
 #include <cstdint>
 #include <string_view>
 
@@ -126,6 +131,78 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
   // Initialize memory instances
   EXPECTED_TRY(initMemory(StackMgr, DataSec)
                    .map_error(ReportError(ASTNodeAttr::Sec_Data)));
+
+#ifdef WASMEDGE_BUILD_IR_JIT
+  // IR JIT compilation: Compile instantiated functions to native code.
+  // This happens after all sections are instantiated but before start function.
+  {
+    static VM::IRJitEngine IREngine;
+    VM::WasmToIRBuilder IRBuilder;
+    
+    // Collect global types for global.get/set instructions
+    std::vector<ValType> GlobalTypes;
+    for (const auto *GlobInst : ModInst->getGlobalInstances()) {
+      GlobalTypes.push_back(GlobInst->getGlobalType().getValType());
+    }
+    
+    // Collect function types for call instructions
+    std::vector<const AST::FunctionType *> FuncTypes;
+    for (const auto *FuncInst : ModInst->getFunctionInstances()) {
+      FuncTypes.push_back(&FuncInst->getFuncType());
+    }
+    
+    // Get number of imported functions (skip these - they're not wasm functions)
+    uint32_t ImportFuncNum = 0;
+    for (const auto &ImpDesc : Mod.getImportSection().getContent()) {
+      if (ImpDesc.getExternalType() == ExternalType::Function) {
+        ImportFuncNum++;
+      }
+    }
+    
+    // Compile each defined (non-imported) wasm function
+    uint32_t FuncIdx = ImportFuncNum;
+    uint32_t SuccessCount = 0;
+    for (const auto &CodeSeg [[maybe_unused]] : CodeSec.getContent()) {
+      auto *FuncInst = ModInst->unsafeGetFunction(FuncIdx);
+      
+      if (FuncInst && FuncInst->isWasmFunction()) {
+        // Get function info
+        const AST::FunctionType &FuncType = FuncInst->getFuncType();
+        auto Locals = FuncInst->getLocals();
+        auto Instrs = FuncInst->getInstrs();
+        
+        // Build IR
+        IRBuilder.reset();
+        
+        if (auto InitRes = IRBuilder.initialize(FuncType, Locals);
+            InitRes.has_value()) {
+          // IMPORTANT: Set module context AFTER initialize() since initialize() calls reset()
+          IRBuilder.setModuleFunctions(FuncTypes);
+          IRBuilder.setModuleGlobals(GlobalTypes);
+          
+          // Create InstrView from instruction vector
+          std::vector<AST::Instruction> InstrVec(Instrs.begin(), Instrs.end());
+          
+          if (auto BuildRes = IRBuilder.buildFromInstructions(InstrVec);
+              BuildRes.has_value()) {
+            // Compile to native code
+            if (auto CompRes = IREngine.compile(IRBuilder.getIRContext());
+                CompRes.has_value()) {
+              // Upgrade function to IR JIT
+              FuncInst->upgradeToIRJit(CompRes->NativeFunc, CompRes->CodeSize,
+                                       nullptr);  // Don't preserve IR graph for now
+              SuccessCount++;
+            }
+          }
+        }
+      }
+      FuncIdx++;
+    }
+    
+    spdlog::info("IR JIT: Compiled {}/{} functions successfully", 
+                 SuccessCount, FuncIdx - ImportFuncNum);
+  }
+#endif
 
   // Instantiate StartSection (StartSec)
   const AST::StartSection &StartSec = Mod.getStartSection();

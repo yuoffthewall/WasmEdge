@@ -1,0 +1,1868 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2019-2024 Second State INC
+
+#include "vm/ir_builder.h"
+
+#ifdef WASMEDGE_BUILD_IR_JIT
+
+#include "ast/instruction.h"
+#include "ast/type.h"
+#include "common/errcode.h"
+
+// Include dstogov/ir headers
+extern "C" {
+#include "ir.h"
+#include "ir_builder.h"
+}
+
+#include <cassert>
+
+namespace WasmEdge {
+namespace VM {
+
+WasmToIRBuilder::WasmToIRBuilder() noexcept
+    : Initialized(false), CurrentPathTerminated(false), FuncTablePtr(0), FuncTableSize(0), GlobalBasePtr(0), MemoryBase(0), MemorySize(0), LocalCount(0) {}
+
+WasmToIRBuilder::~WasmToIRBuilder() noexcept { reset(); }
+
+void WasmToIRBuilder::reset() noexcept {
+  if (Initialized) {
+    ir_free(&Ctx);
+    Initialized = false;
+  }
+  CurrentPathTerminated = false;
+  ValueStack.clear();
+  Locals.clear();
+  LabelStack.clear();
+  FuncTablePtr = 0;
+  FuncTableSize = 0;
+  GlobalBasePtr = 0;
+  MemoryBase = 0;
+  MemorySize = 0;
+  LocalCount = 0;
+  ModuleFuncTypes.clear();
+  ModuleGlobalTypes.clear();
+}
+
+Expect<void> WasmToIRBuilder::initialize(
+    const AST::FunctionType &FuncType,
+    Span<const std::pair<uint32_t, ValType>> LocalVars) {
+  reset();
+
+  // Initialize IR context (like examples)
+  ir_init(&Ctx, IR_FUNCTION | IR_OPT_FOLDING, IR_CONSTS_LIMIT_MIN, IR_INSNS_LIMIT_MIN);
+  Initialized = true;
+
+  // Set return type
+  const auto &RetTypes = FuncType.getReturnTypes();
+  if (!RetTypes.empty()) {
+    Ctx.ret_type = wasmTypeToIRType(RetTypes[0]);
+  } else {
+    Ctx.ret_type = IR_VOID;
+  }
+
+  // Local variable for IR macros (they expect 'ctx')
+  ir_ctx *ctx = &Ctx;
+
+  // Start building IR function
+  ir_START();
+
+  // Set up function parameters as locals
+  const auto &ParamTypes = FuncType.getParamTypes();
+  
+  // Calculate total locals
+  LocalCount = ParamTypes.size();
+  for (const auto &[Count, Type] : LocalVars) {
+    LocalCount += Count;
+  }
+
+  // First parameter: function table pointer (for call instructions)
+  // This is a pointer to an array of function pointers
+  FuncTablePtr = ir_PARAM(IR_ADDR, "func_table", 1);
+  
+  // Second parameter: function table size (for call_indirect bounds checking)
+  FuncTableSize = ir_PARAM(IR_U32, "func_table_size", 2);
+  
+  // Third parameter: globals base pointer (for global.get/set)
+  // Points to an array of ValVariant (16 bytes each, using first 8 bytes for value)
+  GlobalBasePtr = ir_PARAM(IR_ADDR, "global_base", 3);
+  
+  // Fourth parameter: memory base pointer (implicit, passed by runtime)
+  // This is an IR_ADDR (pointer) type for linear memory access
+  MemoryBase = ir_PARAM(IR_ADDR, "mem_base", 4);
+  
+  // Create IR PARAMs for function arguments (starting at index 5)
+  uint32_t paramIdx = 5;  // Start after func_table, func_table_size, global_base, and mem_base
+  for (uint32_t i = 0; i < ParamTypes.size(); ++i) {
+    ir_type irType = wasmTypeToIRType(ParamTypes[i]);
+    Locals[i] = ir_PARAM(irType, "param", paramIdx);
+    paramIdx++;
+  }
+
+  // Initialize additional locals to zero
+  uint32_t localIdx = ParamTypes.size();
+  for (const auto &[Count, Type] : LocalVars) {
+    ir_type irType = wasmTypeToIRType(Type);
+    for (uint32_t i = 0; i < Count; ++i) {
+      // Initialize local to zero based on type
+      if (irType == IR_I32) {
+        Locals[localIdx++] = ir_CONST_I32(0);
+      } else if (irType == IR_I64) {
+        Locals[localIdx++] = ir_CONST_I64(0);
+      } else if (irType == IR_FLOAT) {
+        Locals[localIdx++] = ir_CONST_FLOAT(0.0f);
+      } else if (irType == IR_DOUBLE) {
+        Locals[localIdx++] = ir_CONST_DOUBLE(0.0);
+      } else {
+        Locals[localIdx++] = ir_CONST_I32(0);
+      }
+    }
+  }
+
+  // MemorySize is not passed as parameter for now
+  // Bounds checking would require additional parameter or global
+  MemorySize = IR_UNUSED;
+
+  return {};
+}
+
+Expect<void>
+WasmToIRBuilder::buildFromInstructions(Span<const AST::Instruction> Instrs) {
+  for (const auto &Instr : Instrs) {
+    auto Res = visitInstruction(Instr);
+    if (!Res) {
+      return Unexpect(Res);
+    }
+  }
+  return {};
+}
+
+ir_ref WasmToIRBuilder::pop() noexcept {
+  if (ValueStack.empty()) {
+    return IR_UNUSED;
+  }
+  ir_ref Val = ValueStack.back();
+  ValueStack.pop_back();
+  return Val;
+}
+
+ir_ref WasmToIRBuilder::peek(uint32_t Depth) const noexcept {
+  if (Depth >= ValueStack.size()) {
+    return IR_UNUSED;
+  }
+  return ValueStack[ValueStack.size() - 1 - Depth];
+}
+
+ir_type WasmToIRBuilder::wasmTypeToIRType(ValType Type) const noexcept {
+  // Get type code from ValType
+  auto Code = Type.getCode();
+  if (Code == TypeCode::I32) {
+    return IR_I32;
+  } else if (Code == TypeCode::I64) {
+    return IR_I64;
+  } else if (Code == TypeCode::F32) {
+    return IR_FLOAT;
+  } else if (Code == TypeCode::F64) {
+    return IR_DOUBLE;
+  } else {
+    return IR_ADDR; // Default to address type
+  }
+}
+
+Expect<void> WasmToIRBuilder::visitInstruction(const AST::Instruction &Instr) {
+  OpCode Op = Instr.getOpCode();
+
+  // Skip dead code - when path is terminated, only process control instructions
+  // that might restart the path (End, Else, Block, Loop, If)
+  if (CurrentPathTerminated) {
+    bool isControlRestart = (Op == OpCode::End || Op == OpCode::Else ||
+                             Op == OpCode::Block || Op == OpCode::Loop ||
+                             Op == OpCode::If);
+    if (!isControlRestart) {
+      return {};  // Skip dead code
+    }
+  }
+
+  // Dispatch based on instruction type
+  switch (Op) {
+  // Constants
+  case OpCode::I32__const:
+  case OpCode::I64__const:
+  case OpCode::F32__const:
+  case OpCode::F64__const:
+    return visitConst(Instr);
+
+  // Local operations
+  case OpCode::Local__get:
+  case OpCode::Local__set:
+  case OpCode::Local__tee:
+    return visitLocal(Instr);
+
+  // Global operations
+  case OpCode::Global__get:
+  case OpCode::Global__set:
+    return visitGlobal(Instr);
+
+  // Binary arithmetic operations - i32
+  case OpCode::I32__add:
+  case OpCode::I32__sub:
+  case OpCode::I32__mul:
+  case OpCode::I32__div_s:
+  case OpCode::I32__div_u:
+  case OpCode::I32__rem_s:
+  case OpCode::I32__rem_u:
+  case OpCode::I32__and:
+  case OpCode::I32__or:
+  case OpCode::I32__xor:
+  case OpCode::I32__shl:
+  case OpCode::I32__shr_s:
+  case OpCode::I32__shr_u:
+  case OpCode::I32__rotl:
+  case OpCode::I32__rotr:
+  // Binary arithmetic operations - i64
+  case OpCode::I64__add:
+  case OpCode::I64__sub:
+  case OpCode::I64__mul:
+  case OpCode::I64__div_s:
+  case OpCode::I64__div_u:
+  case OpCode::I64__rem_s:
+  case OpCode::I64__rem_u:
+  case OpCode::I64__and:
+  case OpCode::I64__or:
+  case OpCode::I64__xor:
+  case OpCode::I64__shl:
+  case OpCode::I64__shr_s:
+  case OpCode::I64__shr_u:
+  case OpCode::I64__rotl:
+  case OpCode::I64__rotr:
+  // Binary operations - f32/f64
+  case OpCode::F32__add:
+  case OpCode::F32__sub:
+  case OpCode::F32__mul:
+  case OpCode::F32__div:
+  case OpCode::F32__min:
+  case OpCode::F32__max:
+  case OpCode::F64__add:
+  case OpCode::F64__sub:
+  case OpCode::F64__mul:
+  case OpCode::F64__div:
+  case OpCode::F64__min:
+  case OpCode::F64__max:
+    return visitBinary(Op);
+
+  // Comparison operations
+  case OpCode::I32__eq:
+  case OpCode::I32__ne:
+  case OpCode::I32__lt_s:
+  case OpCode::I32__lt_u:
+  case OpCode::I32__le_s:
+  case OpCode::I32__le_u:
+  case OpCode::I32__gt_s:
+  case OpCode::I32__gt_u:
+  case OpCode::I32__ge_s:
+  case OpCode::I32__ge_u:
+  case OpCode::I64__eq:
+  case OpCode::I64__ne:
+  case OpCode::I64__lt_s:
+  case OpCode::I64__lt_u:
+  case OpCode::I64__le_s:
+  case OpCode::I64__le_u:
+  case OpCode::I64__gt_s:
+  case OpCode::I64__gt_u:
+  case OpCode::I64__ge_s:
+  case OpCode::I64__ge_u:
+  case OpCode::F32__eq:
+  case OpCode::F32__ne:
+  case OpCode::F32__lt:
+  case OpCode::F32__le:
+  case OpCode::F32__gt:
+  case OpCode::F32__ge:
+  case OpCode::F64__eq:
+  case OpCode::F64__ne:
+  case OpCode::F64__lt:
+  case OpCode::F64__le:
+  case OpCode::F64__gt:
+  case OpCode::F64__ge:
+    return visitCompare(Op);
+
+  // Unary operations
+  case OpCode::I32__eqz:
+  case OpCode::I32__clz:
+  case OpCode::I32__ctz:
+  case OpCode::I32__popcnt:
+  case OpCode::I64__eqz:
+  case OpCode::I64__clz:
+  case OpCode::I64__ctz:
+  case OpCode::I64__popcnt:
+  case OpCode::F32__abs:
+  case OpCode::F32__neg:
+  case OpCode::F32__sqrt:
+  case OpCode::F32__ceil:
+  case OpCode::F32__floor:
+  case OpCode::F32__trunc:
+  case OpCode::F32__nearest:
+  case OpCode::F64__abs:
+  case OpCode::F64__neg:
+  case OpCode::F64__sqrt:
+  case OpCode::F64__ceil:
+  case OpCode::F64__floor:
+  case OpCode::F64__trunc:
+  case OpCode::F64__nearest:
+    return visitUnary(Op);
+
+  // Parametric operations
+  case OpCode::Drop:
+  case OpCode::Select:
+  case OpCode::Select_t:
+    return visitParametric(Instr);
+
+  // Control flow
+  case OpCode::Block:
+  case OpCode::Loop:
+  case OpCode::If:
+  case OpCode::Else:
+  case OpCode::End:
+  case OpCode::Br:
+  case OpCode::Br_if:
+  case OpCode::Br_table:
+  case OpCode::Return:
+  case OpCode::Nop:
+  case OpCode::Unreachable:
+    return visitControl(Instr);
+
+  // Function calls
+  case OpCode::Call:
+  case OpCode::Call_indirect:
+    return visitCall(Instr);
+
+  // Memory operations
+  case OpCode::I32__load:
+  case OpCode::I64__load:
+  case OpCode::F32__load:
+  case OpCode::F64__load:
+  case OpCode::I32__load8_s:
+  case OpCode::I32__load8_u:
+  case OpCode::I32__load16_s:
+  case OpCode::I32__load16_u:
+  case OpCode::I64__load8_s:
+  case OpCode::I64__load8_u:
+  case OpCode::I64__load16_s:
+  case OpCode::I64__load16_u:
+  case OpCode::I64__load32_s:
+  case OpCode::I64__load32_u:
+  case OpCode::I32__store:
+  case OpCode::I64__store:
+  case OpCode::F32__store:
+  case OpCode::F64__store:
+  case OpCode::I32__store8:
+  case OpCode::I32__store16:
+  case OpCode::I64__store8:
+  case OpCode::I64__store16:
+  case OpCode::I64__store32:
+    return visitMemory(Instr);
+
+  // Type conversion operations
+  case OpCode::I32__wrap_i64:
+  case OpCode::I64__extend_i32_s:
+  case OpCode::I64__extend_i32_u:
+  case OpCode::I32__trunc_f32_s:
+  case OpCode::I32__trunc_f32_u:
+  case OpCode::I32__trunc_f64_s:
+  case OpCode::I32__trunc_f64_u:
+  case OpCode::I64__trunc_f32_s:
+  case OpCode::I64__trunc_f32_u:
+  case OpCode::I64__trunc_f64_s:
+  case OpCode::I64__trunc_f64_u:
+  case OpCode::F32__convert_i32_s:
+  case OpCode::F32__convert_i32_u:
+  case OpCode::F32__convert_i64_s:
+  case OpCode::F32__convert_i64_u:
+  case OpCode::F64__convert_i32_s:
+  case OpCode::F64__convert_i32_u:
+  case OpCode::F64__convert_i64_s:
+  case OpCode::F64__convert_i64_u:
+  case OpCode::F32__demote_f64:
+  case OpCode::F64__promote_f32:
+  case OpCode::I32__reinterpret_f32:
+  case OpCode::I64__reinterpret_f64:
+  case OpCode::F32__reinterpret_i32:
+  case OpCode::F64__reinterpret_i64:
+  case OpCode::I32__extend8_s:
+  case OpCode::I32__extend16_s:
+  case OpCode::I64__extend8_s:
+  case OpCode::I64__extend16_s:
+  case OpCode::I64__extend32_s:
+  // Saturating truncation operations
+  case OpCode::I32__trunc_sat_f32_s:
+  case OpCode::I32__trunc_sat_f32_u:
+  case OpCode::I32__trunc_sat_f64_s:
+  case OpCode::I32__trunc_sat_f64_u:
+  case OpCode::I64__trunc_sat_f32_s:
+  case OpCode::I64__trunc_sat_f32_u:
+  case OpCode::I64__trunc_sat_f64_s:
+  case OpCode::I64__trunc_sat_f64_u:
+    return visitConversion(Op);
+
+  default:
+    // Unsupported instruction - return error
+    return Unexpect(ErrCode::Value::RuntimeError);
+  }
+}
+
+Expect<void> WasmToIRBuilder::visitConst(const AST::Instruction &Instr) {
+  OpCode Op = Instr.getOpCode();
+  ir_ctx *ctx = &Ctx; // For IR macros
+  ir_ref ConstVal = IR_UNUSED;
+
+  ValVariant NumVal = Instr.getNum();
+  
+  switch (Op) {
+  case OpCode::I32__const:
+    ConstVal = ir_CONST_I32(NumVal.get<int32_t>());
+    break;
+  case OpCode::I64__const:
+    ConstVal = ir_CONST_I64(NumVal.get<int64_t>());
+    break;
+  case OpCode::F32__const:
+    ConstVal = ir_CONST_FLOAT(NumVal.get<float>());
+    break;
+  case OpCode::F64__const:
+    ConstVal = ir_CONST_DOUBLE(NumVal.get<double>());
+    break;
+  default:
+    return Unexpect(ErrCode::Value::RuntimeError);
+  }
+
+  push(ConstVal);
+  return {};
+}
+
+Expect<void> WasmToIRBuilder::visitLocal(const AST::Instruction &Instr) {
+  OpCode Op = Instr.getOpCode();
+  uint32_t LocalIdx = Instr.getTargetIndex();
+
+  if (LocalIdx >= LocalCount) {
+    return Unexpect(ErrCode::Value::RuntimeError);
+  }
+
+  switch (Op) {
+  case OpCode::Local__get: {
+    // In SSA form, just push the local value
+    push(Locals[LocalIdx]);
+    break;
+  }
+  case OpCode::Local__set: {
+    // Update the local to the new SSA value
+    ir_ref Value = pop();
+    Locals[LocalIdx] = Value;
+    break;
+  }
+  case OpCode::Local__tee: {
+    // Tee: set local but keep value on stack
+    ir_ref Value = peek(0);
+    Locals[LocalIdx] = Value;
+    break;
+  }
+  default:
+    return Unexpect(ErrCode::Value::RuntimeError);
+  }
+
+  return {};
+}
+
+Expect<void> WasmToIRBuilder::visitGlobal(const AST::Instruction &Instr) {
+  ir_ctx *ctx = &Ctx;
+  OpCode Op = Instr.getOpCode();
+  uint32_t GlobalIdx = Instr.getTargetIndex();
+
+  // Check if we have global type information
+  if (GlobalIdx >= ModuleGlobalTypes.size()) {
+    return Unexpect(ErrCode::Value::RuntimeError);
+  }
+
+  ValType GlobalType = ModuleGlobalTypes[GlobalIdx];
+  ir_type IrType = wasmTypeToIRType(GlobalType);
+
+  // GlobalBasePtr is ValVariant** (pointer to array of ValVariant*)
+  // Step 1: Calculate address of pointer: GlobalBasePtr + GlobalIdx * sizeof(void*)
+  ir_ref PtrOffset = ir_MUL_A(ir_CONST_ADDR(static_cast<uintptr_t>(GlobalIdx)),
+                              ir_CONST_ADDR(sizeof(void*)));
+  ir_ref PtrAddr = ir_ADD_A(GlobalBasePtr, PtrOffset);
+  
+  // Step 2: Load the ValVariant* pointer
+  ir_ref GlobalPtr = ir_LOAD_A(PtrAddr);
+  
+  // Step 3: The GlobalPtr now points to the ValVariant, which has the value at offset 0
+  // (ValVariant stores value in first bytes)
+  ir_ref GlobalAddr = GlobalPtr;
+
+  switch (Op) {
+  case OpCode::Global__get: {
+    // Load the global value
+    ir_ref Value;
+    switch (IrType) {
+    case IR_I32:
+      Value = ir_LOAD_I32(GlobalAddr);
+      break;
+    case IR_I64:
+      Value = ir_LOAD_I64(GlobalAddr);
+      break;
+    case IR_FLOAT:
+      Value = ir_LOAD_F(GlobalAddr);
+      break;
+    case IR_DOUBLE:
+      Value = ir_LOAD_D(GlobalAddr);
+      break;
+    default:
+      return Unexpect(ErrCode::Value::RuntimeError);
+    }
+    push(Value);
+    break;
+  }
+  case OpCode::Global__set: {
+    // Store the value to the global
+    // ir_STORE infers the type from the value
+    ir_ref Value = pop();
+    ir_STORE(GlobalAddr, Value);
+    break;
+  }
+  default:
+    return Unexpect(ErrCode::Value::RuntimeError);
+  }
+
+  return {};
+}
+
+Expect<void> WasmToIRBuilder::visitBinary(OpCode Op) {
+  ir_ctx *ctx = &Ctx; // For IR macros
+  ir_ref Right = pop();
+  ir_ref Left = pop();
+  ir_ref Result = IR_UNUSED;
+
+  switch (Op) {
+  // I32 arithmetic
+  case OpCode::I32__add:
+    Result = ir_ADD_I32(Left, Right);
+    break;
+  case OpCode::I32__sub:
+    Result = ir_SUB_I32(Left, Right);
+    break;
+  case OpCode::I32__mul:
+    Result = ir_MUL_I32(Left, Right);
+    break;
+  case OpCode::I32__div_s:
+    Result = ir_DIV_I32(Left, Right);
+    break;
+  case OpCode::I32__div_u:
+    Result = ir_DIV_U32(Left, Right);
+    break;
+  case OpCode::I32__rem_s:
+    Result = ir_MOD_I32(Left, Right);
+    break;
+  case OpCode::I32__rem_u:
+    Result = ir_MOD_U32(Left, Right);
+    break;
+  case OpCode::I32__and:
+    Result = ir_AND_I32(Left, Right);
+    break;
+  case OpCode::I32__or:
+    Result = ir_OR_I32(Left, Right);
+    break;
+  case OpCode::I32__xor:
+    Result = ir_XOR_I32(Left, Right);
+    break;
+  case OpCode::I32__shl:
+    Result = ir_SHL_I32(Left, Right);
+    break;
+  case OpCode::I32__shr_s:
+    Result = ir_SAR_I32(Left, Right);
+    break;
+  case OpCode::I32__shr_u:
+    Result = ir_SHR_I32(Left, Right);
+    break;
+  case OpCode::I32__rotl:
+    Result = ir_ROL_I32(Left, Right);
+    break;
+  case OpCode::I32__rotr:
+    Result = ir_ROR_I32(Left, Right);
+    break;
+
+  // I64 arithmetic
+  case OpCode::I64__add:
+    Result = ir_ADD_I64(Left, Right);
+    break;
+  case OpCode::I64__sub:
+    Result = ir_SUB_I64(Left, Right);
+    break;
+  case OpCode::I64__mul:
+    Result = ir_MUL_I64(Left, Right);
+    break;
+  case OpCode::I64__div_s:
+    Result = ir_DIV_I64(Left, Right);
+    break;
+  case OpCode::I64__div_u:
+    Result = ir_DIV_U64(Left, Right);
+    break;
+  case OpCode::I64__rem_s:
+    Result = ir_MOD_I64(Left, Right);
+    break;
+  case OpCode::I64__rem_u:
+    Result = ir_MOD_U64(Left, Right);
+    break;
+  case OpCode::I64__and:
+    Result = ir_AND_I64(Left, Right);
+    break;
+  case OpCode::I64__or:
+    Result = ir_OR_I64(Left, Right);
+    break;
+  case OpCode::I64__xor:
+    Result = ir_XOR_I64(Left, Right);
+    break;
+  case OpCode::I64__shl:
+    Result = ir_SHL_I64(Left, Right);
+    break;
+  case OpCode::I64__shr_s:
+    Result = ir_SAR_I64(Left, Right);
+    break;
+  case OpCode::I64__shr_u:
+    Result = ir_SHR_I64(Left, Right);
+    break;
+  case OpCode::I64__rotl:
+    Result = ir_ROL_I64(Left, Right);
+    break;
+  case OpCode::I64__rotr:
+    Result = ir_ROR_I64(Left, Right);
+    break;
+
+  // F32 arithmetic
+  case OpCode::F32__add:
+    Result = ir_ADD_F(Left, Right);
+    break;
+  case OpCode::F32__sub:
+    Result = ir_SUB_F(Left, Right);
+    break;
+  case OpCode::F32__mul:
+    Result = ir_MUL_F(Left, Right);
+    break;
+  case OpCode::F32__div:
+    Result = ir_DIV_F(Left, Right);
+    break;
+  case OpCode::F32__min:
+    Result = ir_MIN_F(Left, Right);
+    break;
+  case OpCode::F32__max:
+    Result = ir_MAX_F(Left, Right);
+    break;
+
+  // F64 arithmetic
+  case OpCode::F64__add:
+    Result = ir_ADD_D(Left, Right);
+    break;
+  case OpCode::F64__sub:
+    Result = ir_SUB_D(Left, Right);
+    break;
+  case OpCode::F64__mul:
+    Result = ir_MUL_D(Left, Right);
+    break;
+  case OpCode::F64__div:
+    Result = ir_DIV_D(Left, Right);
+    break;
+  case OpCode::F64__min:
+    Result = ir_MIN_D(Left, Right);
+    break;
+  case OpCode::F64__max:
+    Result = ir_MAX_D(Left, Right);
+    break;
+
+  default:
+    return Unexpect(ErrCode::Value::RuntimeError);
+  }
+
+  push(Result);
+  return {};
+}
+
+Expect<void> WasmToIRBuilder::visitCompare(OpCode Op) {
+  ir_ctx *ctx = &Ctx; // For IR macros
+  ir_ref Right = pop();
+  ir_ref Left = pop();
+  ir_ref Result = IR_UNUSED;
+
+  switch (Op) {
+  // I32/I64 comparisons - IR uses generic comparison macros
+  case OpCode::I32__eq:
+  case OpCode::I64__eq:
+    Result = ir_EQ(Left, Right);
+    break;
+  case OpCode::I32__ne:
+  case OpCode::I64__ne:
+    Result = ir_NE(Left, Right);
+    break;
+  case OpCode::I32__lt_s:
+  case OpCode::I64__lt_s:
+    Result = ir_LT(Left, Right);
+    break;
+  case OpCode::I32__lt_u:
+  case OpCode::I64__lt_u:
+    Result = ir_ULT(Left, Right);
+    break;
+  case OpCode::I32__le_s:
+  case OpCode::I64__le_s:
+    Result = ir_LE(Left, Right);
+    break;
+  case OpCode::I32__le_u:
+  case OpCode::I64__le_u:
+    Result = ir_ULE(Left, Right);
+    break;
+  case OpCode::I32__gt_s:
+  case OpCode::I64__gt_s:
+    Result = ir_GT(Left, Right);
+    break;
+  case OpCode::I32__gt_u:
+  case OpCode::I64__gt_u:
+    Result = ir_UGT(Left, Right);
+    break;
+  case OpCode::I32__ge_s:
+  case OpCode::I64__ge_s:
+    Result = ir_GE(Left, Right);
+    break;
+  case OpCode::I32__ge_u:
+  case OpCode::I64__ge_u:
+    Result = ir_UGE(Left, Right);
+    break;
+
+  // F32/F64 comparisons - also use generic macros
+  case OpCode::F32__eq:
+  case OpCode::F64__eq:
+    Result = ir_EQ(Left, Right);
+    break;
+  case OpCode::F32__ne:
+  case OpCode::F64__ne:
+    Result = ir_NE(Left, Right);
+    break;
+  case OpCode::F32__lt:
+  case OpCode::F64__lt:
+    Result = ir_LT(Left, Right);
+    break;
+  case OpCode::F32__le:
+  case OpCode::F64__le:
+    Result = ir_LE(Left, Right);
+    break;
+  case OpCode::F32__gt:
+  case OpCode::F64__gt:
+    Result = ir_GT(Left, Right);
+    break;
+  case OpCode::F32__ge:
+  case OpCode::F64__ge:
+    Result = ir_GE(Left, Right);
+    break;
+
+  default:
+    return Unexpect(ErrCode::Value::RuntimeError);
+  }
+
+  push(Result);
+  return {};
+}
+
+Expect<void> WasmToIRBuilder::visitUnary(OpCode Op) {
+  ir_ctx *ctx = &Ctx; // For IR macros
+  ir_ref Operand = pop();
+  ir_ref Result = IR_UNUSED;
+
+  switch (Op) {
+  // I32 unary
+  case OpCode::I32__eqz:
+    Result = ir_EQ(Operand, ir_CONST_I32(0));
+    break;
+  case OpCode::I32__clz:
+    Result = ir_CTLZ_I32(Operand);
+    break;
+  case OpCode::I32__ctz:
+    Result = ir_CTTZ_I32(Operand);
+    break;
+  case OpCode::I32__popcnt:
+    Result = ir_CTPOP_I32(Operand);
+    break;
+
+  // I64 unary
+  case OpCode::I64__eqz:
+    Result = ir_EQ(Operand, ir_CONST_I64(0));
+    break;
+  case OpCode::I64__clz:
+    Result = ir_CTLZ_I64(Operand);
+    break;
+  case OpCode::I64__ctz:
+    Result = ir_CTTZ_I64(Operand);
+    break;
+  case OpCode::I64__popcnt:
+    Result = ir_CTPOP_I64(Operand);
+    break;
+
+  // F32 unary
+  case OpCode::F32__abs:
+    Result = ir_ABS_F(Operand);
+    break;
+  case OpCode::F32__neg:
+    Result = ir_NEG_F(Operand);
+    break;
+  // TODO: SQRT, CEIL, FLOOR, TRUNC, NEAREST require intrinsic calls
+  // For now, return the operand unchanged (placeholder)
+  case OpCode::F32__sqrt:
+  case OpCode::F32__ceil:
+  case OpCode::F32__floor:
+  case OpCode::F32__trunc:
+  case OpCode::F32__nearest:
+    // Placeholder: would need to call C library functions
+    Result = Operand;
+    break;
+
+  // F64 unary
+  case OpCode::F64__abs:
+    Result = ir_ABS_D(Operand);
+    break;
+  case OpCode::F64__neg:
+    Result = ir_NEG_D(Operand);
+    break;
+  // TODO: SQRT, CEIL, FLOOR, TRUNC, NEAREST require intrinsic calls
+  case OpCode::F64__sqrt:
+  case OpCode::F64__ceil:
+  case OpCode::F64__floor:
+  case OpCode::F64__trunc:
+  case OpCode::F64__nearest:
+    // Placeholder: would need to call C library functions
+    Result = Operand;
+    break;
+
+  default:
+    return Unexpect(ErrCode::Value::RuntimeError);
+  }
+
+  push(Result);
+  return {};
+}
+
+Expect<void> WasmToIRBuilder::visitConversion(OpCode Op) {
+  ir_ctx *ctx = &Ctx; // For IR macros
+  ir_ref Operand = pop();
+  ir_ref Result = IR_UNUSED;
+
+  switch (Op) {
+  // Integer wrap/extend
+  case OpCode::I32__wrap_i64:
+    // Truncate i64 to i32
+    Result = ir_TRUNC_I32(Operand);
+    break;
+  case OpCode::I64__extend_i32_s:
+    // Sign-extend i32 to i64
+    Result = ir_SEXT_I64(Operand);
+    break;
+  case OpCode::I64__extend_i32_u:
+    // Zero-extend i32 to i64
+    Result = ir_ZEXT_U64(Operand);
+    break;
+
+  // Float to integer truncation (non-saturating)
+  case OpCode::I32__trunc_f32_s:
+  case OpCode::I32__trunc_f64_s:
+    Result = ir_FP2I32(Operand);
+    break;
+  case OpCode::I32__trunc_f32_u:
+  case OpCode::I32__trunc_f64_u:
+    Result = ir_FP2U32(Operand);
+    break;
+  case OpCode::I64__trunc_f32_s:
+  case OpCode::I64__trunc_f64_s:
+    Result = ir_FP2I64(Operand);
+    break;
+  case OpCode::I64__trunc_f32_u:
+  case OpCode::I64__trunc_f64_u:
+    Result = ir_FP2U64(Operand);
+    break;
+
+  // Saturating truncation (same as non-saturating for now)
+  // Note: Proper saturation would require additional bounds checking
+  case OpCode::I32__trunc_sat_f32_s:
+  case OpCode::I32__trunc_sat_f64_s:
+    Result = ir_FP2I32(Operand);
+    break;
+  case OpCode::I32__trunc_sat_f32_u:
+  case OpCode::I32__trunc_sat_f64_u:
+    Result = ir_FP2U32(Operand);
+    break;
+  case OpCode::I64__trunc_sat_f32_s:
+  case OpCode::I64__trunc_sat_f64_s:
+    Result = ir_FP2I64(Operand);
+    break;
+  case OpCode::I64__trunc_sat_f32_u:
+  case OpCode::I64__trunc_sat_f64_u:
+    Result = ir_FP2U64(Operand);
+    break;
+
+  // Integer to float conversion
+  case OpCode::F32__convert_i32_s:
+  case OpCode::F32__convert_i64_s:
+    Result = ir_INT2F(Operand);
+    break;
+  case OpCode::F32__convert_i32_u:
+    // Zero-extend to i64 first, then convert (for unsigned semantics)
+    Result = ir_INT2F(ir_ZEXT_U64(Operand));
+    break;
+  case OpCode::F32__convert_i64_u: {
+    // For unsigned i64 to f32, need special handling for large values
+    // Simplified: just use INT2F (may lose precision for large unsigned values)
+    Result = ir_INT2F(Operand);
+    break;
+  }
+  case OpCode::F64__convert_i32_s:
+  case OpCode::F64__convert_i64_s:
+    Result = ir_INT2D(Operand);
+    break;
+  case OpCode::F64__convert_i32_u:
+    // Zero-extend to i64 first, then convert
+    Result = ir_INT2D(ir_ZEXT_U64(Operand));
+    break;
+  case OpCode::F64__convert_i64_u: {
+    // For unsigned i64 to f64, need special handling for large values
+    // Simplified: just use INT2D (may lose precision for large unsigned values)
+    Result = ir_INT2D(Operand);
+    break;
+  }
+
+  // Float promotion/demotion
+  case OpCode::F32__demote_f64:
+    Result = ir_D2F(Operand);
+    break;
+  case OpCode::F64__promote_f32:
+    Result = ir_F2D(Operand);
+    break;
+
+  // Reinterpret (bitcast)
+  case OpCode::I32__reinterpret_f32:
+    Result = ir_BITCAST_I32(Operand);
+    break;
+  case OpCode::I64__reinterpret_f64:
+    Result = ir_BITCAST_I64(Operand);
+    break;
+  case OpCode::F32__reinterpret_i32:
+    Result = ir_BITCAST_F(Operand);
+    break;
+  case OpCode::F64__reinterpret_i64:
+    Result = ir_BITCAST_D(Operand);
+    break;
+
+  // Sign extension from partial width
+  case OpCode::I32__extend8_s: {
+    // Sign-extend lowest 8 bits to i32
+    // Shift left 24, then arithmetic shift right 24
+    ir_ref Shifted = ir_SHL_I32(Operand, ir_CONST_I32(24));
+    Result = ir_SAR_I32(Shifted, ir_CONST_I32(24));
+    break;
+  }
+  case OpCode::I32__extend16_s: {
+    // Sign-extend lowest 16 bits to i32
+    ir_ref Shifted = ir_SHL_I32(Operand, ir_CONST_I32(16));
+    Result = ir_SAR_I32(Shifted, ir_CONST_I32(16));
+    break;
+  }
+  case OpCode::I64__extend8_s: {
+    // Sign-extend lowest 8 bits to i64
+    ir_ref Shifted = ir_SHL_I64(Operand, ir_CONST_I64(56));
+    Result = ir_SAR_I64(Shifted, ir_CONST_I64(56));
+    break;
+  }
+  case OpCode::I64__extend16_s: {
+    // Sign-extend lowest 16 bits to i64
+    ir_ref Shifted = ir_SHL_I64(Operand, ir_CONST_I64(48));
+    Result = ir_SAR_I64(Shifted, ir_CONST_I64(48));
+    break;
+  }
+  case OpCode::I64__extend32_s: {
+    // Sign-extend lowest 32 bits to i64
+    ir_ref Shifted = ir_SHL_I64(Operand, ir_CONST_I64(32));
+    Result = ir_SAR_I64(Shifted, ir_CONST_I64(32));
+    break;
+  }
+
+  default:
+    return Unexpect(ErrCode::Value::RuntimeError);
+  }
+
+  push(Result);
+  return {};
+}
+
+Expect<void> WasmToIRBuilder::visitParametric(const AST::Instruction &Instr) {
+  ir_ctx *ctx = &Ctx; // For IR macros
+  OpCode Op = Instr.getOpCode();
+
+  switch (Op) {
+  case OpCode::Drop: {
+    // Just pop from stack, value is discarded
+    pop();
+    break;
+  }
+  case OpCode::Select:
+  case OpCode::Select_t: {
+    // Select takes 3 operands: val1, val2, cond
+    // Returns val1 if cond != 0, else val2
+    // Stack order: [... val1 val2 cond]
+    ir_ref Cond = pop();
+    ir_ref Val2 = pop();
+    ir_ref Val1 = pop();
+    
+    // Use IR's COND operation: COND(condition, true_val, false_val)
+    // COND returns true_val if condition != 0, else false_val
+    // We need to determine the type - for now use generic COND
+    // The type will be inferred from the operands
+    ir_ref Result = ir_COND(IR_I32, Cond, Val1, Val2);
+    push(Result);
+    break;
+  }
+  default:
+    return Unexpect(ErrCode::Value::RuntimeError);
+  }
+
+  return {};
+}
+
+ir_ref WasmToIRBuilder::buildMemoryAddress(ir_ref Base, uint32_t Offset) {
+  ir_ctx *ctx = &Ctx; // For IR macros
+  
+  // Compute Wasm effective address: base (from stack, i32) + static offset
+  ir_ref WasmAddr = Base;
+  if (Offset != 0) {
+    ir_ref OffsetVal = ir_CONST_U32(Offset);
+    WasmAddr = ir_ADD_U32(Base, OffsetVal);
+  }
+  
+  // Zero-extend Wasm address (32-bit) to native address width
+  // Then add to memory base pointer
+  // IR_ADDR is the native pointer type (64-bit on 64-bit systems)
+  ir_ref WasmAddrExt = ir_ZEXT_A(WasmAddr);  // Zero-extend to address width
+  ir_ref EffectiveAddr = ir_ADD_A(MemoryBase, WasmAddrExt);
+  
+  return EffectiveAddr;
+}
+
+ir_ref WasmToIRBuilder::buildBoundsCheck(ir_ref Address, uint32_t AccessSize) {
+  // Simplified: skip bounds checking for POC
+  // In production, would add runtime checks here
+  (void)Address;
+  (void)AccessSize;
+  return IR_TRUE;
+}
+
+Expect<void> WasmToIRBuilder::visitMemory(const AST::Instruction &Instr) {
+  OpCode Op = Instr.getOpCode();
+  uint32_t Offset = Instr.getMemoryOffset();
+  (void)Instr.getMemoryAlign(); // Alignment hints not enforced in POC
+
+  ir_ctx *ctx = &Ctx; // For IR macros
+  ir_ref Result = IR_UNUSED;
+
+  // Check if this is a load or store operation
+  bool IsLoad = (Op >= OpCode::I32__load && Op <= OpCode::I64__load32_u);
+  
+  if (IsLoad) {
+    // Load operations: pop address, load from memory, push result
+    ir_ref BaseAddr = pop(); // Address from stack (i32)
+    ir_ref EffectiveAddr = buildMemoryAddress(BaseAddr, Offset);
+
+    switch (Op) {
+    // Full-width loads
+    case OpCode::I32__load:
+      Result = ir_LOAD_I32(EffectiveAddr);
+      break;
+    case OpCode::I64__load:
+      Result = ir_LOAD_I64(EffectiveAddr);
+      break;
+    case OpCode::F32__load:
+      Result = ir_LOAD_F(EffectiveAddr);
+      break;
+    case OpCode::F64__load:
+      Result = ir_LOAD_D(EffectiveAddr);
+      break;
+
+    // i32 partial loads - sign extend
+    case OpCode::I32__load8_s: {
+      ir_ref Loaded = ir_LOAD_I8(EffectiveAddr);
+      Result = ir_SEXT_I32(Loaded);
+      break;
+    }
+    case OpCode::I32__load16_s: {
+      ir_ref Loaded = ir_LOAD_I16(EffectiveAddr);
+      Result = ir_SEXT_I32(Loaded);
+      break;
+    }
+
+    // i32 partial loads - zero extend
+    case OpCode::I32__load8_u: {
+      ir_ref Loaded = ir_LOAD_U8(EffectiveAddr);
+      Result = ir_ZEXT_I32(Loaded);
+      break;
+    }
+    case OpCode::I32__load16_u: {
+      ir_ref Loaded = ir_LOAD_U16(EffectiveAddr);
+      Result = ir_ZEXT_I32(Loaded);
+      break;
+    }
+
+    // i64 partial loads - sign extend
+    case OpCode::I64__load8_s: {
+      ir_ref Loaded = ir_LOAD_I8(EffectiveAddr);
+      Result = ir_SEXT_I64(Loaded);
+      break;
+    }
+    case OpCode::I64__load16_s: {
+      ir_ref Loaded = ir_LOAD_I16(EffectiveAddr);
+      Result = ir_SEXT_I64(Loaded);
+      break;
+    }
+    case OpCode::I64__load32_s: {
+      ir_ref Loaded = ir_LOAD_I32(EffectiveAddr);
+      Result = ir_SEXT_I64(Loaded);
+      break;
+    }
+
+    // i64 partial loads - zero extend
+    case OpCode::I64__load8_u: {
+      ir_ref Loaded = ir_LOAD_U8(EffectiveAddr);
+      Result = ir_ZEXT_I64(Loaded);
+      break;
+    }
+    case OpCode::I64__load16_u: {
+      ir_ref Loaded = ir_LOAD_U16(EffectiveAddr);
+      Result = ir_ZEXT_I64(Loaded);
+      break;
+    }
+    case OpCode::I64__load32_u: {
+      ir_ref Loaded = ir_LOAD_U32(EffectiveAddr);
+      Result = ir_ZEXT_I64(Loaded);
+      break;
+    }
+
+    default:
+      return Unexpect(ErrCode::Value::RuntimeError);
+    }
+
+    push(Result);
+  } else {
+    // Store operations: pop value, pop address, store to memory
+    ir_ref Value = pop();      // Value to store
+    ir_ref BaseAddr = pop();   // Address from stack (i32)
+    ir_ref EffectiveAddr = buildMemoryAddress(BaseAddr, Offset);
+
+    switch (Op) {
+    // Full-width stores
+    case OpCode::I32__store:
+      ir_STORE(EffectiveAddr, Value);
+      break;
+    case OpCode::I64__store:
+      ir_STORE(EffectiveAddr, Value);
+      break;
+    case OpCode::F32__store:
+      ir_STORE(EffectiveAddr, Value);
+      break;
+    case OpCode::F64__store:
+      ir_STORE(EffectiveAddr, Value);
+      break;
+
+    // Partial stores - truncate and store
+    case OpCode::I32__store8: {
+      // Truncate i32 to i8 and store
+      ir_ref Truncated = ir_TRUNC_U8(Value);
+      ir_STORE(EffectiveAddr, Truncated);
+      break;
+    }
+    case OpCode::I32__store16: {
+      // Truncate i32 to i16 and store
+      ir_ref Truncated = ir_TRUNC_U16(Value);
+      ir_STORE(EffectiveAddr, Truncated);
+      break;
+    }
+    case OpCode::I64__store8: {
+      // Truncate i64 to i8 and store
+      ir_ref Truncated = ir_TRUNC_U8(Value);
+      ir_STORE(EffectiveAddr, Truncated);
+      break;
+    }
+    case OpCode::I64__store16: {
+      // Truncate i64 to i16 and store
+      ir_ref Truncated = ir_TRUNC_U16(Value);
+      ir_STORE(EffectiveAddr, Truncated);
+      break;
+    }
+    case OpCode::I64__store32: {
+      // Truncate i64 to i32 and store
+      ir_ref Truncated = ir_TRUNC_I32(Value);
+      ir_STORE(EffectiveAddr, Truncated);
+      break;
+    }
+
+    default:
+      return Unexpect(ErrCode::Value::RuntimeError);
+    }
+  }
+
+  return {};
+}
+
+Expect<void> WasmToIRBuilder::visitControl(const AST::Instruction &Instr) {
+  OpCode Op = Instr.getOpCode();
+
+  switch (Op) {
+  case OpCode::Nop:
+    // Nop does nothing
+    return {};
+  case OpCode::Unreachable: {
+    // Unreachable - generate trap/abort
+    ir_ctx *ctx = &Ctx;
+    ir_UNREACHABLE();
+    // Mark current path as terminated
+    CurrentPathTerminated = true;
+    return {};
+  }
+  case OpCode::Block:
+    return visitBlock(Instr);
+  case OpCode::Loop:
+    return visitLoop(Instr);
+  case OpCode::If:
+    return visitIf(Instr);
+  case OpCode::Else:
+    return visitElse(Instr);
+  case OpCode::End:
+    return visitEnd(Instr);
+  case OpCode::Br:
+    return visitBr(Instr);
+  case OpCode::Br_if:
+    return visitBrIf(Instr);
+  case OpCode::Br_table:
+    return visitBrTable(Instr);
+  case OpCode::Return:
+    return visitReturn(Instr);
+  default:
+    return Unexpect(ErrCode::Value::RuntimeError);
+  }
+}
+
+Expect<void> WasmToIRBuilder::visitBlock(const AST::Instruction &) {
+  // Create label info for the block
+  // Blocks are forward-jump targets: br jumps to AFTER the end
+  LabelInfo Label;
+  Label.Kind = ControlKind::Block;
+  Label.LoopHeader = IR_UNUSED;
+  Label.IfRef = IR_UNUSED;
+  Label.ElseEnd = IR_UNUSED;
+  Label.Arity = 0;  // TODO: Get from block type
+  Label.StackBase = static_cast<uint32_t>(ValueStack.size());
+  Label.InElseBranch = false;
+  Label.HasElse = false;
+  Label.TrueBranchTerminated = false;
+  Label.ElseBranchTerminated = false;
+  // EndList will collect ir_END() refs from branches that need to merge
+
+  LabelStack.push_back(Label);
+  return {};
+}
+
+Expect<void> WasmToIRBuilder::visitLoop(const AST::Instruction &) {
+  ir_ctx *ctx = &Ctx;
+  
+  // Loops are backward-jump targets: br jumps to the loop header
+  // Create LOOP_BEGIN node
+  ir_ref LoopEntry = ir_END();
+  ir_ref LoopHeader = ir_LOOP_BEGIN(LoopEntry);
+  
+  LabelInfo Label;
+  Label.Kind = ControlKind::Loop;
+  Label.LoopHeader = LoopHeader;
+  Label.IfRef = IR_UNUSED;
+  Label.ElseEnd = IR_UNUSED;
+  Label.Arity = 0;  // TODO: Get from block type
+  Label.StackBase = static_cast<uint32_t>(ValueStack.size());
+  Label.InElseBranch = false;
+  Label.HasElse = false;
+  Label.TrueBranchTerminated = false;
+  Label.ElseBranchTerminated = false;
+
+  // Create PHI nodes for all local variables
+  // In SSA form, loop variables need PHI nodes to merge:
+  //   - Initial value (before loop)
+  //   - Back-edge value (after loop iteration)
+  for (auto &[LocalIdx, LocalRef] : Locals) {
+    // Determine the IR type from the current value
+    ir_type LocalType = IR_I32;  // Default
+    if (LocalRef > 0 && LocalRef < static_cast<ir_ref>(ctx->insns_count)) {
+      ir_insn *insn = &ctx->ir_base[LocalRef];
+      if (insn) {
+        LocalType = static_cast<ir_type>(insn->type);
+      }
+    }
+    
+    // Create PHI_2: first operand is pre-loop value, second will be set at back-edge
+    ir_ref Phi = ir_PHI_2(LocalType, LocalRef, IR_UNUSED);
+    
+    // Store mapping and original value
+    Label.PreLoopLocals[LocalIdx] = LocalRef;
+    Label.LoopLocalPhis[LocalIdx] = Phi;
+    
+    // Update Locals to use the PHI node inside the loop
+    Locals[LocalIdx] = Phi;
+  }
+
+  LabelStack.push_back(Label);
+  return {};
+}
+
+Expect<void> WasmToIRBuilder::visitIf(const AST::Instruction &) {
+  ir_ctx *ctx = &Ctx;
+  ir_ref Condition = pop();
+  
+  // Create IF node
+  ir_ref IfRef = ir_IF(Condition);
+  
+  // Start the true branch
+  ir_IF_TRUE(IfRef);
+  
+  // Reset termination flag - we're starting a new live branch
+  CurrentPathTerminated = false;
+  
+  LabelInfo Label;
+  Label.Kind = ControlKind::If;
+  Label.LoopHeader = IR_UNUSED;
+  Label.IfRef = IfRef;
+  Label.ElseEnd = IR_UNUSED;
+  Label.Arity = 0;  // TODO: Get from block type
+  Label.StackBase = static_cast<uint32_t>(ValueStack.size());
+  Label.InElseBranch = false;
+  Label.HasElse = false;
+  Label.TrueBranchTerminated = false;
+  Label.ElseBranchTerminated = false;
+
+  LabelStack.push_back(Label);
+  return {};
+}
+
+Expect<void> WasmToIRBuilder::visitElse(const AST::Instruction &) {
+  ir_ctx *ctx = &Ctx;
+  
+  if (LabelStack.empty()) {
+    return Unexpect(ErrCode::Value::RuntimeError);
+  }
+  
+  LabelInfo &Label = LabelStack.back();
+  if (Label.Kind != ControlKind::If) {
+    return Unexpect(ErrCode::Value::RuntimeError);
+  }
+  
+  // Record if the true branch terminated (via return/unreachable)
+  Label.TrueBranchTerminated = CurrentPathTerminated;
+  
+  // Only create ir_END() if the true branch didn't terminate
+  if (!CurrentPathTerminated) {
+    ir_ref TrueEnd = ir_END();
+    Label.EndList.push_back(TrueEnd);
+  }
+  
+  // Start the false branch
+  ir_IF_FALSE(Label.IfRef);
+  
+  // Reset termination flag for the else branch
+  CurrentPathTerminated = false;
+  
+  Label.InElseBranch = true;
+  Label.HasElse = true;
+  
+  return {};
+}
+
+Expect<void> WasmToIRBuilder::visitEnd(const AST::Instruction &) {
+  ir_ctx *ctx = &Ctx;
+  
+  if (LabelStack.empty()) {
+    // Function end - only add return if current path is still live
+    if (CurrentPathTerminated) {
+      // All paths already returned/terminated, don't generate another return
+      return {};
+    }
+    
+    if (!ValueStack.empty()) {
+      ir_ref RetVal = pop();
+      ir_RETURN(RetVal);
+    } else {
+      ir_RETURN(IR_UNUSED);
+    }
+    return {};
+  }
+
+  LabelInfo &Label = LabelStack.back();
+  
+  switch (Label.Kind) {
+  case ControlKind::Block: {
+    // Block end: merge all branches that targeted this block
+    // Only add current path's END if it wasn't already terminated
+    if (!CurrentPathTerminated) {
+      ir_ref CurrentEnd = ir_END();
+      Label.EndList.push_back(CurrentEnd);
+      Label.EndLocals.push_back(Locals);  // Save current Locals
+    }
+    
+    // Merge all collected ends
+    if (Label.EndList.size() == 1) {
+      // Single path, just continue with BEGIN and restore its Locals
+      ir_BEGIN(Label.EndList[0]);
+      if (!Label.EndLocals.empty()) {
+        Locals = Label.EndLocals[0];
+      }
+      CurrentPathTerminated = false;
+    } else if (Label.EndList.size() == 2) {
+      // Two paths, use MERGE_2
+      ir_MERGE_2(Label.EndList[0], Label.EndList[1]);
+      // For multiple paths, we need PHI nodes for locals that differ
+      // For now, use the first path's locals (simplified)
+      if (!Label.EndLocals.empty()) {
+        // Create PHI nodes for locals that have different values on different paths
+        if (Label.EndLocals.size() >= 2) {
+          for (auto &[LocalIdx, Val1] : Label.EndLocals[0]) {
+            auto it2 = Label.EndLocals[1].find(LocalIdx);
+            if (it2 != Label.EndLocals[1].end()) {
+              ir_ref Val2 = it2->second;
+              if (Val1 != Val2) {
+                // Different values, need PHI
+                ir_type LocalType = IR_I32;  // Default
+                if (Val1 > 0 && Val1 < static_cast<ir_ref>(ctx->insns_count)) {
+                  ir_insn *insn = &ctx->ir_base[Val1];
+                  if (insn) LocalType = static_cast<ir_type>(insn->type);
+                }
+                ir_ref Phi = ir_PHI_2(LocalType, Val1, Val2);
+                Locals[LocalIdx] = Phi;
+              } else {
+                Locals[LocalIdx] = Val1;
+              }
+            }
+          }
+        } else {
+          Locals = Label.EndLocals[0];
+        }
+      }
+      CurrentPathTerminated = false;
+    } else if (Label.EndList.size() > 2) {
+      // Multiple paths, use MERGE_N
+      ir_MERGE_N(static_cast<ir_ref>(Label.EndList.size()), Label.EndList.data());
+      // Simplified: use first path's locals
+      if (!Label.EndLocals.empty()) {
+        Locals = Label.EndLocals[0];
+      }
+      CurrentPathTerminated = false;
+    }
+    // else: no paths to merge (all terminated), CurrentPathTerminated stays true
+    break;
+  }
+  
+  case ControlKind::Loop: {
+    // Loop end: just continue, back-edges are already handled by br
+    // If we fall through the loop, we just continue
+    // Note: Loop PHI nodes would need to be handled here for values
+    break;
+  }
+  
+  case ControlKind::If: {
+    // Record if else/current branch terminated
+    if (Label.HasElse) {
+      Label.ElseBranchTerminated = CurrentPathTerminated;
+    } else {
+      // No else means the "else" path is just fallthrough (not terminated)
+      Label.ElseBranchTerminated = false;
+    }
+    
+    // If both branches terminated, the code after if is unreachable
+    if (Label.TrueBranchTerminated && Label.ElseBranchTerminated) {
+      // Mark current path as terminated - code after this if is dead
+      CurrentPathTerminated = true;
+      // Don't create merge - both paths are dead
+      break;
+    }
+    
+    // Only add current end if branch didn't terminate
+    if (!CurrentPathTerminated) {
+      ir_ref CurrentEnd = ir_END();
+      Label.EndList.push_back(CurrentEnd);
+    }
+    
+    if (!Label.HasElse) {
+      // No else clause: create empty false branch
+      ir_IF_FALSE(Label.IfRef);
+      ir_ref FalseEnd = ir_END();
+      Label.EndList.push_back(FalseEnd);
+    }
+    
+    // Merge the branches (only if we have paths to merge)
+    if (Label.EndList.size() == 1) {
+      // Single path continuing
+      ir_BEGIN(Label.EndList[0]);
+      CurrentPathTerminated = false;
+    } else if (Label.EndList.size() == 2) {
+      ir_MERGE_2(Label.EndList[0], Label.EndList[1]);
+      CurrentPathTerminated = false;
+    } else if (Label.EndList.size() > 2) {
+      ir_MERGE_N(static_cast<ir_ref>(Label.EndList.size()), Label.EndList.data());
+      CurrentPathTerminated = false;
+    }
+    // else: no live paths (shouldn't happen if we handled both-terminated case above)
+    break;
+  }
+  }
+
+  LabelStack.pop_back();
+  return {};
+}
+
+Expect<void> WasmToIRBuilder::visitBr(const AST::Instruction &Instr) {
+  ir_ctx *ctx = &Ctx;
+  uint32_t LabelIdx = Instr.getTargetIndex();
+
+  if (LabelIdx >= LabelStack.size()) {
+    return Unexpect(ErrCode::Value::RuntimeError);
+  }
+
+  // Get the target label (index 0 is innermost)
+  LabelInfo &Target = LabelStack[LabelStack.size() - 1 - LabelIdx];
+  
+  if (Target.Kind == ControlKind::Loop) {
+    // Branch to loop: update PHI nodes with current local values before creating back-edge
+    for (auto &[LocalIdx, PhiRef] : Target.LoopLocalPhis) {
+      // Get current value of this local
+      auto it = Locals.find(LocalIdx);
+      if (it != Locals.end()) {
+        ir_PHI_SET_OP(PhiRef, 2, it->second);
+      }
+    }
+    
+    // Create back-edge
+    ir_ref LoopEnd = ir_LOOP_END();
+    ir_MERGE_SET_OP(Target.LoopHeader, 2, LoopEnd);
+  } else {
+    // Branch to block/if: create forward edge to merge at end
+    // Save current Locals state for restoration at merge point
+    ir_ref BrEnd = ir_END();
+    Target.EndList.push_back(BrEnd);
+    Target.EndLocals.push_back(Locals);
+  }
+  
+  // After unconditional branch, code is unreachable
+  // Mark current path as terminated
+  CurrentPathTerminated = true;
+  
+  return {};
+}
+
+Expect<void> WasmToIRBuilder::visitBrIf(const AST::Instruction &Instr) {
+  ir_ctx *ctx = &Ctx;
+  ir_ref Condition = pop();
+  uint32_t LabelIdx = Instr.getTargetIndex();
+
+  if (LabelIdx >= LabelStack.size()) {
+    return Unexpect(ErrCode::Value::RuntimeError);
+  }
+
+  // Get the target label
+  LabelInfo &Target = LabelStack[LabelStack.size() - 1 - LabelIdx];
+  
+  // Create conditional branch
+  ir_ref IfRef = ir_IF(Condition);
+  
+  // True branch: branch is taken
+  ir_IF_TRUE(IfRef);
+  
+  if (Target.Kind == ControlKind::Loop) {
+    // Branch to loop: update PHI nodes with current local values
+    for (auto &[LocalIdx, PhiRef] : Target.LoopLocalPhis) {
+      auto it = Locals.find(LocalIdx);
+      if (it != Locals.end()) {
+        ir_PHI_SET_OP(PhiRef, 2, it->second);
+      }
+    }
+    // Create back-edge
+    ir_ref LoopEnd = ir_LOOP_END();
+    ir_MERGE_SET_OP(Target.LoopHeader, 2, LoopEnd);
+  } else {
+    // Branch to block/if: create forward edge
+    // Save current Locals state for restoration at merge point
+    ir_ref BrEnd = ir_END();
+    Target.EndList.push_back(BrEnd);
+    Target.EndLocals.push_back(Locals);
+  }
+  
+  // False branch: continue with fallthrough
+  ir_IF_FALSE(IfRef);
+  
+  return {};
+}
+
+Expect<void> WasmToIRBuilder::visitBrTable(const AST::Instruction &Instr) {
+  ir_ctx *ctx = &Ctx;
+  
+  // Pop the index value from the stack
+  ir_ref IndexVal = pop();
+  
+  // Get the label list - last entry is the default
+  auto Labels = Instr.getLabelList();
+  if (Labels.empty()) {
+    return Unexpect(ErrCode::Value::RuntimeError);
+  }
+  
+  uint32_t NumCases = static_cast<uint32_t>(Labels.size()) - 1;
+  uint32_t DefaultLabelIdx = Labels.back().TargetIndex;
+  
+  // Validate default label index
+  if (DefaultLabelIdx >= LabelStack.size()) {
+    return Unexpect(ErrCode::Value::RuntimeError);
+  }
+  
+  // Implementation using chained if-else (simpler than ir_SWITCH for Wasm semantics)
+  // This generates: if (idx == 0) br label0; else if (idx == 1) br label1; ... else br default;
+  
+  for (uint32_t i = 0; i < NumCases; i++) {
+    uint32_t LabelIdx = Labels[i].TargetIndex;
+    
+    if (LabelIdx >= LabelStack.size()) {
+      return Unexpect(ErrCode::Value::RuntimeError);
+    }
+    
+    LabelInfo &Target = LabelStack[LabelStack.size() - 1 - LabelIdx];
+    
+    // Compare: idx == i
+    ir_ref CaseVal = ir_CONST_I32(static_cast<int32_t>(i));
+    ir_ref Cmp = ir_EQ(IndexVal, CaseVal);
+    
+    // if (idx == i)
+    ir_ref IfRef = ir_IF(Cmp);
+    
+    // True branch: branch to target
+    ir_IF_TRUE(IfRef);
+    
+    if (Target.Kind == ControlKind::Loop) {
+      // Update PHI nodes with current local values
+      for (auto &[LocalIdx, PhiRef] : Target.LoopLocalPhis) {
+        auto it = Locals.find(LocalIdx);
+        if (it != Locals.end()) {
+          ir_PHI_SET_OP(PhiRef, 2, it->second);
+        }
+      }
+      ir_ref LoopEnd = ir_LOOP_END();
+      ir_MERGE_SET_OP(Target.LoopHeader, 2, LoopEnd);
+    } else {
+      ir_ref BrEnd = ir_END();
+      Target.EndList.push_back(BrEnd);
+    }
+    
+    // False branch: continue checking next case
+    ir_IF_FALSE(IfRef);
+  }
+  
+  // Default case (all comparisons failed, or out of bounds)
+  LabelInfo &DefaultTarget = LabelStack[LabelStack.size() - 1 - DefaultLabelIdx];
+  
+  if (DefaultTarget.Kind == ControlKind::Loop) {
+    // Update PHI nodes with current local values
+    for (auto &[LocalIdx, PhiRef] : DefaultTarget.LoopLocalPhis) {
+      auto it = Locals.find(LocalIdx);
+      if (it != Locals.end()) {
+        ir_PHI_SET_OP(PhiRef, 2, it->second);
+      }
+    }
+    ir_ref LoopEnd = ir_LOOP_END();
+    ir_MERGE_SET_OP(DefaultTarget.LoopHeader, 2, LoopEnd);
+  } else {
+    ir_ref BrEnd = ir_END();
+    DefaultTarget.EndList.push_back(BrEnd);
+  }
+  
+  // After br_table, code is unreachable (all paths branch away)
+  CurrentPathTerminated = true;
+  
+  return {};
+}
+
+Expect<void> WasmToIRBuilder::visitReturn(const AST::Instruction &) {
+  ir_ctx *ctx = &Ctx;
+  
+  if (!ValueStack.empty()) {
+    ir_ref RetVal = pop();
+    ir_RETURN(RetVal);
+  } else {
+    ir_RETURN(IR_UNUSED);
+  }
+  
+  // Mark current path as terminated
+  CurrentPathTerminated = true;
+  
+  return {};
+}
+
+//===----------------------------------------------------------------------===//
+// Function Call Operations
+//===----------------------------------------------------------------------===//
+
+Expect<void> WasmToIRBuilder::visitCall(const AST::Instruction &Instr) {
+  ir_ctx *ctx = &Ctx;
+  
+  OpCode Op = Instr.getOpCode();
+  
+  if (Op == OpCode::Call_indirect) {
+    // call_indirect: pop runtime index from stack, look up function in table
+    uint32_t TypeIdx = Instr.getTargetIndex();
+    // uint32_t TableIdx = Instr.getSourceIndex();  // Currently ignored, assume table 0
+    
+    // Check if we have type information
+    if (TypeIdx >= ModuleFuncTypes.size()) {
+      return Unexpect(ErrCode::Value::RuntimeError);
+    }
+    
+    const AST::FunctionType *TargetFuncType = ModuleFuncTypes[TypeIdx];
+    if (!TargetFuncType) {
+      return Unexpect(ErrCode::Value::RuntimeError);
+    }
+    
+    const auto &ParamTypes = TargetFuncType->getParamTypes();
+    const auto &RetTypes = TargetFuncType->getReturnTypes();
+    
+    // Pop the runtime index from stack (this is the table index)
+    ir_ref TableIndex = pop();
+    
+    // Pop arguments from stack (in reverse order)
+    std::vector<ir_ref> Args;
+    Args.resize(ParamTypes.size() + 4);  // +4 for func_table, func_table_size, global_base, mem_base
+    
+    Args[0] = FuncTablePtr;
+    Args[1] = FuncTableSize;
+    Args[2] = GlobalBasePtr;
+    Args[3] = MemoryBase;
+    
+    for (size_t i = ParamTypes.size(); i > 0; --i) {
+      Args[i + 3] = pop();
+    }
+    
+    // Generate bounds check: if (TableIndex >= FuncTableSize) trap
+    // For PoC, we generate a conditional that calls through nullptr if out of bounds
+    // (which will crash, acting as a trap)
+    // TODO: Proper trap handling would use ir_GUARD or similar
+    ir_ref InBounds = ir_ULT(TableIndex, FuncTableSize);
+    
+    // Create conditional for bounds check
+    ir_ref IfRef = ir_IF(InBounds);
+    
+    // True branch: index is valid, do the call
+    ir_IF_TRUE(IfRef);
+    
+    // Load function pointer from FuncTablePtr[TableIndex]
+    // FuncTablePtr[TableIndex] = *(FuncTablePtr + TableIndex * sizeof(void*))
+    ir_ref IndexExtended = ir_ZEXT_A(TableIndex);  // Extend i32 to address size
+    ir_ref FuncOffset = ir_MUL_A(IndexExtended, ir_CONST_ADDR(sizeof(void*)));
+    ir_ref FuncPtrAddr = ir_ADD_A(FuncTablePtr, FuncOffset);
+    ir_ref FuncPtr = ir_LOAD_A(FuncPtrAddr);
+    
+    // Determine return type
+    ir_type RetType = IR_VOID;
+    if (!RetTypes.empty()) {
+      RetType = wasmTypeToIRType(RetTypes[0]);
+    }
+    
+    // Generate the call
+    ir_ref CallResult = ir_CALL_N(RetType, FuncPtr, 
+                                  static_cast<uint32_t>(Args.size()), 
+                                  Args.data());
+    
+    // Store result for later merge (if there's a return value)
+    ir_ref TrueEnd = ir_END();
+    
+    // False branch: index out of bounds, trap by calling nullptr
+    ir_IF_FALSE(IfRef);
+    
+    // Call through nullptr to trigger crash (simple trap for PoC)
+    // In a real implementation, we'd call a trap handler
+    ir_ref NullPtr = ir_CONST_ADDR(0);
+    ir_ref TrapResult = ir_CALL_N(RetType, NullPtr,
+                                  static_cast<uint32_t>(Args.size()),
+                                  Args.data());
+    ir_ref FalseEnd = ir_END();
+    
+    // Merge both paths
+    ir_MERGE_2(TrueEnd, FalseEnd);
+    
+    // Push return value (from the valid path)
+    if (!RetTypes.empty()) {
+      // Create PHI node to merge results from both paths
+      // Note: The trap path's result is undefined, but we need consistent types
+      ir_ref Phi = ir_PHI_2(RetType, CallResult, TrapResult);
+      push(Phi);
+    }
+    
+    return {};
+  }
+  
+  // Direct call: OpCode::Call
+  uint32_t FuncIdx = Instr.getTargetIndex();
+  
+  // Check if we have function type information
+  if (FuncIdx >= ModuleFuncTypes.size()) {
+    return Unexpect(ErrCode::Value::RuntimeError);
+  }
+  
+  const AST::FunctionType *TargetFuncType = ModuleFuncTypes[FuncIdx];
+  if (!TargetFuncType) {
+    return Unexpect(ErrCode::Value::RuntimeError);
+  }
+  
+  const auto &ParamTypes = TargetFuncType->getParamTypes();
+  const auto &RetTypes = TargetFuncType->getReturnTypes();
+  
+  // Pop arguments from stack (in reverse order)
+  std::vector<ir_ref> Args;
+  Args.resize(ParamTypes.size() + 4);  // +4 for func_table, func_table_size, global_base, mem_base
+  
+  // First four args: func_table, func_table_size, global_base, mem_base (passed through from our params)
+  Args[0] = FuncTablePtr;
+  Args[1] = FuncTableSize;
+  Args[2] = GlobalBasePtr;
+  Args[3] = MemoryBase;
+  
+  // Pop function arguments in reverse order
+  for (size_t i = ParamTypes.size(); i > 0; --i) {
+    Args[i + 3] = pop();  // Args[4..n+3] are the function params
+  }
+  
+  // Load function pointer from FuncTablePtr[FuncIdx]
+  // FuncTablePtr is void**, so FuncTablePtr[FuncIdx] = *(FuncTablePtr + FuncIdx * sizeof(void*))
+  ir_ref FuncOffset = ir_MUL_A(ir_CONST_ADDR(static_cast<uintptr_t>(FuncIdx)), 
+                               ir_CONST_ADDR(sizeof(void*)));
+  ir_ref FuncPtrAddr = ir_ADD_A(FuncTablePtr, FuncOffset);
+  ir_ref FuncPtr = ir_LOAD_A(FuncPtrAddr);
+  
+  // Determine return type
+  ir_type RetType = IR_VOID;
+  if (!RetTypes.empty()) {
+    // WebAssembly currently supports single return value
+    // Multi-value returns would need special handling
+    RetType = wasmTypeToIRType(RetTypes[0]);
+  }
+  
+  // Generate the call
+  ir_ref CallResult = ir_CALL_N(RetType, FuncPtr, 
+                                static_cast<uint32_t>(Args.size()), 
+                                Args.data());
+  
+  // Push return value(s) to stack
+  if (!RetTypes.empty()) {
+    push(CallResult);
+  }
+  
+  return {};
+}
+
+} // namespace VM
+} // namespace WasmEdge
+
+#endif // WASMEDGE_BUILD_IR_JIT
+

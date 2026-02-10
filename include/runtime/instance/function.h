@@ -23,6 +23,12 @@
 #include <string>
 #include <vector>
 
+#ifdef WASMEDGE_BUILD_IR_JIT
+// Forward declare IR types
+struct _ir_ctx;
+typedef struct _ir_ctx ir_ctx;
+#endif
+
 namespace WasmEdge {
 namespace Runtime {
 namespace Instance {
@@ -70,6 +76,18 @@ public:
         Data(std::in_place_type_t<std::unique_ptr<HostFunctionBase>>(),
              std::move(Func)) {}
 
+#ifdef WASMEDGE_BUILD_IR_JIT
+  /// Constructor for IR JIT compiled function.
+  FunctionInstance(const ModuleInstance *Mod, const uint32_t TIdx,
+                   const AST::FunctionType &Type, void *NativeFunc,
+                   size_t CodeSize, ir_ctx *IRGraph) noexcept
+      : CompositeBase(Mod, TIdx), FuncType(Type),
+        Data(std::in_place_type_t<IRJitFunction>(), NativeFunc, CodeSize,
+             IRGraph) {
+    assuming(ModInst);
+  }
+#endif
+
   /// Getter of checking is native wasm function.
   bool isWasmFunction() const noexcept {
     return std::holds_alternative<WasmFunction>(Data);
@@ -84,6 +102,13 @@ public:
   bool isHostFunction() const noexcept {
     return std::holds_alternative<std::unique_ptr<HostFunctionBase>>(Data);
   }
+
+#ifdef WASMEDGE_BUILD_IR_JIT
+  /// Getter of checking is IR JIT compiled function.
+  bool isIRJitFunction() const noexcept {
+    return std::holds_alternative<IRJitFunction>(Data);
+  }
+#endif
 
   /// Getter of function type.
   const AST::FunctionType &getFuncType() const noexcept { return FuncType; }
@@ -118,6 +143,38 @@ public:
   }
 
 private:
+#ifdef WASMEDGE_BUILD_IR_JIT
+  // Forward declare IR JIT function struct
+  struct IRJitFunction;
+#endif
+
+public:
+#ifdef WASMEDGE_BUILD_IR_JIT
+  /// Getter of IR JIT function data.
+  const IRJitFunction &getIRJitFunc() const noexcept {
+    return *std::get_if<IRJitFunction>(&Data);
+  }
+  
+  /// Getter of IR JIT native function pointer.
+  void *getIRJitNativeFunc() const noexcept {
+    if (auto *Func = std::get_if<IRJitFunction>(&Data)) {
+      return Func->NativeFunc;
+    }
+    return nullptr;
+  }
+  
+  /// Upgrade from WasmFunction to IR JIT compiled function.
+  /// Returns true if successful, false if not a WasmFunction.
+  bool upgradeToIRJit(void *NativeFunc, size_t CodeSize, ir_ctx *IRGraph) noexcept {
+    if (!std::holds_alternative<WasmFunction>(Data)) {
+      return false;
+    }
+    Data.template emplace<IRJitFunction>(NativeFunc, CodeSize, IRGraph);
+    return true;
+  }
+#endif
+
+private:
   struct WasmFunction {
     const std::vector<std::pair<uint32_t, ValType>> Locals;
     const uint32_t LocalNum;
@@ -136,13 +193,34 @@ private:
     }
   };
 
+#ifdef WASMEDGE_BUILD_IR_JIT
+  struct IRJitFunction {
+    void *NativeFunc;    // Pointer to JIT compiled code
+    size_t CodeSize;     // Size of compiled code
+    ir_ctx *IRGraph;     // IR graph (preserved for potential tier-up)
+
+    IRJitFunction(void *Func, size_t Size, ir_ctx *Graph) noexcept
+        : NativeFunc(Func), CodeSize(Size), IRGraph(Graph) {}
+
+    ~IRJitFunction() noexcept {
+      // Cleanup is handled by IRJitEngine
+    }
+  };
+#endif
+
   /// \name Data of function instance.
   /// @{
 
   const AST::FunctionType &FuncType;
+#ifdef WASMEDGE_BUILD_IR_JIT
+  std::variant<WasmFunction, Symbol<CompiledFunction>,
+               std::unique_ptr<HostFunctionBase>, IRJitFunction>
+      Data;
+#else
   std::variant<WasmFunction, Symbol<CompiledFunction>,
                std::unique_ptr<HostFunctionBase>>
       Data;
+#endif
   /// @}
 };
 

@@ -39,3 +39,15 @@ target_link_libraries(wasmedgeExecutor
   wasmedgeCommon
   wasmedgeSystem
 )
+
+if(WASMEDGE_BUILD_IR_JIT)
+  target_compile_definitions(wasmedgeExecutor
+    PUBLIC
+    -DWASMEDGE_BUILD_IR_JIT
+  )
+  target_link_libraries(wasmedgeExecutor
+    PUBLIC
+    wasmedgeIR
+    wasmedgeVM
+  )
+endif()
