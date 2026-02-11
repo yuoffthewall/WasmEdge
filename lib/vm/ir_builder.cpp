@@ -16,6 +16,7 @@ extern "C" {
 }
 
 #include <cassert>
+#include <set>
 
 namespace WasmEdge {
 namespace VM {
@@ -1246,7 +1247,7 @@ Expect<void> WasmToIRBuilder::visitControl(const AST::Instruction &Instr) {
   }
 }
 
-Expect<void> WasmToIRBuilder::visitBlock(const AST::Instruction &) {
+Expect<void> WasmToIRBuilder::visitBlock(const AST::Instruction &Instr) {
   // Create label info for the block
   // Blocks are forward-jump targets: br jumps to AFTER the end
   LabelInfo Label;
@@ -1254,7 +1255,17 @@ Expect<void> WasmToIRBuilder::visitBlock(const AST::Instruction &) {
   Label.LoopHeader = IR_UNUSED;
   Label.IfRef = IR_UNUSED;
   Label.ElseEnd = IR_UNUSED;
-  Label.Arity = 0;  // TODO: Get from block type
+  
+  // Get result type from block type
+  const BlockType &BType = Instr.getBlockType();
+  if (!BType.isEmpty() && BType.isValType()) {
+    Label.Arity = 1;
+    Label.ResultType = wasmTypeToIRType(BType.getValType());
+  } else {
+    Label.Arity = 0;
+    Label.ResultType = IR_VOID;
+  }
+  
   Label.StackBase = static_cast<uint32_t>(ValueStack.size());
   Label.InElseBranch = false;
   Label.HasElse = false;
@@ -1315,7 +1326,7 @@ Expect<void> WasmToIRBuilder::visitLoop(const AST::Instruction &) {
   return {};
 }
 
-Expect<void> WasmToIRBuilder::visitIf(const AST::Instruction &) {
+Expect<void> WasmToIRBuilder::visitIf(const AST::Instruction &Instr) {
   ir_ctx *ctx = &Ctx;
   ir_ref Condition = pop();
   
@@ -1333,12 +1344,25 @@ Expect<void> WasmToIRBuilder::visitIf(const AST::Instruction &) {
   Label.LoopHeader = IR_UNUSED;
   Label.IfRef = IfRef;
   Label.ElseEnd = IR_UNUSED;
-  Label.Arity = 0;  // TODO: Get from block type
+  
+  // Get result type from block type
+  const BlockType &BType = Instr.getBlockType();
+  if (!BType.isEmpty() && BType.isValType()) {
+    Label.Arity = 1;
+    Label.ResultType = wasmTypeToIRType(BType.getValType());
+  } else {
+    Label.Arity = 0;
+    Label.ResultType = IR_VOID;
+  }
+  
   Label.StackBase = static_cast<uint32_t>(ValueStack.size());
   Label.InElseBranch = false;
   Label.HasElse = false;
   Label.TrueBranchTerminated = false;
   Label.ElseBranchTerminated = false;
+  
+  // Save locals state before entering if (needed for PHIs at merge)
+  Label.PreIfLocals = Locals;
 
   LabelStack.push_back(Label);
   return {};
@@ -1359,14 +1383,25 @@ Expect<void> WasmToIRBuilder::visitElse(const AST::Instruction &) {
   // Record if the true branch terminated (via return/unreachable)
   Label.TrueBranchTerminated = CurrentPathTerminated;
   
-  // Only create ir_END() if the true branch didn't terminate
+  // Save result value from true branch (if there's a result type and branch didn't terminate)
+  if (Label.Arity > 0 && !CurrentPathTerminated) {
+    ir_ref TrueResult = pop();  // Pop the result value
+    Label.BranchResults.push_back(TrueResult);
+  }
+  
+  // Save the true branch's locals state (for PHI creation at merge)
   if (!CurrentPathTerminated) {
+    Label.EndLocals.push_back(Locals);
     ir_ref TrueEnd = ir_END();
     Label.EndList.push_back(TrueEnd);
   }
   
   // Start the false branch
   ir_IF_FALSE(Label.IfRef);
+  
+  // Restore pre-if locals for the else branch
+  // (else branch should start with the same state as before the if)
+  Locals = Label.PreIfLocals;
   
   // Reset termination flag for the else branch
   CurrentPathTerminated = false;
@@ -1468,11 +1503,23 @@ Expect<void> WasmToIRBuilder::visitEnd(const AST::Instruction &) {
   }
   
   case ControlKind::If: {
-    // Record if else/current branch terminated
+    // Record branch termination status and save locals
     if (Label.HasElse) {
+      // We're at the end of the else branch
       Label.ElseBranchTerminated = CurrentPathTerminated;
+      // Save else branch locals (if not terminated)
+      if (!CurrentPathTerminated) {
+        Label.EndLocals.push_back(Locals);
+      }
     } else {
-      // No else means the "else" path is just fallthrough (not terminated)
+      // No else: we're at the end of the true branch
+      // Record true branch termination status now (since visitElse wasn't called)
+      Label.TrueBranchTerminated = CurrentPathTerminated;
+      // Save true branch locals (if not terminated)
+      if (!CurrentPathTerminated) {
+        Label.EndLocals.push_back(Locals);
+      }
+      // "else" path is just fallthrough (not terminated)
       Label.ElseBranchTerminated = false;
     }
     
@@ -1484,6 +1531,12 @@ Expect<void> WasmToIRBuilder::visitEnd(const AST::Instruction &) {
       break;
     }
     
+    // Save result value from current branch (if there's a result type and branch didn't terminate)
+    if (Label.Arity > 0 && !CurrentPathTerminated) {
+      ir_ref BranchResult = pop();  // Pop the result value
+      Label.BranchResults.push_back(BranchResult);
+    }
+    
     // Only add current end if branch didn't terminate
     if (!CurrentPathTerminated) {
       ir_ref CurrentEnd = ir_END();
@@ -1492,7 +1545,28 @@ Expect<void> WasmToIRBuilder::visitEnd(const AST::Instruction &) {
     
     if (!Label.HasElse) {
       // No else clause: create empty false branch
+      // (execution falls through when condition is false)
       ir_IF_FALSE(Label.IfRef);
+      
+      // False branch has the pre-if locals (unmodified by true branch)
+      Label.EndLocals.push_back(Label.PreIfLocals);
+      
+      if (Label.Arity > 0) {
+        // Need a default value for the "no else" case
+        // This shouldn't happen in well-formed Wasm with result types
+        // but provide a default just in case
+        ir_ref DefaultVal = IR_UNUSED;
+        if (Label.ResultType == IR_I32) {
+          DefaultVal = ir_CONST_I32(0);
+        } else if (Label.ResultType == IR_I64) {
+          DefaultVal = ir_CONST_I64(0);
+        } else if (Label.ResultType == IR_FLOAT) {
+          DefaultVal = ir_CONST_FLOAT(0.0f);
+        } else if (Label.ResultType == IR_DOUBLE) {
+          DefaultVal = ir_CONST_DOUBLE(0.0);
+        }
+        Label.BranchResults.push_back(DefaultVal);
+      }
       ir_ref FalseEnd = ir_END();
       Label.EndList.push_back(FalseEnd);
     }
@@ -1502,12 +1576,78 @@ Expect<void> WasmToIRBuilder::visitEnd(const AST::Instruction &) {
       // Single path continuing
       ir_BEGIN(Label.EndList[0]);
       CurrentPathTerminated = false;
+      // Use that path's locals directly
+      if (!Label.EndLocals.empty()) {
+        Locals = Label.EndLocals[0];
+      }
+      // Push single result value
+      if (Label.Arity > 0 && !Label.BranchResults.empty()) {
+        push(Label.BranchResults[0]);
+      }
     } else if (Label.EndList.size() == 2) {
       ir_MERGE_2(Label.EndList[0], Label.EndList[1]);
       CurrentPathTerminated = false;
+      
+      // Create PHI nodes for locals that differ between branches
+      if (Label.EndLocals.size() == 2) {
+        std::map<uint32_t, ir_ref> MergedLocals;
+        const auto &Locals0 = Label.EndLocals[0];
+        const auto &Locals1 = Label.EndLocals[1];
+        
+        // Collect all local indices from both branches
+        std::set<uint32_t> AllLocalIndices;
+        for (const auto &[idx, _] : Locals0) AllLocalIndices.insert(idx);
+        for (const auto &[idx, _] : Locals1) AllLocalIndices.insert(idx);
+        
+        for (uint32_t LocalIdx : AllLocalIndices) {
+          auto it0 = Locals0.find(LocalIdx);
+          auto it1 = Locals1.find(LocalIdx);
+          
+          if (it0 != Locals0.end() && it1 != Locals1.end()) {
+            ir_ref Val0 = it0->second;
+            ir_ref Val1 = it1->second;
+            if (Val0 != Val1) {
+              // Different values, need PHI
+              ir_type LocalType = IR_I32;  // Default
+              if (Val0 > 0 && Val0 < static_cast<ir_ref>(ctx->insns_count)) {
+                ir_insn *insn = &ctx->ir_base[Val0];
+                if (insn) LocalType = static_cast<ir_type>(insn->type);
+              }
+              ir_ref Phi = ir_PHI_2(LocalType, Val0, Val1);
+              MergedLocals[LocalIdx] = Phi;
+            } else {
+              MergedLocals[LocalIdx] = Val0;  // Same value, no PHI needed
+            }
+          } else if (it0 != Locals0.end()) {
+            MergedLocals[LocalIdx] = it0->second;
+          } else if (it1 != Locals1.end()) {
+            MergedLocals[LocalIdx] = it1->second;
+          }
+        }
+        Locals = MergedLocals;
+      }
+      
+      // Create PHI node for result value
+      if (Label.Arity > 0 && Label.BranchResults.size() == 2) {
+        ir_ref ResultPhi = ir_PHI_2(Label.ResultType, 
+                                     Label.BranchResults[0], 
+                                     Label.BranchResults[1]);
+        push(ResultPhi);
+      }
     } else if (Label.EndList.size() > 2) {
       ir_MERGE_N(static_cast<ir_ref>(Label.EndList.size()), Label.EndList.data());
       CurrentPathTerminated = false;
+      // Simplified: use first path's locals for now (proper impl would create N-way PHIs)
+      if (!Label.EndLocals.empty()) {
+        Locals = Label.EndLocals[0];
+      }
+      // Create PHI node for result value from multiple branches
+      if (Label.Arity > 0 && Label.BranchResults.size() == Label.EndList.size()) {
+        ir_ref ResultPhi = ir_PHI_N(Label.ResultType, 
+                                     static_cast<ir_ref>(Label.BranchResults.size()),
+                                     Label.BranchResults.data());
+        push(ResultPhi);
+      }
     }
     // else: no live paths (shouldn't happen if we handled both-terminated case above)
     break;

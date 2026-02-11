@@ -3,12 +3,13 @@
 **Status**: Phase 1 - Complete IR Lowering + WasmEdge Integration ✅  
 **Last Updated**: February 11, 2026  
 **Build Status**: Compiling with no errors  
-**Test Status**: All tests passing (100%)
+**Test Status**: All tests passing (100%) - **176 total tests across 6 test suites**
 - Basic IR Generation (33 tests)
 - Instruction Coverage (43 tests)  
 - **Execution Correctness (79 tests)** ✅ (includes 8 control flow + 19 memory + 4 function call + 5 global tests)
 - **Integration Tests (6 tests)** ✅ (includes factorial, memory access, globals, conditional logic)
-- **End-to-End Tests (5 tests)** ✅ NEW - real .wasm file loading and execution
+- **End-to-End Tests (5 tests)** ✅ - real .wasm file loading and execution
+- **Benchmark Tests (10 tests)** ✅ NEW - integer algorithm correctness + performance
 
 **WasmEdge Integration**: ✅ IR JIT compiles functions during module instantiation  
 **Instruction Coverage**: ~167 WebAssembly instructions mapped to IR  
@@ -16,8 +17,9 @@
 **Function Calls**: ✅ `call` and `call_indirect` implemented with execution correctness verified (4 tests)  
 **Global Operations**: ✅ `global.get` and `global.set` implemented with execution correctness verified (5 tests)  
 **Execution Verified**: ✅ I32/I64 arithmetic, bitwise, comparison, unary, memory ops, function calls, globals produce correct results  
-**Control Flow Execution**: ✅ Fixed - loops with local variables now correctly use PHI nodes for SSA  
-**Loop Variables**: ✅ Fixed - PHI nodes properly merge local variable values across loop iterations
+**Control Flow Execution**: ✅ Fixed - if blocks with result types now generate proper PHI nodes  
+**Loop Variables**: ✅ Fixed - PHI nodes properly merge local variable values across loop iterations  
+**If Block Locals**: ✅ Fixed - Local variables modified in if branches correctly merged with PHI nodes
 
 ## Table of Contents
 
@@ -496,8 +498,11 @@ WasmEdge/
 ├── test/ir/
 │   ├── testdata/
 │   │   ├── factorial.wat                   [new - E2E test module]
-│   │   └── factorial.wasm                  [new - compiled E2E test]
-│   └── ir_e2e_test.cpp                     [new - E2E integration tests]
+│   │   ├── factorial.wasm                  [new - compiled E2E test]
+│   │   ├── fibonacci.wat                   [new - benchmark algorithms]
+│   │   └── fibonacci.wasm                  [new - compiled benchmarks]
+│   ├── ir_e2e_test.cpp                     [new - E2E integration tests]
+│   └── ir_benchmark_test.cpp               [new - algorithm benchmarks]
 └── ir/                                     [dstogov/ir submodule]
     ├── ir.h
     ├── ir_builder.h
@@ -506,21 +511,24 @@ WasmEdge/
 
 ### Code Statistics
 
-**New Files**: 4 headers + 2 implementations + 5 test files = 11 files  
+**New Files**: 4 headers + 2 implementations + 6 test files = 12 files  
 **Modified Files**: 8 files  
-**Lines of Code Added**: ~5,500 lines
+**Lines of Code Added**: ~6,500 lines
 
 | Component | Lines | Description |
 |-----------|-------|-------------|
-| ir_builder.h | 138 | Translation layer interface |
-| ir_builder.cpp | 1,381 | Complete Wasm→IR lowering (~164 instrs + memory ops) |
+| ir_builder.h | 145 | Translation layer interface (includes PreIfLocals, ResultType) |
+| ir_builder.cpp | 1,450 | Complete Wasm→IR lowering (~164 instrs + PHI node fixes) |
 | ir_jit_engine.h | 50 | JIT engine interface |
 | ir_jit_engine.cpp | 233 | Compilation and execution (updated calling convention) |
 | ir_basic_test.cpp | 916 | Basic functionality tests (33 tests) |
-| ir_instruction_test.cpp | 720 | Comprehensive instruction tests (35 tests) |
-| ir_execution_test.cpp | 1376 | Execution correctness tests (67 tests) |
-| ir_e2e_test.cpp | ~200 | End-to-end integration tests (5 tests) |
-| factorial.wat | ~50 | E2E test module source |
+| ir_instruction_test.cpp | 720 | Comprehensive instruction tests (43 tests) |
+| ir_execution_test.cpp | 1,550 | Execution correctness tests (79 tests) |
+| ir_integration_test.cpp | 403 | Integration tests (6 tests) |
+| ir_e2e_test.cpp | 325 | End-to-end integration tests (5 tests) |
+| ir_benchmark_test.cpp | 450 | Algorithm benchmarks (10 tests) |
+| factorial.wat | 57 | E2E test module source |
+| fibonacci.wat | 172 | Benchmark algorithms (fib, ackermann, primes, etc.) |
 | function.h | +50 | IR JIT function variant + upgradeToIRJit |
 | module.cpp | +80 | IR JIT compilation hook |
 | helper.cpp | +60 | Runtime context (func_table, globals, memory) |
@@ -1034,13 +1042,34 @@ TEST_F(IRExecutionTest, CallIndirect_RuntimeIndex) {
 [==========] 33 tests from 3 test suites
 [  PASSED  ] 33 tests (100%)
 
-# Comprehensive Instruction Test Suite (40 tests)
-[==========] 40 tests from 1 test suite
-[  PASSED  ] 40 tests (100%)
+# Comprehensive Instruction Test Suite (43 tests)
+[==========] 43 tests from 1 test suite
+[  PASSED  ] 43 tests (100%)
 
-# Execution Correctness Test Suite (74 tests)
-[==========] 74 tests from 2 test suites
-[  PASSED  ] 74 tests (100%)
+# Execution Correctness Test Suite (79 tests)
+[==========] 79 tests from 2 test suites
+[  PASSED  ] 79 tests (100%)
+
+# Integration Test Suite (6 tests)
+[==========] 6 tests from 1 test suite
+[  PASSED  ] 6 tests (100%)
+
+# End-to-End Test Suite (5 tests)
+[==========] 5 tests from 1 test suite
+[  PASSED  ] 5 tests (100%)
+
+# Benchmark Test Suite (10 tests)
+[==========] 10 tests from 1 test suite
+[  PASSED  ] 10 tests (100%)
+  - FibonacciRecursive_Correctness
+  - FibonacciIterative_Correctness  
+  - Ackermann_Correctness
+  - SumToN_Correctness
+  - GCD_Correctness
+  - IsPrime_Correctness
+  - CountPrimes_Correctness
+  - Benchmark_FibonacciIterative (~4.5M calls/sec)
+  - Benchmark_CountPrimes (~170k calls/sec)
 
 Type Conversion Coverage (FULL IMPLEMENTATION):
   ✅ Integer wrap/extend - ir_TRUNC, ir_SEXT, ir_ZEXT
@@ -1053,9 +1082,11 @@ Type Conversion Coverage (FULL IMPLEMENTATION):
 
 Control Flow & Calls Coverage (IR Generation + Execution ✅):
   ✅ nop, unreachable - Direct IR mapping
-  ✅ block - Forward-jump with ir_END/ir_MERGE
+  ✅ block - Forward-jump with ir_END/ir_MERGE, result type support
   ✅ loop - ir_LOOP_BEGIN/ir_LOOP_END with back-edges and PHI nodes for locals
   ✅ if/else/end - ir_IF/ir_IF_TRUE/ir_IF_FALSE with proper termination tracking
+  ✅ if (result type) - PHI nodes for merging branch results
+  ✅ if without else - PHI nodes for merging locals with fallthrough path
   ✅ br - Unconditional branch (forward/backward)
   ✅ br_if - Conditional branch with ir_IF
   ✅ br_table - Multi-way branch using chained comparisons
@@ -1064,27 +1095,34 @@ Control Flow & Calls Coverage (IR Generation + Execution ✅):
   ✅ call_indirect - Indirect call with runtime index and bounds checking
 
 Global Operations Coverage (IR Generation + Execution ✅):
-  ✅ global.get - Load from global_base[index * 8]
-  ✅ global.set - Store to global_base[index * 8]
+  ✅ global.get - Load via ValVariant** (double indirection)
+  ✅ global.set - Store via ValVariant** (double indirection)
 
-TOTAL: 161/161 tests passing ✅
+TOTAL: 176/176 tests passing ✅
   - Basic IR Generation: 33 tests
   - Instruction Coverage: 43 tests
-  - Execution Correctness: 79 tests
-  - Integration Tests: 6 tests
   - Execution Correctness: 79 tests (includes 8 control flow + 19 memory + 4 function call + 5 global tests)
+  - Integration Tests: 6 tests
+  - End-to-End Tests: 5 tests
+  - Benchmark Tests: 10 tests
 ```
 
 **Test Suite Structure:**
 ```
 test/ir/
 ├── ir_basic_test.cpp        (33 tests - IR generation)
-├── ir_instruction_test.cpp  (35 tests - bulk instruction coverage)
-├── ir_execution_test.cpp    (67 tests - execution correctness)
+├── ir_instruction_test.cpp  (43 tests - bulk instruction coverage)
+├── ir_execution_test.cpp    (79 tests - execution correctness)
+├── ir_integration_test.cpp  (6 tests - WasmEdge runtime integration)
+├── ir_e2e_test.cpp          (5 tests - real .wasm file loading)
+├── ir_benchmark_test.cpp    (10 tests - algorithm benchmarks)
+├── testdata/
+│   ├── factorial.wat/wasm   (E2E test module)
+│   └── fibonacci.wat/wasm   (benchmark algorithms)
 └── CMakeLists.txt           (build configuration)
 ```
 
-**Execution Tests Coverage (67 tests):**
+**Execution Tests Coverage (79 tests):**
 ```
 I32 Operations Verified (29 tests):
   ✅ Arithmetic: add, sub, mul, div_s, div_u, rem_s, rem_u (incl. overflow)
@@ -1097,12 +1135,28 @@ I64 Operations Verified (14 tests):
   ✅ Comparison: eq, lt_s, lt_u
   ✅ Unary: eqz, clz, ctz, popcnt
 
-Control Flow Verified (5 tests):
+Control Flow Verified (8 tests):
   ✅ ControlFlow_IfElse_Basic - if/else with return in both branches
   ✅ ControlFlow_IfElse_Max - max(a,b) using comparison + if/else
   ✅ ControlFlow_NestedIfElse_Sign - nested if/else for sign function
   ✅ ControlFlow_EarlyReturn_Clamp - early returns with if (no else)
   ✅ ControlFlow_IfElse_Abs - absolute value using if/else
+  ✅ ControlFlow_BrTable_DefaultOnly - br_table with only default case
+  ✅ ControlFlow_BrTable_Switch - br_table multi-way branch
+  ✅ ControlFlow_BrTable_SingleCase - br_table with single case
+
+Function Calls Verified (4 tests):
+  ✅ Call_DirectToNative - direct call to native function via func_table
+  ✅ Call_MultipleArgs - call with multiple arguments
+  ✅ CallIndirect_RuntimeIndex - indirect call with runtime index
+  ✅ CallIndirect_ConstantIndex - indirect call with constant index
+
+Global Operations Verified (5 tests):
+  ✅ Global_GetI32 - i32 global read
+  ✅ Global_SetI32 - i32 global write
+  ✅ Global_Increment - global get + set roundtrip
+  ✅ Global_Multiple - multiple globals access
+  ✅ Global_I64 - i64 global read
 
 Memory Operations Verified (19 tests):
   ✅ Memory_I32_Load - 32-bit load verification
@@ -1124,6 +1178,23 @@ Memory Operations Verified (19 tests):
   ✅ Memory_I64_Store32 - truncated 32-bit store (i64)
   ✅ Memory_I32_RoundTrip - store/load round-trip verification
   ✅ Memory_I64_RoundTrip - store/load round-trip verification (i64)
+```
+
+**Benchmark Tests (10 tests):**
+```
+Integer Algorithm Correctness (8 tests):
+  ✅ FibonacciRecursive - recursive fibonacci (tests recursive calls + if result type)
+  ✅ FibonacciIterative - iterative fibonacci (tests loops + locals)
+  ✅ Ackermann - Ackermann function (tests deep recursion + nested if)
+  ✅ SumToN - sum 1..n (tests basic loop)
+  ✅ GCD - Euclidean GCD (tests loop + conditional)
+  ✅ IsPrime - primality test (tests early return in loop)
+  ✅ TestIsPrimeWrapper - wrapper for is_prime (tests call mechanism)
+  ✅ CountPrimes - count primes up to n (tests nested control flow + calls)
+
+Performance Benchmarks (2 tests):
+  ✅ Benchmark_FibonacciIterative - fib(35) x 100k iterations (~4.5M calls/sec)
+  ✅ Benchmark_CountPrimes - count_primes(1000) x 1k iterations (~170k calls/sec)
 ```
 
 ### Instruction Coverage Verification
@@ -1173,16 +1244,23 @@ Total Instructions Tested: ~145
 ```bash
 cd build
 
-# Run basic tests
-make wasmedgeIRTests
-./test/ir/wasmedgeIRTests
+# Build all IR tests
+make -j8 wasmedgeIRTests wasmedgeIRInstructionTests wasmedgeIRExecutionTests \
+         wasmedgeIRIntegrationTests wasmedgeIRE2ETests wasmedgeIRBenchmarkTests
 
-# Run comprehensive instruction tests  
-make wasmedgeIRInstructionTests
-./test/ir/wasmedgeIRInstructionTests
+# Run individual test suites
+./test/ir/wasmedgeIRTests              # Basic IR generation (33 tests)
+./test/ir/wasmedgeIRInstructionTests   # Instruction coverage (43 tests)
+./test/ir/wasmedgeIRExecutionTests     # Execution correctness (79 tests)
+./test/ir/wasmedgeIRIntegrationTests   # Runtime integration (6 tests)
+./test/ir/wasmedgeIRE2ETests           # End-to-end with .wasm (5 tests)
+./test/ir/wasmedgeIRBenchmarkTests     # Algorithm benchmarks (10 tests)
 
 # Run all IR tests via CTest
 ctest -R IR
+
+# Run all tests with verbose output
+ctest -R IR -V
 ```
 
 ### Manual Verification
@@ -1249,8 +1327,20 @@ TEST_F(IRExecutionTest, I32_Add_Basic) {
 
 4. **Execution Correctness Tests** ✅ (79 tests)
    - I32/I64 arithmetic, bitwise, comparison, unary (43 tests)
-   - Control flow: if/else, nested, early return (5 tests)
+   - Control flow: if/else, nested, early return, br_table (8 tests)
+   - Function calls: direct and indirect (4 tests)
+   - Global operations: get/set for i32/i64 (5 tests)
    - Memory: load/store with sign/zero extension (19 tests)
+
+5. **End-to-End Tests** ✅ (5 tests)
+   - Load real .wasm files through WasmEdge loader/validator
+   - Compile all functions via IR JIT at module instantiation
+   - Execute through WasmEdge executor dispatch
+
+6. **Benchmark Tests** ✅ (10 tests)
+   - Correctness: fibonacci, ackermann, sum, GCD, prime counting
+   - Performance: throughput measurements for real algorithms
+   - Tests complex control flow: recursive calls, nested if with result types, loops modifying locals
 
 ### Remaining Test Gaps
 

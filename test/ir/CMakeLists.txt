@@ -113,3 +113,27 @@ target_link_libraries(wasmedgeIRE2ETests
 )
 
 add_test(NAME IRE2ETests COMMAND wasmedgeIRE2ETests)
+
+# IR JIT benchmark tests (integer algorithms)
+wasmedge_add_executable(wasmedgeIRBenchmarkTests
+  ir_benchmark_test.cpp
+)
+
+target_include_directories(wasmedgeIRBenchmarkTests
+  PRIVATE
+  ${PROJECT_SOURCE_DIR}/include
+  ${PROJECT_SOURCE_DIR}/test
+)
+
+target_link_libraries(wasmedgeIRBenchmarkTests
+  PRIVATE
+  wasmedgeLoader
+  wasmedgeValidator
+  wasmedgeExecutor
+  wasmedgeVM
+  wasmedgeIR
+  wasmedgeCommon
+  GTest::gtest_main
+)
+
+add_test(NAME IRBenchmarkTests COMMAND wasmedgeIRBenchmarkTests)

@@ -87,8 +87,9 @@ private:
     ir_ref ElseEnd;            // For if: end of else branch (or true branch if no else)
     std::vector<ir_ref> EndList;  // List of ir_END() refs to merge at end
     std::vector<std::map<uint32_t, ir_ref>> EndLocals;  // Locals state at each EndList entry
-    std::vector<ir_ref> PhiNodes; // PHI nodes for multi-value results
-    uint32_t Arity;            // Number of values expected at branch
+    std::vector<ir_ref> BranchResults; // Result values from each branch (for result types)
+    uint32_t Arity;            // Number of values expected at branch (0 or 1)
+    ir_type ResultType;        // IR type of result (IR_VOID if no result)
     uint32_t StackBase;        // Stack base for this label
     bool InElseBranch;         // For if: are we in the else branch?
     bool HasElse;              // For if: does this have an else clause?
@@ -98,6 +99,9 @@ private:
     // For loops: PHI nodes for local variables
     std::map<uint32_t, ir_ref> LoopLocalPhis;  // LocalIdx -> PHI node ref
     std::map<uint32_t, ir_ref> PreLoopLocals;  // LocalIdx -> value before loop
+    
+    // For if: locals state at the start of if (before any branch executes)
+    std::map<uint32_t, ir_ref> PreIfLocals;    // LocalIdx -> value before if
   };
 
   /// Stack operations

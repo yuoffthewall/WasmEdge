@@ -322,15 +322,16 @@ TEST_F(IRIntegrationTest, GlobalAccess_IncrementCounter) {
   auto *Result = compileToNative();
   ASSERT_NE(Result, nullptr);
 
-  // Set up globals array (8 bytes per global)
-  int64_t Globals[1] = {0};
+  // Set up globals - GlobalBase is ValVariant** (array of pointers to ValVariant)
+  ValVariant GlobalVal(static_cast<uint32_t>(0));
+  ValVariant* GlobalPtrs[1] = {&GlobalVal};
 
   // Call multiple times, each should increment
   for (int expected = 1; expected <= 5; expected++) {
     std::vector<ValVariant> Args;
     std::vector<ValVariant> Rets(1);
     auto Res = Engine->invoke(Result->NativeFunc, FuncType, Args, Rets,
-                              nullptr, 0, Globals, nullptr, 0);
+                              nullptr, 0, GlobalPtrs, nullptr, 0);
     ASSERT_TRUE(Res.has_value());
     EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), expected)
         << "Counter should be " << expected;

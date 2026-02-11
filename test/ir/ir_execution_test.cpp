@@ -1353,21 +1353,23 @@ TEST_F(IRExecutionTest, Global_GetI32) {
   void* Func = CompRes->NativeFunc;
   ASSERT_NE(Func, nullptr);
   
-  // Set up globals array (8 bytes per global)
-  int64_t Globals[1] = {0};
+  // Set up globals - GlobalBase is ValVariant** (array of pointers to ValVariant)
+  // Each ValVariant is 16 bytes, but for i32 we store at offset 0
+  ValVariant GlobalVal;
+  ValVariant* GlobalPtrs[1] = {&GlobalVal};
   
   using FnType = int32_t (*)(void**, uint32_t, void*, void*);
   auto fn = reinterpret_cast<FnType>(Func);
   
   // Test with different values
-  Globals[0] = 42;
-  EXPECT_EQ(fn(nullptr, 0, Globals, Memory.data()), 42);
+  GlobalVal = ValVariant(static_cast<uint32_t>(42));
+  EXPECT_EQ(fn(nullptr, 0, GlobalPtrs, Memory.data()), 42);
   
-  Globals[0] = -1;
-  EXPECT_EQ(fn(nullptr, 0, Globals, Memory.data()), -1);
+  GlobalVal = ValVariant(static_cast<uint32_t>(-1));
+  EXPECT_EQ(fn(nullptr, 0, GlobalPtrs, Memory.data()), -1);
   
-  Globals[0] = 0x7FFFFFFF;  // INT32_MAX
-  EXPECT_EQ(fn(nullptr, 0, Globals, Memory.data()), 0x7FFFFFFF);
+  GlobalVal = ValVariant(static_cast<uint32_t>(0x7FFFFFFF));  // INT32_MAX
+  EXPECT_EQ(fn(nullptr, 0, GlobalPtrs, Memory.data()), 0x7FFFFFFF);
 }
 
 // Test: global.set for i32 global
@@ -1395,20 +1397,22 @@ TEST_F(IRExecutionTest, Global_SetI32) {
   void* Func = CompRes->NativeFunc;
   ASSERT_NE(Func, nullptr);
   
-  int64_t Globals[1] = {0};
+  // Set up globals - GlobalBase is ValVariant** (array of pointers to ValVariant)
+  ValVariant GlobalVal(static_cast<uint32_t>(0));
+  ValVariant* GlobalPtrs[1] = {&GlobalVal};
   
   using FnType = void (*)(void**, uint32_t, void*, void*, int32_t);
   auto fn = reinterpret_cast<FnType>(Func);
   
   // Test setting different values
-  fn(nullptr, 0, Globals, Memory.data(), 123);
-  EXPECT_EQ(static_cast<int32_t>(Globals[0]), 123);
+  fn(nullptr, 0, GlobalPtrs, Memory.data(), 123);
+  EXPECT_EQ(GlobalVal.get<uint32_t>(), 123u);
   
-  fn(nullptr, 0, Globals, Memory.data(), -999);
-  EXPECT_EQ(static_cast<int32_t>(Globals[0]), -999);
+  fn(nullptr, 0, GlobalPtrs, Memory.data(), -999);
+  EXPECT_EQ(static_cast<int32_t>(GlobalVal.get<uint32_t>()), -999);
   
-  fn(nullptr, 0, Globals, Memory.data(), 0);
-  EXPECT_EQ(static_cast<int32_t>(Globals[0]), 0);
+  fn(nullptr, 0, GlobalPtrs, Memory.data(), 0);
+  EXPECT_EQ(GlobalVal.get<uint32_t>(), 0u);
 }
 
 // Test: global get/set roundtrip - increment a global
@@ -1442,20 +1446,22 @@ TEST_F(IRExecutionTest, Global_Increment) {
   void* Func = CompRes->NativeFunc;
   ASSERT_NE(Func, nullptr);
   
-  int64_t Globals[1] = {0};
+  // Set up globals - GlobalBase is ValVariant** (array of pointers to ValVariant)
+  ValVariant GlobalVal(static_cast<uint32_t>(0));
+  ValVariant* GlobalPtrs[1] = {&GlobalVal};
   
   using FnType = int32_t (*)(void**, uint32_t, void*, void*);
   auto fn = reinterpret_cast<FnType>(Func);
   
   // Call multiple times, each should increment
-  Globals[0] = 0;
-  EXPECT_EQ(fn(nullptr, 0, Globals, Memory.data()), 1);
-  EXPECT_EQ(fn(nullptr, 0, Globals, Memory.data()), 2);
-  EXPECT_EQ(fn(nullptr, 0, Globals, Memory.data()), 3);
+  GlobalVal = ValVariant(static_cast<uint32_t>(0));
+  EXPECT_EQ(fn(nullptr, 0, GlobalPtrs, Memory.data()), 1);
+  EXPECT_EQ(fn(nullptr, 0, GlobalPtrs, Memory.data()), 2);
+  EXPECT_EQ(fn(nullptr, 0, GlobalPtrs, Memory.data()), 3);
   
   // Start from different value
-  Globals[0] = 100;
-  EXPECT_EQ(fn(nullptr, 0, Globals, Memory.data()), 101);
+  GlobalVal = ValVariant(static_cast<uint32_t>(100));
+  EXPECT_EQ(fn(nullptr, 0, GlobalPtrs, Memory.data()), 101);
 }
 
 // Test: multiple globals
@@ -1484,20 +1490,26 @@ TEST_F(IRExecutionTest, Global_Multiple) {
   void* Func = CompRes->NativeFunc;
   ASSERT_NE(Func, nullptr);
   
-  int64_t Globals[2] = {0, 0};
+  // Set up globals - GlobalBase is ValVariant** (array of pointers to ValVariant)
+  ValVariant GlobalVal0(static_cast<uint32_t>(0));
+  ValVariant GlobalVal1(static_cast<uint32_t>(0));
+  ValVariant* GlobalPtrs[2] = {&GlobalVal0, &GlobalVal1};
   
   using FnType = int32_t (*)(void**, uint32_t, void*, void*);
   auto fn = reinterpret_cast<FnType>(Func);
   
   // Test different combinations
-  Globals[0] = 10; Globals[1] = 20;
-  EXPECT_EQ(fn(nullptr, 0, Globals, Memory.data()), 30);
+  GlobalVal0 = ValVariant(static_cast<uint32_t>(10));
+  GlobalVal1 = ValVariant(static_cast<uint32_t>(20));
+  EXPECT_EQ(fn(nullptr, 0, GlobalPtrs, Memory.data()), 30);
   
-  Globals[0] = -5; Globals[1] = 5;
-  EXPECT_EQ(fn(nullptr, 0, Globals, Memory.data()), 0);
+  GlobalVal0 = ValVariant(static_cast<uint32_t>(-5));
+  GlobalVal1 = ValVariant(static_cast<uint32_t>(5));
+  EXPECT_EQ(fn(nullptr, 0, GlobalPtrs, Memory.data()), 0);
   
-  Globals[0] = 100; Globals[1] = 200;
-  EXPECT_EQ(fn(nullptr, 0, Globals, Memory.data()), 300);
+  GlobalVal0 = ValVariant(static_cast<uint32_t>(100));
+  GlobalVal1 = ValVariant(static_cast<uint32_t>(200));
+  EXPECT_EQ(fn(nullptr, 0, GlobalPtrs, Memory.data()), 300);
 }
 
 // Test: i64 global
@@ -1523,16 +1535,18 @@ TEST_F(IRExecutionTest, Global_I64) {
   void* Func = CompRes->NativeFunc;
   ASSERT_NE(Func, nullptr);
   
-  int64_t Globals[1] = {0};
+  // Set up globals - GlobalBase is ValVariant** (array of pointers to ValVariant)
+  ValVariant GlobalVal(static_cast<uint64_t>(0));
+  ValVariant* GlobalPtrs[1] = {&GlobalVal};
   
   using FnType = int64_t (*)(void**, uint32_t, void*, void*);
   auto fn = reinterpret_cast<FnType>(Func);
   
-  Globals[0] = 0x123456789ABCDEF0LL;
-  EXPECT_EQ(fn(nullptr, 0, Globals, Memory.data()), 0x123456789ABCDEF0LL);
+  GlobalVal = ValVariant(static_cast<uint64_t>(0x123456789ABCDEF0ULL));
+  EXPECT_EQ(fn(nullptr, 0, GlobalPtrs, Memory.data()), 0x123456789ABCDEF0LL);
   
-  Globals[0] = -1LL;
-  EXPECT_EQ(fn(nullptr, 0, Globals, Memory.data()), -1LL);
+  GlobalVal = ValVariant(static_cast<uint64_t>(-1LL));
+  EXPECT_EQ(fn(nullptr, 0, GlobalPtrs, Memory.data()), -1LL);
 }
 
 //==============================================================================
