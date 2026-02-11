@@ -519,4 +519,250 @@ TEST_F(IRBenchmarkTest, Benchmark_CountPrimes) {
             << (1000.0 / avgTime) << " calls/sec" << std::endl;
 }
 
+// ============================================================================
+// Quicksort Tests - Memory operations + recursion
+// ============================================================================
+
+TEST_F(IRBenchmarkTest, Quicksort_Correctness) {
+  auto TestDataPath = getTestDataPath();
+  auto WasmPath = TestDataPath / "fibonacci.wasm";
+
+  if (!std::filesystem::exists(WasmPath)) {
+    GTEST_SKIP() << "Test data not found";
+  }
+
+  WasmEdge::Loader::Loader Loader(Conf);
+  auto LoadRes = Loader.parseModule(WasmPath);
+  ASSERT_TRUE(LoadRes.has_value());
+
+  WasmEdge::Validator::Validator Validator(Conf);
+  ASSERT_TRUE(Validator.validate(**LoadRes).has_value());
+
+  WasmEdge::Runtime::StoreManager StoreMgr;
+  WasmEdge::Executor::Executor Executor(Conf);
+
+  auto InstRes = Executor.registerModule(StoreMgr, **LoadRes, "bench");
+  ASSERT_TRUE(InstRes.has_value());
+
+  auto *ModInst = InstRes->get();
+  
+  // Get function pointers
+  auto *QuicksortFunc = ModInst->findFuncExports("quicksort");
+  auto *IsSortedFunc = ModInst->findFuncExports("is_sorted");
+  ASSERT_NE(QuicksortFunc, nullptr);
+  ASSERT_NE(IsSortedFunc, nullptr);
+  EXPECT_TRUE(QuicksortFunc->isIRJitFunction()) << "quicksort should be JIT compiled";
+  EXPECT_TRUE(IsSortedFunc->isIRJitFunction()) << "is_sorted should be JIT compiled";
+
+  // Get memory instance
+  auto MemInsts = ModInst->getMemoryInstances();
+  ASSERT_FALSE(MemInsts.empty());
+  auto *MemInst = MemInsts[0];
+  ASSERT_NE(MemInst, nullptr);
+
+  auto QuicksortParams = QuicksortFunc->getFuncType().getParamTypes();
+  auto IsSortedParams = IsSortedFunc->getFuncType().getParamTypes();
+
+  // Test case 1: Sort a small array [5, 2, 8, 1, 9]
+  {
+    const uint32_t BASE = 0;
+    const uint32_t LEN = 5;
+    int32_t testData[] = {5, 2, 8, 1, 9};
+    
+    // Write test data to memory
+    for (uint32_t i = 0; i < LEN; i++) {
+      uint8_t *ptr = MemInst->getPointer<uint8_t *>(BASE + i * 4);
+      ASSERT_NE(ptr, nullptr);
+      *reinterpret_cast<int32_t *>(ptr) = testData[i];
+    }
+
+    // Call quicksort(base=0, low=0, high=4)
+    std::vector<WasmEdge::ValVariant> SortArgs = {
+        WasmEdge::ValVariant(uint32_t(BASE)),
+        WasmEdge::ValVariant(uint32_t(0)),
+        WasmEdge::ValVariant(uint32_t(LEN - 1))};
+    auto SortRes = Executor.invoke(QuicksortFunc, SortArgs, QuicksortParams);
+    ASSERT_TRUE(SortRes.has_value()) << "quicksort failed";
+
+    // Verify sorted with is_sorted
+    std::vector<WasmEdge::ValVariant> CheckArgs = {
+        WasmEdge::ValVariant(uint32_t(BASE)),
+        WasmEdge::ValVariant(uint32_t(LEN))};
+    auto CheckRes = Executor.invoke(IsSortedFunc, CheckArgs, IsSortedParams);
+    ASSERT_TRUE(CheckRes.has_value());
+    EXPECT_EQ((*CheckRes)[0].first.get<uint32_t>(), 1u) << "Array should be sorted";
+
+    // Also verify manually
+    int32_t expected[] = {1, 2, 5, 8, 9};
+    for (uint32_t i = 0; i < LEN; i++) {
+      uint8_t *ptr = MemInst->getPointer<uint8_t *>(BASE + i * 4);
+      int32_t val = *reinterpret_cast<int32_t *>(ptr);
+      EXPECT_EQ(val, expected[i]) << "Element at index " << i << " incorrect";
+    }
+  }
+
+  // Test case 2: Already sorted array
+  {
+    const uint32_t BASE = 100;
+    const uint32_t LEN = 4;
+    int32_t testData[] = {1, 2, 3, 4};
+    
+    for (uint32_t i = 0; i < LEN; i++) {
+      uint8_t *ptr = MemInst->getPointer<uint8_t *>(BASE + i * 4);
+      *reinterpret_cast<int32_t *>(ptr) = testData[i];
+    }
+
+    std::vector<WasmEdge::ValVariant> SortArgs = {
+        WasmEdge::ValVariant(uint32_t(BASE)),
+        WasmEdge::ValVariant(uint32_t(0)),
+        WasmEdge::ValVariant(uint32_t(LEN - 1))};
+    auto SortRes = Executor.invoke(QuicksortFunc, SortArgs, QuicksortParams);
+    ASSERT_TRUE(SortRes.has_value());
+
+    std::vector<WasmEdge::ValVariant> CheckArgs = {
+        WasmEdge::ValVariant(uint32_t(BASE)),
+        WasmEdge::ValVariant(uint32_t(LEN))};
+    auto CheckRes = Executor.invoke(IsSortedFunc, CheckArgs, IsSortedParams);
+    ASSERT_TRUE(CheckRes.has_value());
+    EXPECT_EQ((*CheckRes)[0].first.get<uint32_t>(), 1u) << "Already sorted array should remain sorted";
+  }
+
+  // Test case 3: Reverse sorted array
+  {
+    const uint32_t BASE = 200;
+    const uint32_t LEN = 6;
+    int32_t testData[] = {6, 5, 4, 3, 2, 1};
+    
+    for (uint32_t i = 0; i < LEN; i++) {
+      uint8_t *ptr = MemInst->getPointer<uint8_t *>(BASE + i * 4);
+      *reinterpret_cast<int32_t *>(ptr) = testData[i];
+    }
+
+    std::vector<WasmEdge::ValVariant> SortArgs = {
+        WasmEdge::ValVariant(uint32_t(BASE)),
+        WasmEdge::ValVariant(uint32_t(0)),
+        WasmEdge::ValVariant(uint32_t(LEN - 1))};
+    auto SortRes = Executor.invoke(QuicksortFunc, SortArgs, QuicksortParams);
+    ASSERT_TRUE(SortRes.has_value());
+
+    std::vector<WasmEdge::ValVariant> CheckArgs = {
+        WasmEdge::ValVariant(uint32_t(BASE)),
+        WasmEdge::ValVariant(uint32_t(LEN))};
+    auto CheckRes = Executor.invoke(IsSortedFunc, CheckArgs, IsSortedParams);
+    ASSERT_TRUE(CheckRes.has_value());
+    EXPECT_EQ((*CheckRes)[0].first.get<uint32_t>(), 1u) << "Reverse array should be sorted";
+  }
+
+  // Test case 4: Single element (edge case)
+  {
+    const uint32_t BASE = 300;
+    uint8_t *ptr = MemInst->getPointer<uint8_t *>(BASE);
+    *reinterpret_cast<int32_t *>(ptr) = 42;
+
+    std::vector<WasmEdge::ValVariant> SortArgs = {
+        WasmEdge::ValVariant(uint32_t(BASE)),
+        WasmEdge::ValVariant(uint32_t(0)),
+        WasmEdge::ValVariant(uint32_t(0))};
+    auto SortRes = Executor.invoke(QuicksortFunc, SortArgs, QuicksortParams);
+    ASSERT_TRUE(SortRes.has_value());
+
+    std::vector<WasmEdge::ValVariant> CheckArgs = {
+        WasmEdge::ValVariant(uint32_t(BASE)),
+        WasmEdge::ValVariant(uint32_t(1))};
+    auto CheckRes = Executor.invoke(IsSortedFunc, CheckArgs, IsSortedParams);
+    ASSERT_TRUE(CheckRes.has_value());
+    EXPECT_EQ((*CheckRes)[0].first.get<uint32_t>(), 1u) << "Single element should be sorted";
+  }
+
+  // Test case 5: Array with duplicates
+  {
+    const uint32_t BASE = 400;
+    const uint32_t LEN = 7;
+    int32_t testData[] = {3, 1, 4, 1, 5, 9, 2};
+    
+    for (uint32_t i = 0; i < LEN; i++) {
+      uint8_t *ptr = MemInst->getPointer<uint8_t *>(BASE + i * 4);
+      *reinterpret_cast<int32_t *>(ptr) = testData[i];
+    }
+
+    std::vector<WasmEdge::ValVariant> SortArgs = {
+        WasmEdge::ValVariant(uint32_t(BASE)),
+        WasmEdge::ValVariant(uint32_t(0)),
+        WasmEdge::ValVariant(uint32_t(LEN - 1))};
+    auto SortRes = Executor.invoke(QuicksortFunc, SortArgs, QuicksortParams);
+    ASSERT_TRUE(SortRes.has_value());
+
+    std::vector<WasmEdge::ValVariant> CheckArgs = {
+        WasmEdge::ValVariant(uint32_t(BASE)),
+        WasmEdge::ValVariant(uint32_t(LEN))};
+    auto CheckRes = Executor.invoke(IsSortedFunc, CheckArgs, IsSortedParams);
+    ASSERT_TRUE(CheckRes.has_value());
+    EXPECT_EQ((*CheckRes)[0].first.get<uint32_t>(), 1u) << "Array with duplicates should be sorted";
+  }
+}
+
+TEST_F(IRBenchmarkTest, Benchmark_Quicksort) {
+  auto TestDataPath = getTestDataPath();
+  auto WasmPath = TestDataPath / "fibonacci.wasm";
+
+  if (!std::filesystem::exists(WasmPath)) {
+    GTEST_SKIP() << "Test data not found";
+  }
+
+  WasmEdge::Loader::Loader Loader(Conf);
+  auto LoadRes = Loader.parseModule(WasmPath);
+  ASSERT_TRUE(LoadRes.has_value());
+
+  WasmEdge::Validator::Validator Validator(Conf);
+  ASSERT_TRUE(Validator.validate(**LoadRes).has_value());
+
+  WasmEdge::Runtime::StoreManager StoreMgr;
+  WasmEdge::Executor::Executor Executor(Conf);
+
+  auto InstRes = Executor.registerModule(StoreMgr, **LoadRes, "bench");
+  ASSERT_TRUE(InstRes.has_value());
+
+  auto *ModInst = InstRes->get();
+  auto *QuicksortFunc = ModInst->findFuncExports("quicksort");
+  ASSERT_NE(QuicksortFunc, nullptr);
+
+  auto MemInsts = ModInst->getMemoryInstances();
+  ASSERT_FALSE(MemInsts.empty());
+  auto *MemInst = MemInsts[0];
+
+  auto QuicksortParams = QuicksortFunc->getFuncType().getParamTypes();
+
+  const uint32_t BASE = 0;
+  const uint32_t LEN = 100;
+  const int ITERATIONS = 1000;
+
+  // Generate reverse-sorted array (worst case for naive quicksort, but our Lomuto is decent)
+  auto initArray = [&]() {
+    for (uint32_t i = 0; i < LEN; i++) {
+      uint8_t *ptr = MemInst->getPointer<uint8_t *>(BASE + i * 4);
+      *reinterpret_cast<int32_t *>(ptr) = static_cast<int32_t>(LEN - i);
+    }
+  };
+
+  std::vector<WasmEdge::ValVariant> SortArgs = {
+      WasmEdge::ValVariant(uint32_t(BASE)),
+      WasmEdge::ValVariant(uint32_t(0)),
+      WasmEdge::ValVariant(uint32_t(LEN - 1))};
+
+  double avgTime = measureTime(
+      [&]() {
+        initArray();  // Reset array before each sort
+        Executor.invoke(QuicksortFunc, SortArgs, QuicksortParams);
+      },
+      ITERATIONS);
+
+  std::cout << "\n=== Quicksort Benchmark ===" << std::endl;
+  std::cout << "  quicksort(" << LEN << " elements) x " << ITERATIONS << " iterations" << std::endl;
+  std::cout << "  JIT: " << QuicksortFunc->isIRJitFunction() << std::endl;
+  std::cout << "  Avg time per call: " << std::fixed << std::setprecision(3)
+            << avgTime << " ms" << std::endl;
+  std::cout << "  Throughput: " << std::fixed << std::setprecision(0)
+            << (1000.0 / avgTime) << " sorts/sec" << std::endl;
+}
+
 } // namespace
