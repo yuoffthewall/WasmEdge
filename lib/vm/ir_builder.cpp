@@ -762,6 +762,39 @@ Expect<void> WasmToIRBuilder::visitCompare(OpCode Op) {
     return Unexpect(ErrCode::Value::RuntimeError);
   }
 
+  // WebAssembly comparisons return i32 0/1 at the ABI boundary.
+  // On some IR backends, the comparison result encodes the truth value in
+  // the least-significant bit, with higher bits used for internal flags.
+  // Normalize integer comparison results to exactly 0 or 1 by masking bit 0.
+  switch (Op) {
+  case OpCode::I32__eq:
+  case OpCode::I32__ne:
+  case OpCode::I32__lt_s:
+  case OpCode::I32__lt_u:
+  case OpCode::I32__le_s:
+  case OpCode::I32__le_u:
+  case OpCode::I32__gt_s:
+  case OpCode::I32__gt_u:
+  case OpCode::I32__ge_s:
+  case OpCode::I32__ge_u:
+  case OpCode::I64__eq:
+  case OpCode::I64__ne:
+  case OpCode::I64__lt_s:
+  case OpCode::I64__lt_u:
+  case OpCode::I64__le_s:
+  case OpCode::I64__le_u:
+  case OpCode::I64__gt_s:
+  case OpCode::I64__gt_u:
+  case OpCode::I64__ge_s:
+  case OpCode::I64__ge_u: {
+    ir_ref One = ir_CONST_I32(1);
+    Result = ir_AND_I32(Result, One);
+    break;
+  }
+  default:
+    break;
+  }
+
   push(Result);
   return {};
 }
@@ -774,13 +807,32 @@ Expect<void> WasmToIRBuilder::visitUnary(OpCode Op) {
   switch (Op) {
   // I32 unary
   case OpCode::I32__eqz:
-    Result = ir_EQ(Operand, ir_CONST_I32(0));
+    // eqz returns i32 0/1; mask LSB from comparison result.
+    {
+      ir_ref Cmp = ir_EQ(Operand, ir_CONST_I32(0));
+      ir_ref One = ir_CONST_I32(1);
+      Result = ir_AND_I32(Cmp, One);
+    }
     break;
   case OpCode::I32__clz:
-    Result = ir_CTLZ_I32(Operand);
+    // WebAssembly defines clz(0) = 32 for i32.
+    // Implement: Operand == 0 ? 32 : ctlz(Operand)
+    {
+      ir_ref IsZero = ir_EQ(Operand, ir_CONST_I32(0));
+      ir_ref ClzVal = ir_CTLZ_I32(Operand);
+      ir_ref BitWidth = ir_CONST_I32(32);
+      Result = ir_COND(IR_I32, IsZero, BitWidth, ClzVal);
+    }
     break;
   case OpCode::I32__ctz:
-    Result = ir_CTTZ_I32(Operand);
+    // WebAssembly defines ctz(0) = 32 for i32.
+    // Implement: Operand == 0 ? 32 : cttz(Operand)
+    {
+      ir_ref IsZero = ir_EQ(Operand, ir_CONST_I32(0));
+      ir_ref CtzVal = ir_CTTZ_I32(Operand);
+      ir_ref BitWidth = ir_CONST_I32(32);
+      Result = ir_COND(IR_I32, IsZero, BitWidth, CtzVal);
+    }
     break;
   case OpCode::I32__popcnt:
     Result = ir_CTPOP_I32(Operand);
@@ -788,13 +840,30 @@ Expect<void> WasmToIRBuilder::visitUnary(OpCode Op) {
 
   // I64 unary
   case OpCode::I64__eqz:
-    Result = ir_EQ(Operand, ir_CONST_I64(0));
+    // eqz(i64) returns i32 0/1; mask LSB from comparison result.
+    {
+      ir_ref Cmp = ir_EQ(Operand, ir_CONST_I64(0));
+      ir_ref One = ir_CONST_I32(1);
+      Result = ir_AND_I32(Cmp, One);
+    }
     break;
   case OpCode::I64__clz:
-    Result = ir_CTLZ_I64(Operand);
+    // WebAssembly defines clz(0) = 64 for i64.
+    {
+      ir_ref IsZero = ir_EQ(Operand, ir_CONST_I64(0));
+      ir_ref ClzVal = ir_CTLZ_I64(Operand);
+      ir_ref BitWidth = ir_CONST_I64(64);
+      Result = ir_COND(IR_I64, IsZero, BitWidth, ClzVal);
+    }
     break;
   case OpCode::I64__ctz:
-    Result = ir_CTTZ_I64(Operand);
+    // WebAssembly defines ctz(0) = 64 for i64.
+    {
+      ir_ref IsZero = ir_EQ(Operand, ir_CONST_I64(0));
+      ir_ref CtzVal = ir_CTTZ_I64(Operand);
+      ir_ref BitWidth = ir_CONST_I64(64);
+      Result = ir_COND(IR_I64, IsZero, BitWidth, CtzVal);
+    }
     break;
   case OpCode::I64__popcnt:
     Result = ir_CTPOP_I64(Operand);

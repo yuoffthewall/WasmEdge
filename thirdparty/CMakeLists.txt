@@ -12,17 +12,28 @@ if(WASMEDGE_BUILD_IR_JIT)
   set(WASMEDGE_IR_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ir")
   set(WASMEDGE_IR_LIB "${WASMEDGE_IR_SOURCE_DIR}/libir.a")
 
-  if(NOT EXISTS "${WASMEDGE_IR_LIB}")
-    message(FATAL_ERROR
-      "IR JIT is enabled (WASMEDGE_BUILD_IR_JIT=ON), but libir.a was not found.\n"
-      "Expected: ${WASMEDGE_IR_LIB}\n"
-      "Please build dstogov/ir first, e.g.:\n"
-      "  cd thirdparty/ir\n"
-      "  make libir.a            # x86_64\n"
-      "  make TARGET=aarch64 libir.a  # Apple Silicon / arm64\n")
+  # Automatically build dstogov/ir when IR JIT is enabled so that a fresh
+  # clone can be configured and built on Linux/macOS without manual steps.
+  #
+  # On Linux we must compile libir.a as PIC so it can be linked into
+  # libwasmedge.so; do that by injecting -fPIC via the environment.
+  set(_ir_env)
+  if(CMAKE_SYSTEM_NAME MATCHES "Linux")
+    list(APPEND _ir_env "CFLAGS=-fPIC" "BUILD_CFLAGS=-fPIC")
   endif()
 
+  add_custom_command(
+    OUTPUT "${WASMEDGE_IR_LIB}"
+    COMMAND ${CMAKE_COMMAND} -E env ${_ir_env} ${CMAKE_MAKE_PROGRAM} libir.a
+    WORKING_DIRECTORY "${WASMEDGE_IR_SOURCE_DIR}"
+    COMMENT "Building dstogov/ir (libir.a) for IR JIT"
+    VERBATIM
+  )
+
+  add_custom_target(wasmedgeIRBuild ALL DEPENDS "${WASMEDGE_IR_LIB}")
+
   add_library(wasmedgeIR STATIC IMPORTED GLOBAL)
+  add_dependencies(wasmedgeIR wasmedgeIRBuild)
   set_target_properties(wasmedgeIR PROPERTIES
     IMPORTED_LOCATION "${WASMEDGE_IR_LIB}"
     INTERFACE_INCLUDE_DIRECTORIES "${WASMEDGE_IR_SOURCE_DIR}"
