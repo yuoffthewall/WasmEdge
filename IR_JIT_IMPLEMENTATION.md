@@ -1,3 +1,102 @@
+# Implementing Tiered Compilation for WasmEdge: A Sea-of-Nodes Baseline JIT Approach
+
+This project aims to solve WasmEdge's cold start problem by integrating a proven, lightweight JIT compiler. It bridges the gap between interpretation and heavy AOT compilation, making WasmEdge more competitive for modern cloud-native workloads.
+
+## 1. Background: WebAssembly Compilation Evolution
+`Wasm` is designed for near-native performance.
+Three Compilation Strategies in `Wasm`:
+
+- **Interpreter:** Fast startup, slow execution (good for short tasks).
+
+- **AOT (Ahead-of-Time):** Best performance, but complex deployment and no dynamic adaptation.
+
+- **JIT (Just-in-Time):** Dynamic compilation. Modern runtimes (V8, Wasmtime) use a Tiered JIT approach: starts with a fast/simple compiler (Baseline) for quick startup, then switches to a slower/complex compiler (Optimizing) for peak performance.
+
+Current State: WasmEdge currently relies only on LLVM (AOT/Optimizing JIT) and lacks a lightweight baseline tier.
+
+## 2. Theoretical Basis: Sea-of-Nodes IR
+- **Concept:** A compilation representation where data dependencies and control flow are unified in a single graph of nodes, unlike traditional methods that separate them into blocks.
+
+- **Advantages:** Easier to optimize (Global Code Motion), simplifies control flow handling (if/loop), and is friendly to incremental compilation.
+
+## 3. The Framework: dstogov/ir
+A lightweight C-based JIT framework implementing Sea-of-Nodes.
+
+- **Features:** Built-in constant folding, code motion (GCM), and register allocation. It generates machine code directly (DynASM) without an external assembler.
+
+- **Performance:** Compiles ~40x faster than GCC-O2, while generated code is only ~5% slower. It balances speed and quality perfectly for a baseline JIT.
+
+## 4. Why Lightweight JIT? (Lessons from PHP)
+- **Problem**: Heavy JITs like LLVM are too slow and memory-hungry for dynamic languages or short tasks (e.g., PHP requests).
+
+- **Design Goals:** The dstogov/ir framework was built to be Simple, Compact, and Fast.
+
+- **Result:** Used in PHP 8.4+, proving that a lightweight JIT can provide huge speedups with minimal overhead compared to LLVM.
+
+## 5. Core Design Principles of dstogov/ir
+- **Structure:** Uses a compact 16-byte struct for IR nodes to save memory.
+
+- **Pipeline:** Construction -> Optimization -> Scheduling -> Register Allocation -> Code Gen.
+
+- **JIT Features:** Supports "Guard" nodes (for speculative optimization) and snapshots (for restoring state if optimization fails), which are essential for tiered compilation.
+
+## 6. Tiered Compilation Strategy & Integration
+- **PHP Experience:** Uses a 2-tier model. Tier 1 (IR JIT) compiles everything quickly; Tier 2 (LLVM) recompiles only "hot" functions (executed frequently).
+
+- **Relevance to Wasm:** Wasm is statically typed and simpler than PHP, making it an even better candidate for this integration.
+
+- **Risks:** The framework is relatively new (mostly used in PHP).
+
+- **Mitigation:** Implement progressively, keep LLVM as a fallback, and add rigorous testing for Wasm-specific features.
+
+## 7. Reference Case: rv32emu
+- **Overview:** A RISC-V simulator that successfully uses a 3-layer architecture (Interpreter -> Tier 1 JIT -> Tier 2 LLVM).
+
+- **Key Takeaway:** "Progressive Investment"—only spend time compiling code that runs often. It proved that a tiered approach saves massive amounts of memory (60% less) while maintaining speed.
+
+## 8. Problem Statement & Motivation
+- **Issue:** WasmEdge uses LLVM for everything. This causes slow cold starts (hundreds of milliseconds) and high memory usage (50-100MB) for simple functions.
+
+- **Solution:** Integrate dstogov/ir as a Tier-1 compiler.
+
+- **Goal:** Achieve fast startup (via IR) and peak performance (via LLVM) in a single runtime, ideal for serverless and edge computing.
+
+## 9. Architecture & Technical Plan
+Workflow:
+
+1. Wasm Bytecode enters WasmEdge.
+
+2. **Tier 1:** dstogov/ir compiles it immediately for execution.
+
+3. **Profiling:** The system counts how many times a function runs.
+
+4. **Tier 2:** If the count exceeds a threshold, the function is recompiled in the background using LLVM.
+
+5. **Switch:** The runtime atomically swaps the function pointer to the new, faster LLVM code.
+
+## 10. Implementation Details
+- **Frontend:** Write a translator that converts Wasm's stack-machine instructions into the Sea-of-Nodes graph (e.g., mapping local.get to LOAD nodes, block/loop to Region nodes).
+
+- **Memory:** Use mmap to allocate executable memory for the JIT code.
+
+- **ABI:** Implement "trampolines" to convert WasmEdge's argument format (ValVariant arrays) into standard C register calls used by the generated code.
+
+## 11. Challenges & Future Work
+- **Challenges:** Handling Wasm exceptions, atomic operations, and ensuring thread safety during the code swap.
+
+- **Future Directions:** Adding speculative optimizations (guessing branch directions), Profile-Guided Optimization (PGO), and potentially hardware-specific acceleration.
+
+
+# Introduction
+WebAssembly (Wasm) has evolved from a client-side browser technology into a high-performance, secure execution environment for cloud-native, serverless, and edge computing applications. To meet the stringent performance demands of these environments, Wasm runtimes must optimize for two often conflicting metrics: rapid startup latency (cold start) and peak execution throughput. Traditional execution models force a trade-off: interpreters offer instant startup but slow execution, while Ahead-of-Time (AOT) and optimizing Just-in-Time (JIT) compilers produce efficient native code at the cost of significant compilation delays and memory usage.
+
+To resolve this dichotomy, modern high-performance engines (such as V8 and Wasmtime) employ tiered compilation. This strategy utilizes a lightweight "baseline" compiler to generate code quickly for immediate execution, followed by a heavy "optimizing" compiler to recompile hot functions for peak performance. This thesis explores the implementation of such a tiered architecture within WasmEdge, a leading cloud-native Wasm runtime. Specifically, it proposes integrating the dstogov/ir framework—a lightweight compilation infrastructure based on Sea-of-Nodes IR—as a new Tier-1 baseline JIT compiler. By combining dstogov/ir's rapid compilation capabilities with WasmEdge's existing LLVM-based optimization pipeline, this research aims to achieve a system that offers both low-latency startup and high-performance steady-state execution.
+
+# Problem Statement
+While WasmEdge demonstrates exceptional peak performance in computational workloads, its current architecture lacks a multi-tiered compilation strategy. WasmEdge relies heavily on LLVM for both AOT and JIT compilation. Although LLVM generates highly optimized machine code, its compilation pipeline is computationally expensive and memory-intensive, which is often prohibitive for resource-constrained edge devices or short-lived serverless functions.
+
+Consequently, WasmEdge faces a significant "cold start" problem, where applications must endure long pauses while LLVM compiles the code. ==Currently, WasmEdge lacks a lightweight baseline JIT implementation capable of bridging the gap between slow interpretation and expensive optimization.== The lack of a fast-path compiler prevents the runtime from adapting dynamically to workload behavior, limiting its efficiency in scenarios where rapid responsiveness is as critical as raw throughput. ==This Pproject addresses this deficiency by integrating `dstogov/ir` to establish a baseline compilation tier, thereby enabling a complete tiered JIT infrastructure.==
+
 # WasmEdge IR JIT Implementation
 
 **Status**: Phase 1 - Complete IR Lowering + WasmEdge Integration ✅  
@@ -430,37 +529,88 @@ testBinaryOp(OpCode::I32__rotl);
 - CMake 3.11+
 - C++20 compiler (GCC 11+, Clang 13+)
 - Standard WasmEdge dependencies
+- `make`, `gcc`/`clang` for building `dstogov/ir`
 
-### Building with IR JIT
+### 1. Clone with IR submodule
+
+To ensure the `dstogov/ir` framework is available when you clone:
 
 ```bash
-cd /Users/tommylee/Desktop/WasmEdge
-mkdir -p build && cd build
+git clone --recursive https://github.com/WasmEdge/WasmEdge.git
+cd WasmEdge
+```
 
-# Configure with IR JIT enabled
-cmake -DWASMEDGE_BUILD_IR_JIT=ON ..
+If you already cloned the repo without `--recursive`, initialize submodules:
+
+```bash
+git submodule update --init --recursive
+```
+
+This will populate `thirdparty/ir` with the `dstogov/ir` sources.
+
+### 2. Build `dstogov/ir` (`libir.a`)
+
+The IR JIT integration treats `dstogov/ir` as an external project built with its own Makefile.  
+You must build the static library once before configuring CMake with IR JIT enabled.
+
+From the WasmEdge repo root:
+
+```bash
+cd thirdparty/ir
+
+# x86_64 (Linux, Intel macOS)
+make libir.a
+
+# Apple Silicon / arm64
+make TARGET=aarch64 libir.a
+```
+
+This produces:
+
+```bash
+thirdparty/ir/libir.a
+```
+
+### 3. Configure and build WasmEdge with IR JIT
+
+From the WasmEdge repo root:
+
+```bash
+mkdir -p build
+cd build
+
+# Configure with IR JIT enabled (LLVM optional)
+cmake -DWASMEDGE_BUILD_IR_JIT=ON \
+      -DWASMEDGE_BUILD_TESTS=ON \
+      ..
 
 # Build
 make -j8
-
-# Verify libraries
-ls -lh thirdparty/ir/libwasmedgeIR.a
-ls -lh lib/vm/libwasmedgeVM.a
 ```
 
-### Building without IR JIT (Default)
+Key flags:
+
+- **`WASMEDGE_BUILD_IR_JIT=ON`**: enables IR JIT integration and expects `thirdparty/ir/libir.a` to exist.
+- **`WASMEDGE_USE_LLVM`**: optional, controls whether LLVM-based AOT/JIT is built.
+
+If `libir.a` is missing, CMake will fail with a clear error message pointing to `thirdparty/ir` and the `make libir.a` command.
+
+### 4. Building without IR JIT (Default)
 
 ```bash
+mkdir -p build
+cd build
 cmake ..
 make -j8
 ```
 
-### Verification
+### 5. Verification
 
 Check that IR symbols are present:
+
 ```bash
-nm thirdparty/ir/libwasmedgeIR.a | grep "T ir_jit_compile"
-# Should show: T _ir_jit_compile
+nm thirdparty/ir/libir.a | grep "T ir_jit_compile"
+# Should show: T ir_jit_compile (or similar)
 
 nm lib/vm/libwasmedgeVM.a | grep "WasmToIRBuilder"
 # Should show WasmEdge::VM::WasmToIRBuilder symbols
