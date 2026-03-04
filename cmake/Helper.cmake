@@ -104,6 +104,9 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     )
   endif()
 elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU")
+  list(APPEND WASMEDGE_CFLAGS
+    -Wno-error=unused-parameter
+  )
   if(CMAKE_CXX_COMPILER_VERSION VERSION_GREATER 13)
     list(APPEND WASMEDGE_CFLAGS
       -Wno-error=dangling-reference
