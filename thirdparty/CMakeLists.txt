@@ -22,9 +22,22 @@ if(WASMEDGE_BUILD_IR_JIT)
     list(APPEND _ir_env "CFLAGS=-fPIC" "BUILD_CFLAGS=-fPIC")
   endif()
 
+  # Select the correct IR JIT target for the host CPU.
+  # dstogov/ir defaults to x86_64; on Apple Silicon / other AArch64
+  # platforms we must explicitly request the aarch64 backend.
+  set(_ir_make_args "")
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+    list(APPEND _ir_make_args "TARGET=aarch64")
+  endif()
+  
+  if(CMAKE_SYSTEM_NAME MATCHES "Darwin")
+    # Provide homebrew include paths so ir_disasm.c can find capstone.h
+    list(APPEND _ir_make_args "CFLAGS=-I/usr/local/include -I/opt/homebrew/include")
+  endif()
+
   add_custom_command(
     OUTPUT "${WASMEDGE_IR_LIB}"
-    COMMAND ${CMAKE_COMMAND} -E env ${_ir_env} ${CMAKE_MAKE_PROGRAM} libir.a
+    COMMAND ${CMAKE_COMMAND} -E env ${_ir_env} ${CMAKE_MAKE_PROGRAM} ${_ir_make_args} libir.a
     WORKING_DIRECTORY "${WASMEDGE_IR_SOURCE_DIR}"
     COMMENT "Building dstogov/ir (libir.a) for IR JIT"
     VERBATIM
