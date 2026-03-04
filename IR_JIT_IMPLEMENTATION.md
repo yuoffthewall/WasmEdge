@@ -548,28 +548,11 @@ git submodule update --init --recursive
 
 This will populate `thirdparty/ir` with the `dstogov/ir` sources.
 
-### 2. Build `dstogov/ir` (`libir.a`)
+### 2. The `dstogov/ir` Submodule
 
-The IR JIT integration treats `dstogov/ir` as an external project built with its own Makefile.  
-You must build the static library once before configuring CMake with IR JIT enabled.
-
-From the WasmEdge repo root:
-
-```bash
-cd thirdparty/ir
-
-# x86_64 (Linux, Intel macOS)
-make libir.a
-
-# Apple Silicon / arm64
-make TARGET=aarch64 libir.a
-```
-
-This produces:
-
-```bash
-thirdparty/ir/libir.a
-```
+The IR JIT integration treats `dstogov/ir` as an external project built with its own Makefile. 
+Thanks to WasmEdge's CMake configuration, **you do not need to build `libir.a` manually**. 
+When you configure WasmEdge with `WASMEDGE_BUILD_IR_JIT=ON`, the CMake build system will automatically configure and build the submodule matching your CPU architecture (detecting x86_64 vs. AArch64) and link it into `libwasmedge`.
 
 ### 3. Configure and build WasmEdge with IR JIT
 
@@ -580,22 +563,72 @@ mkdir -p build
 cd build
 
 # Configure with IR JIT enabled (LLVM optional)
-cmake -DWASMEDGE_BUILD_IR_JIT=ON \
+cmake -DCMAKE_BUILD_TYPE=Release \
+      -DWASMEDGE_BUILD_IR_JIT=ON \
       -DWASMEDGE_BUILD_TESTS=ON \
       ..
 
-# Build
+# Build everything
 make -j8
 ```
 
 Key flags:
 
-- **`WASMEDGE_BUILD_IR_JIT=ON`**: enables IR JIT integration and expects `thirdparty/ir/libir.a` to exist.
+- **`WASMEDGE_BUILD_IR_JIT=ON`**: enables IR JIT integration and automatically builds the `dstogov/ir` submodule.
+- **`WASMEDGE_BUILD_TESTS=ON`**: ensures the unit, integration, and e2e test suites are built.
 - **`WASMEDGE_USE_LLVM`**: optional, controls whether LLVM-based AOT/JIT is built.
 
-If `libir.a` is missing, CMake will fail with a clear error message pointing to `thirdparty/ir` and the `make libir.a` command.
+### 4. Building Specific Components
 
-### 4. Building without IR JIT (Default)
+For faster iteration during development, you can build specific parts of the project in isolation:
+
+#### Building the IR Submodule Only
+If you only want to verify the `dstogov/ir` submodule compiles correctly:
+```bash
+cd build
+make wasmedgeIRBuild
+```
+
+#### Building Specific Core Libraries
+To build just the individual static libraries (useful when modifying specific subsystems):
+```bash
+cd build
+make wasmedgeVM -j8
+make wasmedgeExecutor -j8
+make wasmedgeLoader -j8
+```
+
+#### Building Specific Test Suites
+To compile just the test executables (much faster than building everything):
+```bash
+cd build
+make wasmedgeIRExecutionTests -j8
+make wasmedgeIRE2ETests -j8
+make wasmedgeIRBenchmarkTests -j8
+make wasmedgeIRIntegrationTests -j8
+```
+
+### 5. Running the Tests
+
+To run the full suite of IR tests (Execution, Benchmarks, E2E, Unit, Integration):
+```bash
+cd build
+ctest -R IR -V --output-on-failure
+```
+
+To run a specific test suite directly (e.g., E2E Tests):
+```bash
+cd build
+./test/ir/wasmedgeIRE2ETests
+```
+
+To execute a specific Google Test case within a suite:
+```bash
+cd build
+./test/ir/wasmedgeIRE2ETests --gtest_filter=IRE2ETest.LoadAndRunAdd
+```
+
+### 6. Building without IR JIT (Default)
 
 ```bash
 mkdir -p build
