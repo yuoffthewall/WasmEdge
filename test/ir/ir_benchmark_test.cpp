@@ -55,10 +55,16 @@ static_assert(sizeof(Prestat) == 8, "prestat size");
 
 // ============================================================================
 // Sightglass: WASI stub host module (no-op / dummy so kernels can instantiate)
+// Optional stdout/stderr capture for correctness checks (Interpreter vs JIT).
 // ============================================================================
+struct StdioCapture {
+  std::string stdout_;
+  std::string stderr_;
+};
+
 class WasiStubModule : public WasmEdge::Runtime::Instance::ModuleInstance {
 public:
-  WasiStubModule() : ModuleInstance("wasi_snapshot_preview1") {
+  explicit WasiStubModule(StdioCapture *Capture = nullptr) : ModuleInstance("wasi_snapshot_preview1"), Capture(Capture) {
     addHostFunc("fd_fdstat_get", std::make_unique<StubFdFdstatGet>());
     addHostFunc("fd_prestat_get", std::make_unique<StubFdPrestatGet>());
     addHostFunc("fd_prestat_dir_name", std::make_unique<StubFdPrestatDirName>());
@@ -70,13 +76,14 @@ public:
     addHostFunc("fd_close", std::make_unique<StubFdClose>());
     addHostFunc("fd_read", std::make_unique<StubFdRead>());
     addHostFunc("fd_seek", std::make_unique<StubFdSeek>());
-    addHostFunc("fd_write", std::make_unique<StubFdWrite>());
+    addHostFunc("fd_write", std::make_unique<StubFdWrite>(Capture));
     addHostFunc("path_open", std::make_unique<StubPathOpen>());
     addHostFunc("random_get", std::make_unique<StubRandomGet>());
     addHostFunc("proc_exit", std::make_unique<StubProcExit>());
   }
 
 private:
+  StdioCapture *Capture;
   using Expect = WasmEdge::Expect<uint32_t>;
   static WasmEdge::Runtime::Instance::MemoryInstance *
   getMem(const WasmEdge::Runtime::CallingFrame &Frame, uint32_t Index = 0) {
@@ -213,21 +220,33 @@ private:
 
   class StubFdWrite : public WasmEdge::Runtime::HostFunction<StubFdWrite> {
   public:
-    Expect body(const WasmEdge::Runtime::CallingFrame &Frame, int32_t,
+    explicit StubFdWrite(StdioCapture *Cap) : Capture(Cap) {}
+    Expect body(const WasmEdge::Runtime::CallingFrame &Frame, int32_t Fd,
                 uint32_t IovsPtr, uint32_t IovsLen, uint32_t NwrittenPtr) {
       auto *Mem = getMem(Frame);
       if (!Mem) return SightglassWasi::WASI_ERRNO_SUCCESS;
-      // Sum up iovec lengths to report how many bytes "written"
       uint32_t totalLen = 0;
       for (uint32_t i = 0; i < IovsLen; ++i) {
-        // iovec is { buf_ptr: i32, buf_len: i32 }
         auto *iov = Mem->getPointer<uint32_t *>(IovsPtr + i * 8);
-        if (iov) totalLen += iov[1];
+        if (!iov) continue;
+        uint32_t bufPtr = iov[0];
+        uint32_t bufLen = iov[1];
+        totalLen += bufLen;
+        if (Capture && (Fd == 1 || Fd == 2) && bufLen > 0) {
+          const uint8_t *src = Mem->getPointer<const uint8_t *>(bufPtr);
+          if (src) {
+            if (Fd == 1)
+              Capture->stdout_.append(reinterpret_cast<const char *>(src), bufLen);
+            else
+              Capture->stderr_.append(reinterpret_cast<const char *>(src), bufLen);
+          }
+        }
       }
       auto *p = Mem->getPointer<uint32_t *>(NwrittenPtr);
       if (p) *p = totalLen;
       return SightglassWasi::WASI_ERRNO_SUCCESS;
     }
+    StdioCapture *Capture;
   };
 
   class StubPathOpen : public WasmEdge::Runtime::HostFunction<StubPathOpen> {
@@ -1118,12 +1137,16 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
 
   for (const auto &wasmPath : kernels) {
     std::string kernelName = wasmPath.stem().string();
+    StdioCapture interpCap, jitCap;
+    bool interpOk = false;
+    bool jitOk = false;
 
     const char *modes[] = {"Interpreter", "JIT"};
     for (const char *modeName : modes) {
       if (interpOnly && std::strcmp(modeName, "Interpreter") != 0) continue;
       if (jitOnly && std::strcmp(modeName, "JIT") != 0) continue;
       bool useJIT = (std::strcmp(modeName, "JIT") == 0);
+      StdioCapture *cap = useJIT ? &jitCap : &interpCap;
 
       WasmEdge::Configure Conf;
       Conf.getCompilerConfigure().setOptimizationLevel(
@@ -1131,7 +1154,7 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
       Conf.getRuntimeConfigure().setForceInterpreter(!useJIT);
       Conf.getRuntimeConfigure().setEnableJIT(useJIT);
 
-      WasiStubModule wasiStub;
+      WasiStubModule wasiStub(cap);
       BenchEnv benchEnv;
       BenchModule benchMod(benchEnv);
 
@@ -1174,6 +1197,9 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
         }
       }
 
+      if (useJIT) jitOk = true;
+      else interpOk = true;
+
       double workTimeUs =
           duration_cast<Micro>(benchEnv.workTimeNs).count();
 
@@ -1184,6 +1210,40 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
                 << std::setw(18) << workTimeUs
                 << std::setw(18) << ttvUs
                 << std::endl;
+    }
+
+    // Correctness: JIT output must match Interpreter when both ran successfully
+    if (interpOk && jitOk) {
+      /*
+      // Print captured stdout/stderr for manual inspection
+      std::cout << "\n--- " << kernelName << " captured output ---\n";
+      std::cout << "Interpreter stdout (" << interpCap.stdout_.size() << " bytes): ";
+      if (interpCap.stdout_.empty())
+        std::cout << "(empty)\n";
+      else
+        std::cout << "\n" << interpCap.stdout_ << "\n";
+      std::cout << "Interpreter stderr (" << interpCap.stderr_.size() << " bytes): ";
+      if (interpCap.stderr_.empty())
+        std::cout << "(empty)\n";
+      else
+        std::cout << "\n" << interpCap.stderr_ << "\n";
+      std::cout << "JIT stdout (" << jitCap.stdout_.size() << " bytes): ";
+      if (jitCap.stdout_.empty())
+        std::cout << "(empty)\n";
+      else
+        std::cout << "\n" << jitCap.stdout_ << "\n";
+      std::cout << "JIT stderr (" << jitCap.stderr_.size() << " bytes): ";
+      if (jitCap.stderr_.empty())
+        std::cout << "(empty)\n";
+      else
+        std::cout << "\n" << jitCap.stderr_ << "\n";
+      std::cout << "---\n";
+      */
+
+      EXPECT_EQ(interpCap.stdout_, jitCap.stdout_)
+          << "Kernel " << kernelName << ": JIT stdout must match Interpreter";
+      EXPECT_EQ(interpCap.stderr_, jitCap.stderr_)
+          << "Kernel " << kernelName << ": JIT stderr must match Interpreter";
     }
   }
   std::cout << std::endl;
