@@ -259,8 +259,10 @@ private:
 
   class StubProcExit : public WasmEdge::Runtime::HostFunction<StubProcExit> {
   public:
+    // WASI proc_exit(code) never returns; the wasm then has unreachable.
+    // Return Terminated so execution stops and we never run that unreachable.
     WasmEdge::Expect<void> body(const WasmEdge::Runtime::CallingFrame &, int32_t) {
-      return {};
+      return WasmEdge::Unexpect(WasmEdge::ErrCode::Value::Terminated);
     }
   };
 };
@@ -1164,9 +1166,12 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
       double ttvUs = duration_cast<Micro>(ttvEnd - ttvStart).count();
 
       if (!execRes) {
-        std::cerr << "execute _start failed: " << kernelName << " " << modeName
-                  << " " << WasmEdge::ErrCode(execRes.error()) << std::endl;
-        continue;
+        // WASI proc_exit triggers Terminated; that is normal success.
+        if (execRes.error() != WasmEdge::ErrCode::Value::Terminated) {
+          std::cerr << "execute _start failed: " << kernelName << " " << modeName
+                    << " " << WasmEdge::ErrCode(execRes.error()) << std::endl;
+          continue;
+        }
       }
 
       double workTimeUs =

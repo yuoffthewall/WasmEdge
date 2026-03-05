@@ -196,7 +196,10 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
       
       // Skip functions with many instructions (likely complex control flow)
       // until IR builder is more robust
-      if (InstrVec.size() > 500) {
+      constexpr size_t MaxInstrCount = 1000;
+      if (InstrVec.size() > MaxInstrCount) {
+        spdlog::info("IR JIT: skip func {} (instr count {} > {})", FuncIdx,
+                     static_cast<uint32_t>(InstrVec.size()), MaxInstrCount);
         SkipCount++;
         CodeIdx++;
         FuncIdx++;
@@ -207,22 +210,25 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
       // These produce degenerate IR that the backend can't compile
       if (!InstrVec.empty() && 
           InstrVec[0].getOpCode() == OpCode::Unreachable) {
+        spdlog::info("IR JIT: skip func {} (starts with unreachable)", FuncIdx);
         SkipCount++;
         CodeIdx++;
         FuncIdx++;
         continue;
       }
       
-      // Skip functions with problematic patterns not fully supported yet
-      bool hasUnsupported = false;
+      // Skip functions with extremely complex control flow
+      // br_table is now supported; only skip very deeply nested control flow
+      constexpr int MaxIfCount = 50;
+      int ifCount = 0;
       for (const auto &Instr : InstrVec) {
-        OpCode Op = Instr.getOpCode();
-        if (Op == OpCode::Br_table || Op == OpCode::Call || Op == OpCode::Call_indirect) {
-          hasUnsupported = true;
-          break;
+        if (Instr.getOpCode() == OpCode::If) {
+          ifCount++;
         }
       }
-      if (hasUnsupported) {
+      if (ifCount > MaxIfCount) {
+        spdlog::info("IR JIT: skip func {} (if_count {} > {})", FuncIdx,
+                     ifCount, MaxIfCount);
         SkipCount++;
         CodeIdx++;
         FuncIdx++;

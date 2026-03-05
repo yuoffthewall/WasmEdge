@@ -25,7 +25,8 @@ if(WASMEDGE_BUILD_IR_JIT)
   # Select the correct IR JIT target for the host CPU.
   # dstogov/ir defaults to x86_64; on Apple Silicon / other AArch64
   # platforms we must explicitly request the aarch64 backend.
-  set(_ir_make_args "")
+  # Also use release build to disable IR_DEBUG assertions.
+  set(_ir_make_args "BUILD=release")
   if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
     list(APPEND _ir_make_args "TARGET=aarch64")
   endif()

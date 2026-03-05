@@ -8,6 +8,7 @@
 #include "ast/type.h"
 #include "common/errcode.h"
 #include "vm/ir_builder.h"
+#include <spdlog/spdlog.h>
 
 // Include dstogov/ir headers
 extern "C" {
@@ -36,6 +37,14 @@ IRJitEngine::compile(ir_ctx *Ctx) {
     return Unexpect(ErrCode::Value::RuntimeError);
   }
 
+  // Verify IR before compilation to catch invalid patterns that would crash
+  // the backend. With release build of IR library, this returns false instead
+  // of aborting on invalid IR.
+  if (!ir_check(Ctx)) {
+    spdlog::info("IR JIT: ir_check failed");
+    return Unexpect(ErrCode::Value::RuntimeError);
+  }
+
   // Use IR's built-in JIT compilation
   // Optimization level: 0 = no opt, 1 = light, 2 = full
   // Using level 0 for now to avoid GCM assertion failures in IR backend
@@ -43,6 +52,7 @@ IRJitEngine::compile(ir_ctx *Ctx) {
   void *NativeCode = ir_jit_compile(Ctx, 0, &CodeSize);
   
   if (!NativeCode) {
+    spdlog::info("IR JIT: ir_jit_compile failed");
     return Unexpect(ErrCode::Value::RuntimeError);
   }
 

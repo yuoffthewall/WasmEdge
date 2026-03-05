@@ -146,6 +146,10 @@ private:
   /// Return value for ir_RETURN: pop if stack has value, else emit constant matching ret_type.
   /// Ensures we never emit IR_UNUSED for a value-returning function (avoids IR assertion).
   ir_ref getOrEmitReturnValue() noexcept;
+  
+  /// Ensure ir_ref is valid; if not, emit a zero constant of the given type.
+  /// Used to sanitize values before passing to ir_CALL_N to avoid backend assertions.
+  ir_ref ensureValidRef(ir_ref Ref, ir_type Type) noexcept;
 
 private:
   ir_ctx Ctx;                               // IR context (stack allocated)
@@ -153,6 +157,7 @@ private:
   bool CurrentPathTerminated;               // True if current code path hit return/unreachable
   std::vector<ir_ref> ValueStack;           // Wasm value stack (SSA values)
   std::map<uint32_t, ir_ref> Locals;        // Local variables
+  std::map<uint32_t, ir_type> LocalTypes;   // Types of local variables (fixed)
   std::vector<LabelInfo> LabelStack;        // Control flow label stack
   ir_ref FuncTablePtr;                      // Pointer to function table (for calls)
   ir_ref FuncTableSize;                     // Size of function table (for call_indirect bounds check)
