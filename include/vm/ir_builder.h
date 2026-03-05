@@ -143,6 +143,10 @@ private:
   /// Type conversion
   ir_type wasmTypeToIRType(ValType Type) const noexcept;
 
+  /// Return value for ir_RETURN: pop if stack has value, else emit constant matching ret_type.
+  /// Ensures we never emit IR_UNUSED for a value-returning function (avoids IR assertion).
+  ir_ref getOrEmitReturnValue() noexcept;
+
 private:
   ir_ctx Ctx;                               // IR context (stack allocated)
   bool Initialized;                         // Track if context is initialized

@@ -135,7 +135,8 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
 #ifdef WASMEDGE_BUILD_IR_JIT
   // IR JIT compilation: Compile instantiated functions to native code.
   // This happens after all sections are instantiated but before start function.
-  {
+  // Skip if ForceInterpreter is set (interpreter-only mode).
+  if (!Conf.getRuntimeConfigure().isForceInterpreter()) {
     static VM::IRJitEngine IREngine;
     VM::WasmToIRBuilder IRBuilder;
     
@@ -160,49 +161,126 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
     }
     
     // Compile each defined (non-imported) wasm function
+    // We use code segments from AST directly since FuncInst may already be
+    // CompiledFunction (LLVM AOT) without accessible instructions.
+    const auto &TypeIdxs = Mod.getFunctionSection().getContent();
     uint32_t FuncIdx = ImportFuncNum;
     uint32_t SuccessCount = 0;
-    for (const auto &CodeSeg [[maybe_unused]] : CodeSec.getContent()) {
+    uint32_t InitFailCount = 0, BuildFailCount = 0, CompileFailCount = 0, SkipCount = 0;
+    uint32_t CodeIdx = 0;
+    for (const auto &CodeSeg : CodeSec.getContent()) {
       auto *FuncInst = ModInst->unsafeGetFunction(FuncIdx);
       
-      if (FuncInst && FuncInst->isWasmFunction()) {
-        // Get function info
-        const AST::FunctionType &FuncType = FuncInst->getFuncType();
-        auto Locals = FuncInst->getLocals();
-        auto Instrs = FuncInst->getInstrs();
+      if (!FuncInst) {
+        CodeIdx++;
+        FuncIdx++;
+        continue;
+      }
+      
+      // Get function type from the type section
+      uint32_t TypeIdx = TypeIdxs[CodeIdx];
+      auto TypeRes = ModInst->getType(TypeIdx);
+      if (!TypeRes) {
+        CodeIdx++;
+        FuncIdx++;
+        continue;
+      }
+      const AST::FunctionType &FuncType = (*TypeRes)->getCompositeType().getFuncType();
+      
+      // Get locals and instructions from AST code segment (not FuncInst)
+      auto Locals = CodeSeg.getLocals();
+      auto Instrs = CodeSeg.getExpr().getInstrs();
+      
+      // Create InstrView from instruction vector
+      std::vector<AST::Instruction> InstrVec(Instrs.begin(), Instrs.end());
+      
+      // Skip functions with many instructions (likely complex control flow)
+      // until IR builder is more robust
+      if (InstrVec.size() > 500) {
+        SkipCount++;
+        CodeIdx++;
+        FuncIdx++;
+        continue;
+      }
+      
+      // Skip functions that start with unreachable (e.g., abort)
+      // These produce degenerate IR that the backend can't compile
+      if (!InstrVec.empty() && 
+          InstrVec[0].getOpCode() == OpCode::Unreachable) {
+        SkipCount++;
+        CodeIdx++;
+        FuncIdx++;
+        continue;
+      }
+      
+      // Skip functions with problematic patterns not fully supported yet
+      bool hasUnsupported = false;
+      for (const auto &Instr : InstrVec) {
+        OpCode Op = Instr.getOpCode();
+        if (Op == OpCode::Br_table || Op == OpCode::Call || Op == OpCode::Call_indirect) {
+          hasUnsupported = true;
+          break;
+        }
+      }
+      if (hasUnsupported) {
+        SkipCount++;
+        CodeIdx++;
+        FuncIdx++;
+        continue;
+      }
+      
+      if (true) {
         
         // Build IR
         IRBuilder.reset();
         
-        if (auto InitRes = IRBuilder.initialize(FuncType, Locals);
-            InitRes.has_value()) {
-          // IMPORTANT: Set module context AFTER initialize() since initialize() calls reset()
-          IRBuilder.setModuleFunctions(FuncTypes);
-          IRBuilder.setModuleGlobals(GlobalTypes);
-          
-          // Create InstrView from instruction vector
-          std::vector<AST::Instruction> InstrVec(Instrs.begin(), Instrs.end());
-          
-          if (auto BuildRes = IRBuilder.buildFromInstructions(InstrVec);
-              BuildRes.has_value()) {
-            // Compile to native code
-            if (auto CompRes = IREngine.compile(IRBuilder.getIRContext());
-                CompRes.has_value()) {
-              // Upgrade function to IR JIT
-              FuncInst->upgradeToIRJit(CompRes->NativeFunc, CompRes->CodeSize,
-                                       nullptr);  // Don't preserve IR graph for now
-              SuccessCount++;
-            }
-          }
+        auto InitRes = IRBuilder.initialize(FuncType, Locals);
+        if (!InitRes.has_value()) {
+          InitFailCount++;
+          CodeIdx++;
+          FuncIdx++;
+          continue;
         }
+        // IMPORTANT: Set module context AFTER initialize() since initialize() calls reset()
+        IRBuilder.setModuleFunctions(FuncTypes);
+        IRBuilder.setModuleGlobals(GlobalTypes);
+        
+        spdlog::debug("IR JIT: Building func {}", FuncIdx);
+        auto BuildRes = IRBuilder.buildFromInstructions(InstrVec);
+        if (!BuildRes.has_value()) {
+          spdlog::info("IR JIT: func {} build failed: {}", FuncIdx,
+                       static_cast<uint32_t>(BuildRes.error()));
+          BuildFailCount++;
+          CodeIdx++;
+          FuncIdx++;
+          continue;
+        }
+        
+        // Compile to native code
+        auto CompRes = IREngine.compile(IRBuilder.getIRContext());
+        if (!CompRes.has_value()) {
+          spdlog::info("IR JIT: func {} compile failed", FuncIdx);
+          CompileFailCount++;
+          CodeIdx++;
+          FuncIdx++;
+          continue;
+        }
+        // Upgrade function to IR JIT
+        FuncInst->upgradeToIRJit(CompRes->NativeFunc, CompRes->CodeSize,
+                                 nullptr);  // Don't preserve IR graph for now
+        SuccessCount++;
       }
+      CodeIdx++;
       FuncIdx++;
     }
+    spdlog::info("IR JIT stats: skip={}, init_fail={}, build_fail={}, compile_fail={}",
+                 SkipCount, InitFailCount, BuildFailCount, CompileFailCount);
     
     spdlog::info("IR JIT: Compiled {}/{} functions successfully", 
                  SuccessCount, FuncIdx - ImportFuncNum);
   }
 #endif
+  (void)Conf; // Suppress unused warning when IR JIT disabled
 
   // Instantiate StartSection (StartSec)
   const AST::StartSection &StartSec = Mod.getStartSection();

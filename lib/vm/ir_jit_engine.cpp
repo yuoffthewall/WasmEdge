@@ -36,10 +36,11 @@ IRJitEngine::compile(ir_ctx *Ctx) {
     return Unexpect(ErrCode::Value::RuntimeError);
   }
 
-  // Use IR's built-in JIT compilation (from examples)
-  // Optimization level 2 = with optimizations
+  // Use IR's built-in JIT compilation
+  // Optimization level: 0 = no opt, 1 = light, 2 = full
+  // Using level 0 for now to avoid GCM assertion failures in IR backend
   size_t CodeSize = 0;
-  void *NativeCode = ir_jit_compile(Ctx, 2, &CodeSize);
+  void *NativeCode = ir_jit_compile(Ctx, 0, &CodeSize);
   
   if (!NativeCode) {
     return Unexpect(ErrCode::Value::RuntimeError);
