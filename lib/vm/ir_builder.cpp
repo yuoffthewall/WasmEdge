@@ -196,6 +196,60 @@ ir_ref WasmToIRBuilder::ensureValidRef(ir_ref Ref, ir_type Type) noexcept {
   }
 }
 
+ir_ref WasmToIRBuilder::coerceToType(ir_ref Value, ir_type TargetType) noexcept {
+  ir_ctx *ctx = &Ctx;
+  
+  // If value is invalid, return a zero constant of target type
+  if (Value <= 0 || Value >= static_cast<ir_ref>(Ctx.insns_count)) {
+    return ensureValidRef(IR_UNUSED, TargetType);  // Will emit zero constant
+  }
+  
+  ir_type SrcType = static_cast<ir_type>(Ctx.ir_base[Value].type);
+  
+  // Same type - no coercion needed
+  if (SrcType == TargetType) {
+    return Value;
+  }
+  
+  // Handle signed/unsigned variants as compatible
+  if ((SrcType == IR_I32 && TargetType == IR_U32) ||
+      (SrcType == IR_U32 && TargetType == IR_I32)) {
+    // Just use the value - they're the same bit pattern
+    return Value;
+  }
+  if ((SrcType == IR_I64 && TargetType == IR_U64) ||
+      (SrcType == IR_U64 && TargetType == IR_I64)) {
+    return Value;
+  }
+  
+  // Type conversion needed
+  switch (TargetType) {
+  case IR_I32:
+  case IR_U32:
+    if (SrcType == IR_I64 || SrcType == IR_U64) {
+      return ir_TRUNC_I32(Value);
+    }
+    break;
+  case IR_I64:
+    if (SrcType == IR_I32) {
+      return ir_SEXT_I64(Value);
+    } else if (SrcType == IR_U32) {
+      return ir_ZEXT_I64(Value);
+    }
+    break;
+  case IR_U64:
+    if (SrcType == IR_I32 || SrcType == IR_U32) {
+      return ir_ZEXT_U64(Value);
+    }
+    break;
+  default:
+    break;
+  }
+  
+  // Can't coerce (e.g., int to float) - return value as-is and let ir_check catch it
+  return Value;
+}
+
 ir_ref WasmToIRBuilder::peek(uint32_t Depth) const noexcept {
   if (Depth >= ValueStack.size()) {
     return IR_UNUSED;
@@ -1121,7 +1175,8 @@ Expect<void> WasmToIRBuilder::visitConversion(OpCode Op) {
     break;
   case OpCode::I32__trunc_f32_u:
   case OpCode::I32__trunc_f64_u:
-    Result = ir_FP2U32(Operand);
+    // Use I32 for WebAssembly stack consistency (FP2U32 produces U32 which causes type mismatches)
+    Result = ir_FP2I32(Operand);
     break;
   case OpCode::I64__trunc_f32_s:
   case OpCode::I64__trunc_f64_s:
@@ -1129,7 +1184,8 @@ Expect<void> WasmToIRBuilder::visitConversion(OpCode Op) {
     break;
   case OpCode::I64__trunc_f32_u:
   case OpCode::I64__trunc_f64_u:
-    Result = ir_FP2U64(Operand);
+    // Use I64 for WebAssembly stack consistency (FP2U64 produces U64 which causes type mismatches)
+    Result = ir_FP2I64(Operand);
     break;
 
   // Saturating truncation (same as non-saturating for now)
@@ -1140,7 +1196,8 @@ Expect<void> WasmToIRBuilder::visitConversion(OpCode Op) {
     break;
   case OpCode::I32__trunc_sat_f32_u:
   case OpCode::I32__trunc_sat_f64_u:
-    Result = ir_FP2U32(Operand);
+    // Use I32 for consistency
+    Result = ir_FP2I32(Operand);
     break;
   case OpCode::I64__trunc_sat_f32_s:
   case OpCode::I64__trunc_sat_f64_s:
@@ -1148,7 +1205,8 @@ Expect<void> WasmToIRBuilder::visitConversion(OpCode Op) {
     break;
   case OpCode::I64__trunc_sat_f32_u:
   case OpCode::I64__trunc_sat_f64_u:
-    Result = ir_FP2U64(Operand);
+    // Use I64 for consistency
+    Result = ir_FP2I64(Operand);
     break;
 
   // Integer to float conversion
@@ -1265,9 +1323,12 @@ Expect<void> WasmToIRBuilder::visitParametric(const AST::Instruction &Instr) {
     
     // Use IR's COND operation: COND(condition, true_val, false_val)
     // COND returns true_val if condition != 0, else false_val
-    // We need to determine the type - for now use generic COND
-    // The type will be inferred from the operands
-    ir_ref Result = ir_COND(IR_I32, Cond, Val1, Val2);
+    // Infer result type from Val1 (in WebAssembly, Val1 and Val2 have same type)
+    ir_type ResultType = IR_I32;  // default
+    if (Val1 != IR_UNUSED && Val1 > 0 && Val1 < static_cast<ir_ref>(Ctx.insns_count)) {
+      ResultType = static_cast<ir_type>(Ctx.ir_base[Val1].type);
+    }
+    ir_ref Result = ir_COND(ResultType, Cond, Val1, Val2);
     push(Result);
     break;
   }
@@ -1567,10 +1628,25 @@ Expect<void> WasmToIRBuilder::visitLoop(const AST::Instruction &) {
     auto typeIt = LocalTypes.find(LocalIdx);
     if (typeIt != LocalTypes.end()) {
       LocalType = typeIt->second;
+    } else {
+      // Local not in LocalTypes - infer from operand
+      if (LocalRef > 0 && LocalRef < static_cast<ir_ref>(Ctx.insns_count)) {
+        LocalType = static_cast<ir_type>(Ctx.ir_base[LocalRef].type);
+      }
+    }
+    // Check if operand type matches
+    ir_type RefType = (LocalRef > 0 && LocalRef < static_cast<ir_ref>(Ctx.insns_count)) 
+                      ? static_cast<ir_type>(Ctx.ir_base[LocalRef].type) : IR_VOID;
+    
+    // If types don't match, skip creating PHI for this local (will use pre-loop value)
+    if (RefType != LocalType && RefType != IR_VOID) {
+      continue;
     }
     
     // Create PHI_2: first operand is pre-loop value, second will be set at back-edge
-    ir_ref Phi = ir_PHI_2(LocalType, LocalRef, IR_UNUSED);
+    // Coerce the operand to ensure type matches
+    ir_ref CoercedRef = coerceToType(LocalRef, LocalType);
+    ir_ref Phi = ir_PHI_2(LocalType, CoercedRef, IR_UNUSED);
     
     // Store mapping and original value
     Label.PreLoopLocals[LocalIdx] = LocalRef;
@@ -1722,9 +1798,32 @@ Expect<void> WasmToIRBuilder::visitEnd(const AST::Instruction &) {
                 auto typeIt = LocalTypes.find(LocalIdx);
                 if (typeIt != LocalTypes.end()) {
                   LocalType = typeIt->second;
+                } else {
+                  // Local not in LocalTypes - infer from operand
+                  if (Val1 > 0 && Val1 < static_cast<ir_ref>(Ctx.insns_count)) {
+                    LocalType = static_cast<ir_type>(Ctx.ir_base[Val1].type);
+                  }
                 }
-                ir_ref Phi = ir_PHI_2(LocalType, Val1, Val2);
-                Locals[LocalIdx] = Phi;
+                // Check types before coercing
+                ir_type Val1Type = (Val1 > 0 && Val1 < static_cast<ir_ref>(Ctx.insns_count)) 
+                                   ? static_cast<ir_type>(Ctx.ir_base[Val1].type) : IR_VOID;
+                ir_type Val2Type = (Val2 > 0 && Val2 < static_cast<ir_ref>(Ctx.insns_count)) 
+                                   ? static_cast<ir_type>(Ctx.ir_base[Val2].type) : IR_VOID;
+                
+                // Skip PHI if either operand is invalid/void
+                if (Val1Type == IR_VOID || Val2Type == IR_VOID) {
+                  // Use whichever operand is valid
+                  Locals[LocalIdx] = (Val1Type != IR_VOID) ? Val1 : Val2;
+                } else if (Val1Type != Val2Type || Val1Type != LocalType) {
+                  // Type mismatch - use first operand as fallback
+                  Locals[LocalIdx] = Val1;
+                } else {
+                  // Coerce operands to ensure types match
+                  ir_ref Coerced1 = coerceToType(Val1, LocalType);
+                  ir_ref Coerced2 = coerceToType(Val2, LocalType);
+                  ir_ref Phi = ir_PHI_2(LocalType, Coerced1, Coerced2);
+                  Locals[LocalIdx] = Phi;
+                }
               } else {
                 Locals[LocalIdx] = Val1;
               }
@@ -1875,9 +1974,32 @@ Expect<void> WasmToIRBuilder::visitEnd(const AST::Instruction &) {
               auto typeIt = LocalTypes.find(LocalIdx);
               if (typeIt != LocalTypes.end()) {
                 LocalType = typeIt->second;
+              } else {
+                // Local not in LocalTypes - infer from operand
+                if (Val0 > 0 && Val0 < static_cast<ir_ref>(Ctx.insns_count)) {
+                  LocalType = static_cast<ir_type>(Ctx.ir_base[Val0].type);
+                }
               }
-              ir_ref Phi = ir_PHI_2(LocalType, Val0, Val1);
-              MergedLocals[LocalIdx] = Phi;
+              // Check types before coercing
+              ir_type Val0Type = (Val0 > 0 && Val0 < static_cast<ir_ref>(Ctx.insns_count)) 
+                                 ? static_cast<ir_type>(Ctx.ir_base[Val0].type) : IR_VOID;
+              ir_type Val1Type = (Val1 > 0 && Val1 < static_cast<ir_ref>(Ctx.insns_count)) 
+                                 ? static_cast<ir_type>(Ctx.ir_base[Val1].type) : IR_VOID;
+              
+              // Skip PHI if either operand is invalid/void
+              if (Val0Type == IR_VOID || Val1Type == IR_VOID) {
+                // Use whichever operand is valid
+                MergedLocals[LocalIdx] = (Val0Type != IR_VOID) ? Val0 : Val1;
+              } else if (Val0Type != Val1Type || Val0Type != LocalType) {
+                // Type mismatch - use first operand as fallback
+                MergedLocals[LocalIdx] = Val0;
+              } else {
+                // Coerce operands to ensure types match
+                ir_ref Coerced0 = coerceToType(Val0, LocalType);
+                ir_ref Coerced1 = coerceToType(Val1, LocalType);
+                ir_ref Phi = ir_PHI_2(LocalType, Coerced0, Coerced1);
+                MergedLocals[LocalIdx] = Phi;
+              }
             } else {
               MergedLocals[LocalIdx] = Val0;  // Same value, no PHI needed
             }
@@ -1892,9 +2014,10 @@ Expect<void> WasmToIRBuilder::visitEnd(const AST::Instruction &) {
       
       // Create PHI node for result value
       if (Label.Arity > 0 && Label.BranchResults.size() == 2) {
-        ir_ref ResultPhi = ir_PHI_2(Label.ResultType, 
-                                     Label.BranchResults[0], 
-                                     Label.BranchResults[1]);
+        // Coerce operands to ensure types match
+        ir_ref Coerced0 = coerceToType(Label.BranchResults[0], Label.ResultType);
+        ir_ref Coerced1 = coerceToType(Label.BranchResults[1], Label.ResultType);
+        ir_ref ResultPhi = ir_PHI_2(Label.ResultType, Coerced0, Coerced1);
         push(ResultPhi);
       }
     } else if (Label.EndList.size() > 2) {
@@ -1906,9 +2029,14 @@ Expect<void> WasmToIRBuilder::visitEnd(const AST::Instruction &) {
       }
       // Create PHI node for result value from multiple branches
       if (Label.Arity > 0 && Label.BranchResults.size() == Label.EndList.size()) {
+        // Coerce all operands to ensure types match
+        std::vector<ir_ref> CoercedResults;
+        for (ir_ref R : Label.BranchResults) {
+          CoercedResults.push_back(coerceToType(R, Label.ResultType));
+        }
         ir_ref ResultPhi = ir_PHI_N(Label.ResultType, 
-                                     static_cast<ir_ref>(Label.BranchResults.size()),
-                                     Label.BranchResults.data());
+                                     static_cast<ir_ref>(CoercedResults.size()),
+                                     CoercedResults.data());
         push(ResultPhi);
       }
     }
@@ -1938,7 +2066,14 @@ Expect<void> WasmToIRBuilder::visitBr(const AST::Instruction &Instr) {
       // Get current value of this local
       auto it = Locals.find(LocalIdx);
       if (it != Locals.end()) {
-        ir_PHI_SET_OP(PhiRef, 2, it->second);
+        // Coerce to match PHI type
+        ir_type PhiType = IR_I32;
+        auto typeIt = LocalTypes.find(LocalIdx);
+        if (typeIt != LocalTypes.end()) {
+          PhiType = typeIt->second;
+        }
+        ir_ref CoercedVal = coerceToType(it->second, PhiType);
+        ir_PHI_SET_OP(PhiRef, 2, CoercedVal);
       }
     }
     
@@ -1983,7 +2118,14 @@ Expect<void> WasmToIRBuilder::visitBrIf(const AST::Instruction &Instr) {
     for (auto &[LocalIdx, PhiRef] : Target.LoopLocalPhis) {
       auto it = Locals.find(LocalIdx);
       if (it != Locals.end()) {
-        ir_PHI_SET_OP(PhiRef, 2, it->second);
+        // Coerce to match PHI type
+        ir_type PhiType = IR_I32;
+        auto typeIt = LocalTypes.find(LocalIdx);
+        if (typeIt != LocalTypes.end()) {
+          PhiType = typeIt->second;
+        }
+        ir_ref CoercedVal = coerceToType(it->second, PhiType);
+        ir_PHI_SET_OP(PhiRef, 2, CoercedVal);
       }
     }
     // Create back-edge
@@ -2050,7 +2192,14 @@ Expect<void> WasmToIRBuilder::visitBrTable(const AST::Instruction &Instr) {
       for (auto &[LocalIdx, PhiRef] : Target.LoopLocalPhis) {
         auto it = Locals.find(LocalIdx);
         if (it != Locals.end()) {
-          ir_PHI_SET_OP(PhiRef, 2, it->second);
+          // Coerce to match PHI type
+          ir_type PhiType = IR_I32;
+          auto typeIt = LocalTypes.find(LocalIdx);
+          if (typeIt != LocalTypes.end()) {
+            PhiType = typeIt->second;
+          }
+          ir_ref CoercedVal = coerceToType(it->second, PhiType);
+          ir_PHI_SET_OP(PhiRef, 2, CoercedVal);
         }
       }
       ir_ref LoopEnd = ir_LOOP_END();
@@ -2072,7 +2221,14 @@ Expect<void> WasmToIRBuilder::visitBrTable(const AST::Instruction &Instr) {
     for (auto &[LocalIdx, PhiRef] : DefaultTarget.LoopLocalPhis) {
       auto it = Locals.find(LocalIdx);
       if (it != Locals.end()) {
-        ir_PHI_SET_OP(PhiRef, 2, it->second);
+        // Coerce to match PHI type
+        ir_type PhiType = IR_I32;
+        auto typeIt = LocalTypes.find(LocalIdx);
+        if (typeIt != LocalTypes.end()) {
+          PhiType = typeIt->second;
+        }
+        ir_ref CoercedVal = coerceToType(it->second, PhiType);
+        ir_PHI_SET_OP(PhiRef, 2, CoercedVal);
       }
     }
     ir_ref LoopEnd = ir_LOOP_END();

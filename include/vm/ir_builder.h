@@ -150,6 +150,10 @@ private:
   /// Ensure ir_ref is valid; if not, emit a zero constant of the given type.
   /// Used to sanitize values before passing to ir_CALL_N to avoid backend assertions.
   ir_ref ensureValidRef(ir_ref Ref, ir_type Type) noexcept;
+  
+  /// Coerce a value to a target type, emitting conversion if needed.
+  /// Returns the original value if types are compatible, or a converted value.
+  ir_ref coerceToType(ir_ref Value, ir_type TargetType) noexcept;
 
 private:
   ir_ctx Ctx;                               // IR context (stack allocated)

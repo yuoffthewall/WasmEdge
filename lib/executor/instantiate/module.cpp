@@ -166,7 +166,7 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
     const auto &TypeIdxs = Mod.getFunctionSection().getContent();
     uint32_t FuncIdx = ImportFuncNum;
     uint32_t SuccessCount = 0;
-    uint32_t InitFailCount = 0, BuildFailCount = 0, CompileFailCount = 0, SkipCount = 0;
+    uint32_t InitFailCount = 0, BuildFailCount = 0, CompileFailCount = 0;
     uint32_t CodeIdx = 0;
     for (const auto &CodeSeg : CodeSec.getContent()) {
       auto *FuncInst = ModInst->unsafeGetFunction(FuncIdx);
@@ -194,48 +194,9 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
       // Create InstrView from instruction vector
       std::vector<AST::Instruction> InstrVec(Instrs.begin(), Instrs.end());
       
-      // Skip functions with many instructions (likely complex control flow)
-      // until IR builder is more robust
-      constexpr size_t MaxInstrCount = 1000;
-      if (InstrVec.size() > MaxInstrCount) {
-        spdlog::info("IR JIT: skip func {} (instr count {} > {})", FuncIdx,
-                     static_cast<uint32_t>(InstrVec.size()), MaxInstrCount);
-        SkipCount++;
-        CodeIdx++;
-        FuncIdx++;
-        continue;
-      }
-      
-      // Skip functions that start with unreachable (e.g., abort)
-      // These produce degenerate IR that the backend can't compile
-      if (!InstrVec.empty() && 
-          InstrVec[0].getOpCode() == OpCode::Unreachable) {
-        spdlog::info("IR JIT: skip func {} (starts with unreachable)", FuncIdx);
-        SkipCount++;
-        CodeIdx++;
-        FuncIdx++;
-        continue;
-      }
-      
-      // Skip functions with extremely complex control flow
-      // br_table is now supported; only skip very deeply nested control flow
-      constexpr int MaxIfCount = 50;
-      int ifCount = 0;
-      for (const auto &Instr : InstrVec) {
-        if (Instr.getOpCode() == OpCode::If) {
-          ifCount++;
-        }
-      }
-      if (ifCount > MaxIfCount) {
-        spdlog::info("IR JIT: skip func {} (if_count {} > {})", FuncIdx,
-                     ifCount, MaxIfCount);
-        SkipCount++;
-        CodeIdx++;
-        FuncIdx++;
-        continue;
-      }
-      
-      if (true) {
+      // No skip conditions - attempt to JIT compile every function.
+      // Failures will be reported as init_fail, build_fail, or compile_fail.
+      {
         
         // Build IR
         IRBuilder.reset();
@@ -265,7 +226,8 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
         // Compile to native code
         auto CompRes = IREngine.compile(IRBuilder.getIRContext());
         if (!CompRes.has_value()) {
-          spdlog::info("IR JIT: func {} compile failed", FuncIdx);
+          spdlog::debug("IR JIT: func {} compile failed (instr_count={})", 
+                        FuncIdx, static_cast<uint32_t>(InstrVec.size()));
           CompileFailCount++;
           CodeIdx++;
           FuncIdx++;
@@ -279,8 +241,8 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
       CodeIdx++;
       FuncIdx++;
     }
-    spdlog::info("IR JIT stats: skip={}, init_fail={}, build_fail={}, compile_fail={}",
-                 SkipCount, InitFailCount, BuildFailCount, CompileFailCount);
+    spdlog::info("IR JIT stats: init_fail={}, build_fail={}, compile_fail={}",
+                 InitFailCount, BuildFailCount, CompileFailCount);
     
     spdlog::info("IR JIT: Compiled {}/{} functions successfully", 
                  SuccessCount, FuncIdx - ImportFuncNum);
