@@ -1340,10 +1340,10 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
 #endif
 
     // Correctness: JIT output must match Interpreter when both ran successfully
-    if (interpOk && jitOk) {
-      /*
+    if (jitOk && aotOk) {
       // Print captured stdout/stderr for manual inspection
       std::cout << "\n--- " << kernelName << " captured output ---\n";
+      /*
       std::cout << "Interpreter stdout (" << interpCap.stdout_.size() << " bytes): ";
       if (interpCap.stdout_.empty())
         std::cout << "(empty)\n";
@@ -1354,6 +1354,7 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
         std::cout << "(empty)\n";
       else
         std::cout << "\n" << interpCap.stderr_ << "\n";
+      */
       std::cout << "JIT stdout (" << jitCap.stdout_.size() << " bytes): ";
       if (jitCap.stdout_.empty())
         std::cout << "(empty)\n";
@@ -1364,16 +1365,26 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
         std::cout << "(empty)\n";
       else
         std::cout << "\n" << jitCap.stderr_ << "\n";
-      std::cout << "---\n";
-      */
+      std::cout << "AOT stdout (" << aotCap.stdout_.size() << " bytes): ";
+      if (aotCap.stdout_.empty())
+        std::cout << "(empty)\n";
+      else
+        std::cout << "\n" << aotCap.stdout_ << "\n";
+      std::cout << "AOT stderr (" << aotCap.stderr_.size() << " bytes): ";
+      if (aotCap.stderr_.empty())
+        std::cout << "(empty)\n";
+      else
+        std::cout << "\n" << aotCap.stderr_ << "\n";
 
-      EXPECT_EQ(interpCap.stdout_, jitCap.stdout_)
-          << "Kernel " << kernelName << ": JIT stdout must match Interpreter";
-      EXPECT_EQ(interpCap.stderr_, jitCap.stderr_)
-          << "Kernel " << kernelName << ": JIT stderr must match Interpreter";
-      EXPECT_EQ(interpCap.exitCode, jitCap.exitCode)
-          << "Kernel " << kernelName << ": JIT proc_exit code must match Interpreter ("
-          << interpCap.exitCode << " vs " << jitCap.exitCode << ")";
+      std::cout << "---\n";
+
+      EXPECT_EQ(jitCap.stdout_,aotCap.stdout_)
+          << "Kernel " << kernelName << ": JIT stdout must match AOT";
+      EXPECT_EQ(jitCap.stderr_, aotCap.stderr_)
+          << "Kernel " << kernelName << ": JIT stderr must match AOT";
+      EXPECT_EQ(jitCap.exitCode, aotCap.exitCode)
+          << "Kernel " << kernelName << ": JIT proc_exit code must match AOT ("
+          << jitCap.exitCode << " vs " << aotCap.exitCode << ")";
     }
 #ifdef WASMEDGE_USE_LLVM
     // Correctness: AOT output must match reference (Interpreter or JIT) when both ran
