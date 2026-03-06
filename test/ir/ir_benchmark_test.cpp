@@ -31,6 +31,7 @@
 #include <gtest/gtest.h>
 #include <iomanip>
 #include <iostream>
+#include <map>
 #include <vector>
 
 namespace {
@@ -40,6 +41,8 @@ namespace {
 // ============================================================================
 namespace SightglassWasi {
 constexpr uint16_t WASI_ERRNO_SUCCESS = 0;
+constexpr uint16_t WASI_ERRNO_BADF = 8;     // EBADF: bad file descriptor
+constexpr uint16_t WASI_ERRNO_NOENT = 44;  // ENOENT: no such file or directory
 // __wasi_fdstat_t: 24 bytes (filetype u8, fdflags u16, rights_base u64, rights_inheriting u64)
 struct FdStat {
   uint8_t fs_filetype;
@@ -69,6 +72,12 @@ struct StdioCapture {
   int32_t exitCode{-1};  // proc_exit(code); -1 = never called
 };
 
+// Virtual file descriptor state for serving preloaded file content via WASI stubs.
+struct VirtualFd {
+  std::string content;
+  size_t offset = 0;
+};
+
 class WasiStubModule : public WasmEdge::Runtime::Instance::ModuleInstance {
 public:
   explicit WasiStubModule(StdioCapture *Capture = nullptr) : ModuleInstance("wasi_snapshot_preview1"), Capture(Capture) {
@@ -80,14 +89,27 @@ public:
     addHostFunc("args_sizes_get", std::make_unique<StubArgsSizesGet>());
     addHostFunc("args_get", std::make_unique<StubArgsGet>());
     addHostFunc("fd_filestat_get", std::make_unique<StubFdFilestatGet>());
-    addHostFunc("fd_close", std::make_unique<StubFdClose>());
-    addHostFunc("fd_read", std::make_unique<StubFdRead>());
+    addHostFunc("fd_close", std::make_unique<StubFdClose>(this));
+    addHostFunc("fd_read", std::make_unique<StubFdRead>(this));
     addHostFunc("fd_seek", std::make_unique<StubFdSeek>());
     addHostFunc("fd_write", std::make_unique<StubFdWrite>(Capture));
-    addHostFunc("path_open", std::make_unique<StubPathOpen>());
+    addHostFunc("path_open", std::make_unique<StubPathOpen>(this));
     addHostFunc("random_get", std::make_unique<StubRandomGet>());
     addHostFunc("proc_exit", std::make_unique<StubProcExit>(Capture));
   }
+
+  // Preload a virtual file that can be opened by the guest via path_open.
+  // The path should match what the guest requests (e.g. "./shootout-ackermann.m.input"
+  // or just "shootout-ackermann.m.input" — we try both with and without "./").
+  void addVirtualFile(const std::string &path, std::string content) {
+    virtualFiles[path] = std::move(content);
+  }
+
+  // Virtual file storage: filename -> content
+  std::map<std::string, std::string> virtualFiles;
+  // Open file descriptors: fd -> VirtualFd
+  std::map<int32_t, VirtualFd> openFds;
+  int32_t nextFd = 10;  // Start above stdin(0)/stdout(1)/stderr(2)
 
 private:
   StdioCapture *Capture;
@@ -116,13 +138,16 @@ private:
 
   class StubFdPrestatGet : public WasmEdge::Runtime::HostFunction<StubFdPrestatGet> {
   public:
-    Expect body(const WasmEdge::Runtime::CallingFrame &Frame, int32_t /* Fd */,
+    Expect body(const WasmEdge::Runtime::CallingFrame &Frame, int32_t Fd,
                uint32_t PrestatPtr) {
+      // Only fd 3 is pre-opened as "." (current directory).
+      // Return BADF for any other fd to stop wasi-libc enumeration.
+      if (Fd != 3) return SightglassWasi::WASI_ERRNO_BADF;
       auto *Mem = getMem(Frame);
       if (!Mem) return WasmEdge::Unexpect(WasmEdge::ErrCode::Value::HostFuncError);
       SightglassWasi::Prestat p = {};
       p.tag = 0;  // dir
-      p.pr_name_len = 0;
+      p.pr_name_len = 1;  // "." is 1 byte
       auto *ptr = Mem->getPointer<uint8_t *>(PrestatPtr);
       if (!ptr) return WasmEdge::Unexpect(WasmEdge::ErrCode::Value::HostFuncError);
       std::memcpy(ptr, &p, sizeof(p));
@@ -133,8 +158,14 @@ private:
   class StubFdPrestatDirName : public WasmEdge::Runtime::HostFunction<StubFdPrestatDirName> {
   public:
     Expect body(const WasmEdge::Runtime::CallingFrame &Frame, int32_t /* Fd */,
-               uint32_t /* PathBuf */, uint32_t /* PathLen */) {
-      (void)Frame;
+               uint32_t PathBuf, uint32_t PathLen) {
+      auto *Mem = getMem(Frame);
+      if (!Mem) return WasmEdge::Unexpect(WasmEdge::ErrCode::Value::HostFuncError);
+      // Write "." as the pre-opened directory name
+      if (PathLen >= 1) {
+        auto *ptr = Mem->getPointer<char *>(PathBuf);
+        if (ptr) ptr[0] = '.';
+      }
       return SightglassWasi::WASI_ERRNO_SUCCESS;
     }
   };
@@ -194,22 +225,59 @@ private:
 
   class StubFdClose : public WasmEdge::Runtime::HostFunction<StubFdClose> {
   public:
-    Expect body(const WasmEdge::Runtime::CallingFrame &, int32_t) {
+    explicit StubFdClose(WasiStubModule *Mod) : Module(Mod) {}
+    Expect body(const WasmEdge::Runtime::CallingFrame &, int32_t Fd) {
+      if (Module) Module->openFds.erase(Fd);
       return SightglassWasi::WASI_ERRNO_SUCCESS;
     }
+    WasiStubModule *Module;
   };
 
   class StubFdRead : public WasmEdge::Runtime::HostFunction<StubFdRead> {
   public:
-    Expect body(const WasmEdge::Runtime::CallingFrame &Frame, int32_t,
-                uint32_t, uint32_t, uint32_t NreadPtr) {
+    explicit StubFdRead(WasiStubModule *Mod) : Module(Mod) {}
+    Expect body(const WasmEdge::Runtime::CallingFrame &Frame, int32_t Fd,
+                uint32_t IovsPtr, uint32_t IovsLen, uint32_t NreadPtr) {
       auto *Mem = getMem(Frame);
-      if (Mem) {
-        auto *p = Mem->getPointer<uint32_t *>(NreadPtr);
-        if (p) *p = 0;
+      if (!Mem) return WasmEdge::Unexpect(WasmEdge::ErrCode::Value::HostFuncError);
+
+      uint32_t totalRead = 0;
+
+      // Check if this fd is a virtual file
+      if (Module) {
+        auto it = Module->openFds.find(Fd);
+        if (it != Module->openFds.end()) {
+          auto &vfd = it->second;
+          // Read from virtual file content into iovecs
+          for (uint32_t i = 0; i < IovsLen && vfd.offset < vfd.content.size(); i++) {
+            // WASI iovec: { buf_ptr: u32, buf_len: u32 }
+            auto *iovec = Mem->getPointer<uint32_t *>(IovsPtr + i * 8);
+            if (!iovec) break;
+            uint32_t bufPtr = iovec[0];
+            uint32_t bufLen = iovec[1];
+            size_t avail = vfd.content.size() - vfd.offset;
+            size_t toRead = std::min(static_cast<size_t>(bufLen), avail);
+            if (toRead > 0) {
+              auto *dst = Mem->getPointer<uint8_t *>(bufPtr);
+              if (dst) {
+                std::memcpy(dst, vfd.content.data() + vfd.offset, toRead);
+                vfd.offset += toRead;
+                totalRead += static_cast<uint32_t>(toRead);
+              }
+            }
+          }
+          auto *p = Mem->getPointer<uint32_t *>(NreadPtr);
+          if (p) *p = totalRead;
+          return SightglassWasi::WASI_ERRNO_SUCCESS;
+        }
       }
+
+      // Default: return 0 bytes (EOF) for stdin and unknown fds
+      auto *p = Mem->getPointer<uint32_t *>(NreadPtr);
+      if (p) *p = 0;
       return SightglassWasi::WASI_ERRNO_SUCCESS;
     }
+    WasiStubModule *Module;
   };
 
   class StubFdSeek : public WasmEdge::Runtime::HostFunction<StubFdSeek> {
@@ -258,16 +326,47 @@ private:
 
   class StubPathOpen : public WasmEdge::Runtime::HostFunction<StubPathOpen> {
   public:
+    explicit StubPathOpen(WasiStubModule *Mod) : Module(Mod) {}
     Expect body(const WasmEdge::Runtime::CallingFrame &Frame, int32_t, uint32_t,
-                uint32_t, uint32_t, uint32_t, uint64_t, uint64_t, uint32_t,
+                uint32_t PathPtr, uint32_t PathLen, uint32_t, uint64_t, uint64_t, uint32_t,
                 uint32_t OpenedFdPtr) {
       auto *Mem = getMem(Frame);
-      if (Mem) {
-        auto *p = Mem->getPointer<uint32_t *>(OpenedFdPtr);
-        if (p) *p = 0;
+      if (!Mem) return WasmEdge::Unexpect(WasmEdge::ErrCode::Value::HostFuncError);
+
+      // Extract the path string from guest memory
+      if (Module && PathLen > 0 && PathLen < 4096) {
+        auto *pathBytes = Mem->getPointer<const char *>(PathPtr);
+        if (pathBytes) {
+          std::string reqPath(pathBytes, PathLen);
+          // Try exact match, then with "./" prefix, then without "./" prefix
+          std::string candidates[] = { reqPath };
+          std::string bareReqPath = reqPath;
+          if (bareReqPath.substr(0, 2) == "./")
+            bareReqPath = bareReqPath.substr(2);
+
+          for (const auto &[fname, content] : Module->virtualFiles) {
+            std::string bareFname = fname;
+            if (bareFname.substr(0, 2) == "./")
+              bareFname = bareFname.substr(2);
+            if (bareFname == bareReqPath) {
+              int32_t fd = Module->nextFd++;
+              Module->openFds[fd] = VirtualFd{content, 0};
+              auto *p = Mem->getPointer<uint32_t *>(OpenedFdPtr);
+              if (p) *p = static_cast<uint32_t>(fd);
+              return SightglassWasi::WASI_ERRNO_SUCCESS;
+            }
+          }
+          // File not found in virtual FS
+          return SightglassWasi::WASI_ERRNO_NOENT;
+        }
       }
+
+      // Fallback: return fd 0 (legacy behavior)
+      auto *p = Mem->getPointer<uint32_t *>(OpenedFdPtr);
+      if (p) *p = 0;
       return SightglassWasi::WASI_ERRNO_SUCCESS;
     }
+    WasiStubModule *Module;
   };
 
   class StubRandomGet : public WasmEdge::Runtime::HostFunction<StubRandomGet> {
@@ -1156,6 +1255,24 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
     bool jitOk = false;
     bool aotOk = false;
 
+    // Helper: load .input files for this kernel into a WasiStubModule's virtual FS
+    auto loadVirtualFiles = [&](WasiStubModule &stub) {
+      for (const auto &e : std::filesystem::directory_iterator(SightglassDir)) {
+        auto fname = e.path().filename().string();
+        // Match files like "shootout-ackermann.m.input" for kernel "shootout-ackermann"
+        if (fname.size() > kernelName.size() + 1 &&
+            fname.substr(0, kernelName.size()) == kernelName &&
+            fname.find(".input") != std::string::npos) {
+          std::ifstream ifs(e.path(), std::ios::binary);
+          if (ifs) {
+            std::string content((std::istreambuf_iterator<char>(ifs)),
+                                std::istreambuf_iterator<char>());
+            stub.addVirtualFile(fname, std::move(content));
+          }
+        }
+      }
+    };
+
     const char *modes[] = {"Interpreter", "JIT"};
     for (const char *modeName : modes) {
       if (skipInterp && std::strcmp(modeName, "Interpreter") == 0) continue;
@@ -1172,6 +1289,7 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
       Conf.getRuntimeConfigure().setEnableJIT(useJIT);
 
       WasiStubModule wasiStub(cap);
+      loadVirtualFiles(wasiStub);
       BenchEnv benchEnv;
       BenchModule benchMod(benchEnv);
 
@@ -1280,6 +1398,7 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
                   runConf.getRuntimeConfigure().setEnableJIT(false);
 
                   WasiStubModule wasiStub(&aotCap);
+                  loadVirtualFiles(wasiStub);
                   BenchEnv benchEnv;
                   BenchModule benchMod(benchEnv);
 
@@ -1400,6 +1519,35 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
           << "Kernel " << kernelName << ": AOT exit code must match reference";
     }
 #endif
+
+    // Correctness: verify output against sightglass .expected reference files
+    auto loadExpected = [&](const std::string &suffix) -> std::string {
+      auto path = SightglassDir / (kernelName + suffix);
+      if (!std::filesystem::exists(path)) return "";
+      std::ifstream ifs(path, std::ios::binary);
+      if (!ifs) return "";
+      return std::string((std::istreambuf_iterator<char>(ifs)),
+                          std::istreambuf_iterator<char>());
+    };
+
+    std::string expectedStdout = loadExpected(".stdout.expected");
+    std::string expectedStderr = loadExpected(".stderr.expected");
+
+    // Check whichever mode(s) ran successfully against expected output
+    auto checkExpected = [&](const std::string &label, const StdioCapture &cap, bool ok) {
+      if (!ok) return;
+      if (!expectedStdout.empty()) {
+        EXPECT_EQ(cap.stdout_, expectedStdout)
+            << "Kernel " << kernelName << " (" << label << "): stdout mismatch vs .expected";
+      }
+      if (!expectedStderr.empty()) {
+        EXPECT_EQ(cap.stderr_, expectedStderr)
+            << "Kernel " << kernelName << " (" << label << "): stderr mismatch vs .expected";
+      }
+    };
+    checkExpected("Interpreter", interpCap, interpOk);
+    checkExpected("JIT", jitCap, jitOk);
+    checkExpected("AOT", aotCap, aotOk);
   }
   std::cout << std::endl;
 }
