@@ -10,18 +10,24 @@
 //===----------------------------------------------------------------------===//
 
 #include "common/configure.h"
+#include "common/defines.h"
 #include "executor/executor.h"
 #include "loader/loader.h"
 #include "runtime/hostfunc.h"
 #include "runtime/instance/module.h"
 #include "validator/validator.h"
 #include "vm/vm.h"
+#ifdef WASMEDGE_USE_LLVM
+#include "llvm/codegen.h"
+#include "llvm/compiler.h"
+#endif
 
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <gtest/gtest.h>
 #include <iomanip>
 #include <iostream>
@@ -55,11 +61,12 @@ static_assert(sizeof(Prestat) == 8, "prestat size");
 
 // ============================================================================
 // Sightglass: WASI stub host module (no-op / dummy so kernels can instantiate)
-// Optional stdout/stderr capture for correctness checks (Interpreter vs JIT).
+// Optional stdout/stderr and exit code capture for correctness checks (Interpreter vs JIT).
 // ============================================================================
 struct StdioCapture {
   std::string stdout_;
   std::string stderr_;
+  int32_t exitCode{-1};  // proc_exit(code); -1 = never called
 };
 
 class WasiStubModule : public WasmEdge::Runtime::Instance::ModuleInstance {
@@ -79,7 +86,7 @@ public:
     addHostFunc("fd_write", std::make_unique<StubFdWrite>(Capture));
     addHostFunc("path_open", std::make_unique<StubPathOpen>());
     addHostFunc("random_get", std::make_unique<StubRandomGet>());
-    addHostFunc("proc_exit", std::make_unique<StubProcExit>());
+    addHostFunc("proc_exit", std::make_unique<StubProcExit>(Capture));
   }
 
 private:
@@ -278,11 +285,15 @@ private:
 
   class StubProcExit : public WasmEdge::Runtime::HostFunction<StubProcExit> {
   public:
+    explicit StubProcExit(StdioCapture *Cap) : Capture(Cap) {}
     // WASI proc_exit(code) never returns; the wasm then has unreachable.
     // Return Terminated so execution stops and we never run that unreachable.
-    WasmEdge::Expect<void> body(const WasmEdge::Runtime::CallingFrame &, int32_t) {
+    // Capture exit code for correctness comparison (Interpreter vs JIT).
+    WasmEdge::Expect<void> body(const WasmEdge::Runtime::CallingFrame &, int32_t code) {
+      if (Capture) Capture->exitCode = code;
       return WasmEdge::Unexpect(WasmEdge::ErrCode::Value::Terminated);
     }
+    StdioCapture *Capture;
   };
 };
 
@@ -1117,6 +1128,9 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
   const char *modeEnv = std::getenv("WASMEDGE_SIGHTGLASS_MODE");
   bool interpOnly = (modeEnv && (std::strcmp(modeEnv, "Interpreter") == 0));
   bool jitOnly = (modeEnv && (std::strcmp(modeEnv, "JIT") == 0));
+  bool aotOnly = (modeEnv && (std::strcmp(modeEnv, "AOT") == 0));
+  const char *skipInterpEnv = std::getenv("WASMEDGE_SIGHTGLASS_SKIP_INTERP");
+  bool skipInterp = (skipInterpEnv && skipInterpEnv[0] == '1');
 
   if (kernels.empty()) {
     GTEST_SKIP() << "No .wasm kernels in sightglass/. Run utils/download_sightglass.sh";
@@ -1137,14 +1151,17 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
 
   for (const auto &wasmPath : kernels) {
     std::string kernelName = wasmPath.stem().string();
-    StdioCapture interpCap, jitCap;
+    StdioCapture interpCap, jitCap, aotCap;
     bool interpOk = false;
     bool jitOk = false;
+    bool aotOk = false;
 
     const char *modes[] = {"Interpreter", "JIT"};
     for (const char *modeName : modes) {
+      if (skipInterp && std::strcmp(modeName, "Interpreter") == 0) continue;
       if (interpOnly && std::strcmp(modeName, "Interpreter") != 0) continue;
       if (jitOnly && std::strcmp(modeName, "JIT") != 0) continue;
+      if (aotOnly) continue;
       bool useJIT = (std::strcmp(modeName, "JIT") == 0);
       StdioCapture *cap = useJIT ? &jitCap : &interpCap;
 
@@ -1212,6 +1229,116 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
                 << std::endl;
     }
 
+#ifdef WASMEDGE_USE_LLVM
+    // AOT mode (LLVM: compile wasm -> .so, then load .so and run).
+    // Skip if WASMEDGE_SIGHTGLASS_SKIP_AOT=1 (e.g. for faster runs without LLVM AOT).
+    const char *skipAotEnv = std::getenv("WASMEDGE_SIGHTGLASS_SKIP_AOT");
+    const bool skipAOT = (skipAotEnv && skipAotEnv[0] == '1');
+    if (!skipAOT && (aotOnly || (!interpOnly && !jitOnly))) {
+      const char *modeName = "AOT";
+      WasmEdge::Configure compileConf;
+      compileConf.getCompilerConfigure().setOptimizationLevel(
+          WasmEdge::CompilerConfigure::OptimizationLevel::O0);
+      compileConf.getCompilerConfigure().setOutputFormat(
+          WasmEdge::CompilerConfigure::OutputFormat::Native);
+      compileConf.getRuntimeConfigure().setForceInterpreter(true);
+
+      auto loadData = WasmEdge::Loader::Loader::loadFile(wasmPath);
+      if (!loadData) {
+        std::cerr << "AOT loadFile failed: " << kernelName
+                  << " " << WasmEdge::ErrCode(loadData.error()) << std::endl;
+      } else {
+        WasmEdge::Loader::Loader loader(compileConf);
+        auto parseRes = loader.parseModule(*loadData);
+        if (!parseRes) {
+          std::cerr << "AOT parseModule failed: " << kernelName << std::endl;
+        } else {
+          std::unique_ptr<WasmEdge::AST::Module> module = std::move(*parseRes);
+          WasmEdge::Validator::Validator validator(compileConf);
+          if (!validator.validate(*module)) {
+            std::cerr << "AOT validate failed: " << kernelName << std::endl;
+          } else {
+            WasmEdge::LLVM::Compiler compiler(compileConf);
+            if (!compiler.checkConfigure()) {
+              std::cerr << "AOT checkConfigure failed: " << kernelName << std::endl;
+            } else {
+              auto compileRes = compiler.compile(*module);
+              if (!compileRes) {
+                std::cerr << "AOT compile failed: " << kernelName
+                          << " " << WasmEdge::ErrCode(compileRes.error()) << std::endl;
+              } else {
+                std::filesystem::path soPath = std::filesystem::temp_directory_path() /
+                    ("wasmedge_sightglass_" + kernelName + WASMEDGE_LIB_EXTENSION);
+                WasmEdge::LLVM::CodeGen codegen(compileConf);
+                if (!codegen.codegen(WasmEdge::Span<const WasmEdge::Byte>(*loadData),
+                                    std::move(*compileRes), soPath)) {
+                  std::cerr << "AOT codegen failed: " << kernelName << std::endl;
+                } else {
+                  soPath = std::filesystem::absolute(soPath);
+                  WasmEdge::Configure runConf;
+                  runConf.getRuntimeConfigure().setForceInterpreter(false);
+                  runConf.getRuntimeConfigure().setEnableJIT(false);
+
+                  WasiStubModule wasiStub(&aotCap);
+                  BenchEnv benchEnv;
+                  BenchModule benchMod(benchEnv);
+
+                  WasmEdge::VM::VM VM(runConf);
+                  ASSERT_TRUE(VM.registerModule(wasiStub));
+                  ASSERT_TRUE(VM.registerModule(benchMod));
+
+                  auto ttvStart = high_resolution_clock::now();
+                  auto loadRes = VM.loadWasm(soPath);
+                  if (!loadRes) {
+                    std::cerr << "AOT loadWasm(so) failed: " << kernelName
+                              << " " << WasmEdge::ErrCode(loadRes.error()) << std::endl;
+                  } else {
+                    ASSERT_TRUE(VM.validate());
+                    auto instStart = high_resolution_clock::now();
+                    auto instRes = VM.instantiate();
+                    auto instEnd = high_resolution_clock::now();
+                    if (!instRes) {
+                      std::cerr << "AOT instantiate failed: " << kernelName
+                                << " " << WasmEdge::ErrCode(instRes.error()) << std::endl;
+                    } else {
+                      double instLatencyUs = duration_cast<Micro>(instEnd - instStart).count();
+                      std::vector<WasmEdge::ValVariant> noArgs;
+                      std::vector<WasmEdge::ValType> noTypes;
+                      auto execRes = VM.execute("_start", noArgs, noTypes);
+                      auto ttvEnd = high_resolution_clock::now();
+                      double ttvUs = duration_cast<Micro>(ttvEnd - ttvStart).count();
+
+                      if (!execRes) {
+                        if (execRes.error() != WasmEdge::ErrCode::Value::Terminated)
+                          std::cerr << "AOT execute failed: " << kernelName << std::endl;
+                        else
+                          aotOk = true; // proc_exit = success
+                      } else {
+                        aotOk = true;
+                      }
+                      if (aotOk) {
+                        double workTimeUs =
+                            duration_cast<Micro>(benchEnv.workTimeNs).count();
+                        std::cout << std::left << std::setw(20) << kernelName
+                                  << std::setw(14) << modeName
+                                  << std::fixed << std::setprecision(2)
+                                  << std::setw(18) << instLatencyUs
+                                  << std::setw(18) << workTimeUs
+                                  << std::setw(18) << ttvUs
+                                  << std::endl;
+                      }
+                    }
+                  }
+                  std::filesystem::remove(soPath);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+#endif
+
     // Correctness: JIT output must match Interpreter when both ran successfully
     if (interpOk && jitOk) {
       /*
@@ -1244,7 +1371,24 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
           << "Kernel " << kernelName << ": JIT stdout must match Interpreter";
       EXPECT_EQ(interpCap.stderr_, jitCap.stderr_)
           << "Kernel " << kernelName << ": JIT stderr must match Interpreter";
+      EXPECT_EQ(interpCap.exitCode, jitCap.exitCode)
+          << "Kernel " << kernelName << ": JIT proc_exit code must match Interpreter ("
+          << interpCap.exitCode << " vs " << jitCap.exitCode << ")";
     }
+#ifdef WASMEDGE_USE_LLVM
+    // Correctness: AOT output must match reference (Interpreter or JIT) when both ran
+    const std::string *refStdout = interpOk ? &interpCap.stdout_ : (jitOk ? &jitCap.stdout_ : nullptr);
+    const std::string *refStderr = interpOk ? &interpCap.stderr_ : (jitOk ? &jitCap.stderr_ : nullptr);
+    const int32_t *refExit = interpOk ? &interpCap.exitCode : (jitOk ? &jitCap.exitCode : nullptr);
+    if (aotOk && refStdout && refStderr && refExit) {
+      EXPECT_EQ(*refStdout, aotCap.stdout_)
+          << "Kernel " << kernelName << ": AOT stdout must match reference";
+      EXPECT_EQ(*refStderr, aotCap.stderr_)
+          << "Kernel " << kernelName << ": AOT stderr must match reference";
+      EXPECT_EQ(*refExit, aotCap.exitCode)
+          << "Kernel " << kernelName << ": AOT exit code must match reference";
+    }
+#endif
   }
   std::cout << std::endl;
 }

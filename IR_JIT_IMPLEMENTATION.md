@@ -95,20 +95,20 @@ To resolve this dichotomy, modern high-performance engines (such as V8 and Wasmt
 # Problem Statement
 While WasmEdge demonstrates exceptional peak performance in computational workloads, its current architecture lacks a multi-tiered compilation strategy. WasmEdge relies heavily on LLVM for both AOT and JIT compilation. Although LLVM generates highly optimized machine code, its compilation pipeline is computationally expensive and memory-intensive, which is often prohibitive for resource-constrained edge devices or short-lived serverless functions.
 
-Consequently, WasmEdge faces a significant "cold start" problem, where applications must endure long pauses while LLVM compiles the code. ==Currently, WasmEdge lacks a lightweight baseline JIT implementation capable of bridging the gap between slow interpretation and expensive optimization.== The lack of a fast-path compiler prevents the runtime from adapting dynamically to workload behavior, limiting its efficiency in scenarios where rapid responsiveness is as critical as raw throughput. ==This Pproject addresses this deficiency by integrating `dstogov/ir` to establish a baseline compilation tier, thereby enabling a complete tiered JIT infrastructure.==
+Consequently, WasmEdge faces a significant "cold start" problem, where applications must endure long pauses while LLVM compiles the code. Currently, WasmEdge lacks a lightweight baseline JIT implementation capable of bridging the gap between slow interpretation and expensive optimization. The lack of a fast-path compiler prevents the runtime from adapting dynamically to workload behavior, limiting its efficiency in scenarios where rapid responsiveness is as critical as raw throughput. This project addresses this deficiency by integrating `dstogov/ir` to establish a baseline compilation tier, thereby enabling a complete tiered JIT infrastructure.
 
 # WasmEdge IR JIT Implementation
 
 **Status**: Phase 1 - Complete IR Lowering + WasmEdge Integration ✅  
-**Last Updated**: February 11, 2026  
+**Last Updated**: March 6, 2026  
 **Build Status**: Compiling with no errors  
-**Test Status**: All tests passing (100%) - **176 total tests across 6 test suites**
+**Test Status**: All tests passing (100%) - **179 total tests across 6 test suites**
 - Basic IR Generation (33 tests)
 - Instruction Coverage (43 tests)  
 - **Execution Correctness (79 tests)** ✅ (includes 8 control flow + 19 memory + 4 function call + 5 global tests)
 - **Integration Tests (6 tests)** ✅ (includes factorial, memory access, globals, conditional logic)
 - **End-to-End Tests (5 tests)** ✅ - real .wasm file loading and execution
-- **Benchmark Tests (10 tests)** ✅ NEW - integer algorithm correctness + performance
+- **Benchmark Tests (13 tests)** ✅ - integer algorithms, quicksort, Sightglass suite (Interpreter/JIT/AOT)
 
 **WasmEdge Integration**: ✅ IR JIT compiles functions during module instantiation  
 **Instruction Coverage**: ~167 WebAssembly instructions mapped to IR  
@@ -522,7 +522,7 @@ testBinaryOp(OpCode::I32__rotl);
 
 ---
 
-## Build Instructions
+## Build & Test Instructions
 
 ### Prerequisites
 
@@ -576,7 +576,7 @@ Key flags:
 
 - **`WASMEDGE_BUILD_IR_JIT=ON`**: enables IR JIT integration and automatically builds the `dstogov/ir` submodule.
 - **`WASMEDGE_BUILD_TESTS=ON`**: ensures the unit, integration, and e2e test suites are built.
-- **`WASMEDGE_USE_LLVM`**: optional, controls whether LLVM-based AOT/JIT is built.
+- **`WASMEDGE_USE_LLVM=ON`**: optional; required for **Sightglass AOT** mode (compare IR JIT vs LLVM AOT). When ON, the benchmark test links `wasmedgeLLVM` and can compile kernels to .so and run them.
 
 ### 4. Building Specific Components
 
@@ -602,33 +602,71 @@ make wasmedgeLoader -j8
 To compile just the test executables (much faster than building everything):
 ```bash
 cd build
-make wasmedgeIRExecutionTests -j8
-make wasmedgeIRE2ETests -j8
-make wasmedgeIRBenchmarkTests -j8
-make wasmedgeIRIntegrationTests -j8
+make wasmedgeIRTests wasmedgeIRInstructionTests -j8
+make wasmedgeIRExecutionTests wasmedgeIRIntegrationTests wasmedgeIRE2ETests wasmedgeIRBenchmarkTests -j8
 ```
 
 ### 5. Running the Tests
 
-To run the full suite of IR tests (Execution, Benchmarks, E2E, Unit, Integration):
+**Full IR test suite (Execution, Benchmarks, E2E, Unit, Integration):**
 ```bash
 cd build
 ctest -R IR -V --output-on-failure
 ```
 
-To run a specific test suite directly (e.g., E2E Tests):
+**Individual test executables:**
 ```bash
 cd build
+./test/ir/wasmedgeIRTests
+./test/ir/wasmedgeIRInstructionTests
+./test/ir/wasmedgeIRExecutionTests
 ./test/ir/wasmedgeIRE2ETests
+./test/ir/wasmedgeIRBenchmarkTests
+./test/ir/wasmedgeIRIntegrationTests
 ```
 
-To execute a specific Google Test case within a suite:
+**Run a specific test case:**
 ```bash
 cd build
 ./test/ir/wasmedgeIRE2ETests --gtest_filter=IRE2ETest.LoadAndRunAdd
+./test/ir/wasmedgeIRBenchmarkTests --gtest_filter='*SightglassSuite*'
 ```
 
-### 6. Building without IR JIT (Default)
+**Sightglass benchmark suite (Interpreter vs JIT vs AOT):**
+
+1. **Obtain testdata** (if `test/ir/testdata/sightglass/` is missing):
+   ```bash
+   ./utils/download_sightglass.sh
+   ```
+
+2. **Run all kernels, all modes** (from repo root):
+   ```bash
+   ./test/ir/run_sightglass_all.sh build/
+   ```
+   Uses per-run timeout `SIGHTGLASS_TIMEOUT` (default 15s). Build with `-DWASMEDGE_BUILD_IR_JIT=ON -DWASMEDGE_BUILD_TESTS=ON`; add `-DWASMEDGE_USE_LLVM=ON` for AOT.
+
+3. **Run only JIT and AOT** (skip Interpreter, faster):
+   ```bash
+   SIGHTGLASS_TIMEOUT=30 WASMEDGE_SIGHTGLASS_SKIP_INTERP=1 ./test/ir/run_sightglass_all.sh build/
+   ```
+
+4. **Run a single kernel or mode** (gtest filter + env):
+   ```bash
+   WASMEDGE_SIGHTGLASS_KERNEL=noop ./build/test/ir/wasmedgeIRBenchmarkTests --gtest_filter='*SightglassSuite*'
+   WASMEDGE_SIGHTGLASS_MODE=JIT WASMEDGE_SIGHTGLASS_KERNEL=quicksort ./build/test/ir/wasmedgeIRBenchmarkTests --gtest_filter='*SightglassSuite*'
+   ```
+
+**Environment variables for Sightglass:**
+
+| Variable | Effect |
+|----------|--------|
+| `WASMEDGE_SIGHTGLASS_KERNEL` | Run only this kernel (e.g. `noop`, `quicksort`). |
+| `WASMEDGE_SIGHTGLASS_MODE` | Run only this mode: `Interpreter`, `JIT`, or `AOT`. |
+| `WASMEDGE_SIGHTGLASS_SKIP_INTERP=1` | In test: skip Interpreter; in script: run only JIT and AOT. |
+| `WASMEDGE_SIGHTGLASS_SKIP_AOT=1` | In test: skip AOT (e.g. when not built with LLVM). |
+| `SIGHTGLASS_TIMEOUT` | Per-run timeout in seconds (script only; default 15). |
+
+### 7. Building without IR JIT (Default)
 
 ```bash
 mkdir -p build
@@ -637,7 +675,7 @@ cmake ..
 make -j8
 ```
 
-### 5. Verification
+### 8. Verification
 
 Check that IR symbols are present:
 
@@ -683,10 +721,12 @@ WasmEdge/
 │   │   ├── factorial.wat                   [new - E2E test module]
 │   │   ├── factorial.wasm                  [new - compiled E2E test]
 │   │   ├── fibonacci.wat                   [new - benchmark algorithms]
-│   │   └── fibonacci.wasm                  [new - compiled benchmarks]
+│   │   ├── fibonacci.wasm                  [new - compiled benchmarks]
+│   │   └── sightglass/                     [Sightglass .wasm kernels]
 │   ├── ir_e2e_test.cpp                     [new - E2E integration tests]
-│   └── ir_benchmark_test.cpp               [new - algorithm benchmarks]
-└── ir/                                     [dstogov/ir submodule]
+│   ├── ir_benchmark_test.cpp               [new - algorithm + Sightglass benchmarks]
+│   └── run_sightglass_all.sh               [run Sightglass kernels: Interpreter/JIT/AOT]
+└── thirdparty/ir/                           [dstogov/ir submodule]
     ├── ir.h
     ├── ir_builder.h
     └── examples/                           [studied for patterns]
@@ -701,7 +741,7 @@ WasmEdge/
 | Component | Lines | Description |
 |-----------|-------|-------------|
 | ir_builder.h | 145 | Translation layer interface (includes PreIfLocals, ResultType) |
-| ir_builder.cpp | 1,450 | Complete Wasm→IR lowering (~164 instrs + PHI node fixes) |
+| ir_builder.cpp | ~2,376 | Complete Wasm→IR lowering (~166 instrs + PHI node fixes) |
 | ir_jit_engine.h | 50 | JIT engine interface |
 | ir_jit_engine.cpp | 233 | Compilation and execution (updated calling convention) |
 | ir_basic_test.cpp | 916 | Basic functionality tests (33 tests) |
@@ -709,7 +749,7 @@ WasmEdge/
 | ir_execution_test.cpp | 1,550 | Execution correctness tests (79 tests) |
 | ir_integration_test.cpp | 403 | Integration tests (6 tests) |
 | ir_e2e_test.cpp | 325 | End-to-end integration tests (5 tests) |
-| ir_benchmark_test.cpp | 450 | Algorithm benchmarks (10 tests) |
+| ir_benchmark_test.cpp | ~1,397 | Algorithm + Sightglass benchmarks (13 tests) |
 | factorial.wat | 57 | E2E test module source |
 | fibonacci.wat | 172 | Benchmark algorithms (fib, ackermann, primes, etc.) |
 | function.h | +50 | IR JIT function variant + upgradeToIRJit |
@@ -1202,6 +1242,36 @@ TEST_F(IRExecutionTest, CallIndirect_RuntimeIndex) {
 | **Control flow** | Branch targets incorrect | `if(true)` executes wrong branch |
 | **Dead code** | Return values lost after branch | `if/else` returns 0 for both branches |
 
+### Sightglass Benchmark Suite
+
+The **Sightglass** benchmark suite is integrated to compare **Interpreter**, **IR JIT** (dstogov/ir), and **LLVM AOT** on real-world WASI-style kernels. It provides performance metrics and cross-mode correctness checks.
+
+**Location:** `test/ir/ir_benchmark_test.cpp` (gtest `SightglassSuite`), `test/ir/run_sightglass_all.sh`, `test/ir/testdata/sightglass/*.wasm`.
+
+**What it does:**
+
+- Runs each kernel in `test/ir/testdata/sightglass/` in one or more modes: **Interpreter**, **JIT** (IR JIT), **AOT** (LLVM-compiled .so, when `WASMEDGE_USE_LLVM=ON`).
+- Uses minimal WASI and `bench` host stubs so kernels can instantiate and run; captures **stdout**, **stderr**, and **exit code** per run.
+- **Correctness:** For each kernel, JIT output is required to match Interpreter (stdout, stderr, exit code). When AOT runs, AOT output is required to match the same reference (Interpreter or JIT). This verifies that IR JIT and LLVM AOT produce the same observable behavior as the interpreter.
+- **Metrics:** Reports instantiation latency (µs), work time (µs), and time-to-value (µs) per mode.
+
+**Modes and environment:**
+
+- **Interpreter** – no JIT; execution is interpreted.
+- **JIT** – IR JIT (dstogov/ir) compiles at instantiation; execution uses compiled code.
+- **AOT** – Wasm is compiled to a native .so with the LLVM pipeline, then the VM loads the .so and runs it (no interpreter, no IR JIT). Requires `WASMEDGE_USE_LLVM=ON` and links `wasmedgeLLVM` for the benchmark test.
+
+**Script (`run_sightglass_all.sh`):**
+
+- Runs each kernel in isolation with a per-run timeout (default 15s; set `SIGHTGLASS_TIMEOUT`).
+- By default runs all three modes (Interpreter, JIT, AOT). Set **`WASMEDGE_SIGHTGLASS_SKIP_INTERP=1`** to run only JIT and AOT (faster, no interpreter).
+- Set **`WASMEDGE_SIGHTGLASS_SKIP_AOT=1`** to skip AOT (e.g. when not built with LLVM).
+- Summarizes pass/fail/timeout per mode.
+
+**Testdata:** Populate `test/ir/testdata/sightglass/` with `.wasm` kernels (e.g. from the Sightglass project). Run `utils/download_sightglass.sh` if the directory is missing.
+
+This suite complements the unit and execution tests by validating **real WASI kernels** and **cross-backend consistency** (Interpreter ≈ JIT ≈ AOT).
+
 ### Test Categories and Coverage
 
 | Test Category | What's Verified | File Location |
@@ -1241,9 +1311,9 @@ TEST_F(IRExecutionTest, CallIndirect_RuntimeIndex) {
 [==========] 5 tests from 1 test suite
 [  PASSED  ] 5 tests (100%)
 
-# Benchmark Test Suite (10 tests)
-[==========] 10 tests from 1 test suite
-[  PASSED  ] 10 tests (100%)
+# Benchmark Test Suite (13 tests)
+[==========] 13 tests from 1 test suite
+[  PASSED  ] 13 tests (100%)
   - FibonacciRecursive_Correctness
   - FibonacciIterative_Correctness  
   - Ackermann_Correctness
@@ -1253,6 +1323,9 @@ TEST_F(IRExecutionTest, CallIndirect_RuntimeIndex) {
   - CountPrimes_Correctness
   - Benchmark_FibonacciIterative (~4.5M calls/sec)
   - Benchmark_CountPrimes (~170k calls/sec)
+  - Quicksort_Correctness
+  - Benchmark_Quicksort
+  - SightglassSuite (Interpreter/JIT/AOT cross-mode correctness + metrics)
 
 Type Conversion Coverage (FULL IMPLEMENTATION):
   ✅ Integer wrap/extend - ir_TRUNC, ir_SEXT, ir_ZEXT
@@ -1281,13 +1354,13 @@ Global Operations Coverage (IR Generation + Execution ✅):
   ✅ global.get - Load via ValVariant** (double indirection)
   ✅ global.set - Store via ValVariant** (double indirection)
 
-TOTAL: 176/176 tests passing ✅
+TOTAL: 179/179 tests passing ✅
   - Basic IR Generation: 33 tests
   - Instruction Coverage: 43 tests
   - Execution Correctness: 79 tests (includes 8 control flow + 19 memory + 4 function call + 5 global tests)
   - Integration Tests: 6 tests
   - End-to-End Tests: 5 tests
-  - Benchmark Tests: 10 tests
+  - Benchmark Tests: 13 tests (algorithm correctness + SightglassSuite)
 ```
 
 **Test Suite Structure:**
@@ -1298,10 +1371,12 @@ test/ir/
 ├── ir_execution_test.cpp    (79 tests - execution correctness)
 ├── ir_integration_test.cpp  (6 tests - WasmEdge runtime integration)
 ├── ir_e2e_test.cpp          (5 tests - real .wasm file loading)
-├── ir_benchmark_test.cpp    (10 tests - algorithm benchmarks)
+├── ir_benchmark_test.cpp    (13 tests - algorithms + SightglassSuite)
+├── run_sightglass_all.sh    (run Sightglass kernels: Interpreter/JIT/AOT)
 ├── testdata/
 │   ├── factorial.wat/wasm   (E2E test module)
-│   └── fibonacci.wat/wasm   (benchmark algorithms)
+│   ├── fibonacci.wat/wasm   (benchmark algorithms)
+│   └── sightglass/          (Sightglass .wasm kernels)
 └── CMakeLists.txt           (build configuration)
 ```
 
@@ -1363,7 +1438,7 @@ Memory Operations Verified (19 tests):
   ✅ Memory_I64_RoundTrip - store/load round-trip verification (i64)
 ```
 
-**Benchmark Tests (10 tests):**
+**Benchmark Tests (13 tests):**
 ```
 Integer Algorithm Correctness (8 tests):
   ✅ FibonacciRecursive - recursive fibonacci (tests recursive calls + if result type)
@@ -1378,6 +1453,11 @@ Integer Algorithm Correctness (8 tests):
 Performance Benchmarks (2 tests):
   ✅ Benchmark_FibonacciIterative - fib(35) x 100k iterations (~4.5M calls/sec)
   ✅ Benchmark_CountPrimes - count_primes(1000) x 1k iterations (~170k calls/sec)
+
+Quicksort + Sightglass (3 tests):
+  ✅ Quicksort_Correctness - quicksort algorithm correctness
+  ✅ Benchmark_Quicksort - quicksort performance
+  ✅ SightglassSuite - Sightglass kernels in Interpreter/JIT/AOT; cross-mode correctness + metrics
 ```
 
 ### Instruction Coverage Verification
@@ -1437,7 +1517,7 @@ make -j8 wasmedgeIRTests wasmedgeIRInstructionTests wasmedgeIRExecutionTests \
 ./test/ir/wasmedgeIRExecutionTests     # Execution correctness (79 tests)
 ./test/ir/wasmedgeIRIntegrationTests   # Runtime integration (6 tests)
 ./test/ir/wasmedgeIRE2ETests           # End-to-end with .wasm (5 tests)
-./test/ir/wasmedgeIRBenchmarkTests     # Algorithm benchmarks (10 tests)
+./test/ir/wasmedgeIRBenchmarkTests     # Algorithm + Sightglass benchmarks (13 tests)
 
 # Run all IR tests via CTest
 ctest -R IR
@@ -1455,17 +1535,17 @@ make wasmedgeVM -j8
 echo "Exit code: $?"  # Should be 0
 
 # 2. Library verification
-ls -lh thirdparty/ir/libwasmedgeIR.a  # ~1-2 MB
+ls -lh thirdparty/ir/libir.a  # ~1-2 MB (built by CMake when WASMEDGE_BUILD_IR_JIT=ON)
 ls -lh lib/vm/libwasmedgeVM.a
 
 # 3. Symbol verification
-nm thirdparty/ir/libwasmedgeIR.a | grep "T ir_jit_compile"
+nm thirdparty/ir/libir.a | grep "T ir_jit_compile"
 nm lib/vm/libwasmedgeVM.a | grep "WasmToIRBuilder"
 ```
 
 ### ✅ Execution-Level Testing
 
-The test suite includes **67 execution correctness tests** that call JIT-compiled functions and verify computed results:
+The test suite includes **79 execution correctness tests** that call JIT-compiled functions and verify computed results:
 
 ```cpp
 // Example from ir_execution_test.cpp
@@ -1483,7 +1563,7 @@ TEST_F(IRExecutionTest, I32_Add_Basic) {
 }
 ```
 
-**Coverage**: I32/I64 arithmetic (43 tests), control flow (5 tests), memory operations (19 tests)
+**Coverage**: I32/I64 arithmetic (43 tests), control flow (8 tests), function calls (4 tests), global operations (5 tests), memory operations (19 tests)
 
 ### ✅ Completed Test Coverage
 
@@ -1520,9 +1600,10 @@ TEST_F(IRExecutionTest, I32_Add_Basic) {
    - Compile all functions via IR JIT at module instantiation
    - Execute through WasmEdge executor dispatch
 
-6. **Benchmark Tests** ✅ (10 tests)
-   - Correctness: fibonacci, ackermann, sum, GCD, prime counting
+6. **Benchmark Tests** ✅ (13 tests)
+   - Correctness: fibonacci, ackermann, sum, GCD, prime counting, quicksort
    - Performance: throughput measurements for real algorithms
+   - SightglassSuite: Sightglass kernels in Interpreter/JIT/AOT; cross-mode correctness + metrics
    - Tests complex control flow: recursive calls, nested if with result types, loops modifying locals
 
 ### Remaining Test Gaps
@@ -1539,12 +1620,12 @@ TEST_F(IRExecutionTest, I32_Add_Basic) {
 
 ### Key Files to Reference
 
-- **IR Examples**: `/Users/tommylee/Desktop/ir/examples/`
+- **IR Examples**: `thirdparty/ir/examples/` (or `ir/examples/` in the dstogov/ir repo)
   - `0001-basic.c` - Basic function compilation pattern
   - `0003-pointer.c` - Memory operations pattern
   - `0004-func.c` - Function call pattern
 
-- **IR Headers**: `/Users/tommylee/Desktop/ir/`
+- **IR Headers**: `thirdparty/ir/`
   - `ir.h` - Core IR types and functions
   - `ir_builder.h` - Builder macros (ir_PARAM, ir_ADD, etc.)
 
@@ -1622,10 +1703,10 @@ This section provides a comprehensive breakdown of all WebAssembly instruction i
 
 | Status | Count | Percentage |
 |--------|-------|------------|
-| ✅ Fully Implemented | 165 | 90% of core |
-| ⚠️ Placeholder | 10 | 5% of core |
-| ❌ Not Implemented | 8 | 5% of core |
-| **Core Total** | **183** | 100% |
+| ✅ Fully Implemented | 166 | ~90% of core |
+| ⚠️ Placeholder | 10 | ~5% of core |
+| ❌ Not Implemented | 8 | ~5% of core |
+| **Core Total** | **184** | 100% |
 
 *Note: SIMD, Atomics, and Exceptions are considered advanced features and not counted in "core" percentages.*
 

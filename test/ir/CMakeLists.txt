@@ -114,7 +114,7 @@ target_link_libraries(wasmedgeIRE2ETests
 
 add_test(NAME IRE2ETests COMMAND wasmedgeIRE2ETests)
 
-# IR JIT benchmark tests (integer algorithms)
+# IR JIT benchmark tests (integer algorithms; optional LLVM AOT comparison)
 wasmedge_add_executable(wasmedgeIRBenchmarkTests
   ir_benchmark_test.cpp
 )
@@ -135,5 +135,10 @@ target_link_libraries(wasmedgeIRBenchmarkTests
   wasmedgeCommon
   GTest::gtest_main
 )
+
+if(WASMEDGE_USE_LLVM)
+  target_compile_definitions(wasmedgeIRBenchmarkTests PRIVATE WASMEDGE_USE_LLVM)
+  target_link_libraries(wasmedgeIRBenchmarkTests PRIVATE wasmedgeLLVM)
+endif()
 
 add_test(NAME IRBenchmarkTests COMMAND wasmedgeIRBenchmarkTests)

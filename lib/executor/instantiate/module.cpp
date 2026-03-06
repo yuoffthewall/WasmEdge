@@ -136,7 +136,12 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
   // IR JIT compilation: Compile instantiated functions to native code.
   // This happens after all sections are instantiated but before start function.
   // Skip if ForceInterpreter is set (interpreter-only mode).
-  if (!Conf.getRuntimeConfigure().isForceInterpreter()) {
+  // Skip if module is already AOT-compiled (LLVM .so): functions are
+  // CompiledFunction; re-compiling with IR JIT would overwrite them and can hang.
+  const auto &CodeSegsAOTCheck = CodeSec.getContent();
+  const bool isAOTModule =
+      !CodeSegsAOTCheck.empty() && CodeSegsAOTCheck[0].getSymbol();
+  if (!Conf.getRuntimeConfigure().isForceInterpreter() && !isAOTModule) {
     static VM::IRJitEngine IREngine;
     VM::WasmToIRBuilder IRBuilder;
     

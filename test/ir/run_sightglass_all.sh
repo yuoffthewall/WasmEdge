@@ -93,7 +93,14 @@ while IFS= read -r -d '' p; do
 done < <(find "$SIGHTGLASS_DIR" -maxdepth 1 -name "*.wasm" -print0 | sort -z)
 [ ${#KERNELS[@]} -eq 0 ] && echo "No .wasm in $SIGHTGLASS_DIR" && exit 1
 
-echo "=== Sightglass suite: run each kernel in isolation (Interpreter + JIT) ==="
+# Modes: Interpreter JIT AOT, or only JIT+AOT when WASMEDGE_SIGHTGLASS_SKIP_INTERP=1
+MODES="Interpreter JIT AOT"
+if [[ "${WASMEDGE_SIGHTGLASS_SKIP_INTERP:-0}" = "1" ]]; then
+  MODES="JIT AOT"
+  export WASMEDGE_SIGHTGLASS_SKIP_INTERP=1
+fi
+
+echo "=== Sightglass suite: run each kernel in isolation ($MODES) ==="
 echo "Test binary: $TEST_BIN"
 echo "Timeout: ${TIMEOUT_SEC}s per run (crash/error exits immediately)"
 echo "Kernels: ${KERNELS[*]}"
@@ -107,9 +114,11 @@ ABORT_INTERP=()
 PASS_JIT=()
 FAIL_JIT=()
 ABORT_JIT=()
-
+PASS_AOT=()
+FAIL_AOT=()
+ABORT_AOT=()
 for k in "${KERNELS[@]}"; do
-  for mode in Interpreter JIT; do
+  for mode in $MODES; do
     export WASMEDGE_SIGHTGLASS_KERNEL="$k"
     export WASMEDGE_SIGHTGLASS_MODE="$mode"
     out=$(mktemp)
@@ -130,20 +139,39 @@ for k in "${KERNELS[@]}"; do
     dur=$(echo "$end - $start" | bc 2>/dev/null || echo "?")
     if [ $ret -eq 0 ]; then
       if grep -q "Inst.Lat\|WorkTime\|TtV" "$out" 2>/dev/null; then
-        [ "$mode" = "Interpreter" ] && PASS_INTERP+=("$k") || PASS_JIT+=("$k")
+        case "$mode" in
+          Interpreter) PASS_INTERP+=("$k") ;;
+          JIT)         PASS_JIT+=("$k") ;;
+          AOT)         PASS_AOT+=("$k") ;;
+        esac
+        echo "  $k $mode: ${dur}s (pass)"
       else
         [ "$mode" = "Interpreter" ] && FAIL_INTERP+=("$k") || FAIL_JIT+=("$k")
         echo "  $k $mode: ${dur}s (fail)"
       fi
     elif [ $ret -eq 124 ]; then
-      [ "$mode" = "Interpreter" ] && ABORT_INTERP+=("$k (timeout)") || ABORT_JIT+=("$k (timeout)")
+      # Timeout: this run (Interpreter or JIT) exceeded SIGHTGLASS_TIMEOUT. Heavy kernels
+      # often timeout in Interpreter only; JIT is typically fast and passes.
+      case "$mode" in
+        Interpreter) ABORT_INTERP+=("$k (timeout)") ;;
+        JIT)         ABORT_JIT+=("$k (timeout)") ;;
+        AOT)         ABORT_AOT+=("$k (timeout)") ;;
+      esac
       echo "  $k $mode: ${dur}s (timeout)"
     elif [ $ret -ge 128 ] && [ $ret -le 165 ]; then
-      [ "$mode" = "Interpreter" ] && ABORT_INTERP+=("$k") || ABORT_JIT+=("$k")
+      case "$mode" in
+        Interpreter) ABORT_INTERP+=("$k") ;;
+        JIT)         ABORT_JIT+=("$k") ;;
+        AOT)         ABORT_AOT+=("$k") ;;
+      esac
       echo "  $k $mode: ${dur}s (abort/crash)"
       [ "$STOP_ON_FIRST_ABORT" = "1" ] && rm -f "$out" && break 2
     else
-      [ "$mode" = "Interpreter" ] && FAIL_INTERP+=("$k") || FAIL_JIT+=("$k")
+      case "$mode" in
+        Interpreter) FAIL_INTERP+=("$k") ;;
+        JIT)         FAIL_JIT+=("$k") ;;
+        AOT)         FAIL_AOT+=("$k") ;;
+      esac
       echo "  $k $mode: ${dur}s (exit $ret)"
       [ "$STOP_ON_FIRST_ABORT" = "1" ] && rm -f "$out" && break 2
     fi
@@ -159,9 +187,14 @@ echo "  PASS (${#PASS_INTERP[@]}): ${PASS_INTERP[*]:-none}"
 echo "  FAIL (${#FAIL_INTERP[@]}): ${FAIL_INTERP[*]:-none}"
 echo "  ABORT/CRASH (${#ABORT_INTERP[@]}): ${ABORT_INTERP[*]:-none}"
 echo ""
-echo "JIT mode:"
+echo "JIT mode (IR JIT = dstogov/ir):"
 echo "  PASS (${#PASS_JIT[@]}): ${PASS_JIT[*]:-none}"
 echo "  FAIL (${#FAIL_JIT[@]}): ${FAIL_JIT[*]:-none}"
 echo "  ABORT/CRASH (${#ABORT_JIT[@]}): ${ABORT_JIT[*]:-none}"
 echo ""
-echo "Summary: ${#PASS_INTERP[@]}/${#KERNELS[@]} Interpreter OK, ${#PASS_JIT[@]}/${#KERNELS[@]} JIT OK"
+echo "AOT mode (LLVM):"
+echo "  PASS (${#PASS_AOT[@]}): ${PASS_AOT[*]:-none}"
+echo "  FAIL (${#FAIL_AOT[@]}): ${FAIL_AOT[*]:-none}"
+echo "  ABORT/CRASH (${#ABORT_AOT[@]}): ${ABORT_AOT[*]:-none}"
+echo ""
+echo "Summary: ${#PASS_INTERP[@]}/${#KERNELS[@]} Interpreter OK, ${#PASS_JIT[@]}/${#KERNELS[@]} JIT OK, ${#PASS_AOT[@]}/${#KERNELS[@]} AOT OK"
