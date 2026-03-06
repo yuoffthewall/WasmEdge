@@ -194,6 +194,19 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
       // Create InstrView from instruction vector
       std::vector<AST::Instruction> InstrVec(Instrs.begin(), Instrs.end());
       
+      // Skip functions that start with unreachable - these are trap stubs
+      // (libc/wasi stubs that exist for linking but should never be called).
+      // Any code after unreachable is dead code. The IR backend can't compile
+      // these (asserts on unreachable-only blocks), and there's no benefit
+      // to JIT-compiling a trap.
+      if (!InstrVec.empty() &&
+          InstrVec[0].getOpCode() == OpCode::Unreachable) {
+        spdlog::debug("IR JIT: skip func {} (starts with unreachable)", FuncIdx);
+        CodeIdx++;
+        FuncIdx++;
+        continue;
+      }
+      
       {
         
         // Build IR
@@ -224,8 +237,6 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
         // Compile to native code
         auto CompRes = IREngine.compile(IRBuilder.getIRContext());
         if (!CompRes.has_value()) {
-          spdlog::debug("IR JIT: func {} compile failed (instr_count={})", 
-                        FuncIdx, static_cast<uint32_t>(InstrVec.size()));
           CompileFailCount++;
           CodeIdx++;
           FuncIdx++;
