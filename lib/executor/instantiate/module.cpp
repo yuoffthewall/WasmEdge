@@ -194,16 +194,6 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
       // Create InstrView from instruction vector
       std::vector<AST::Instruction> InstrVec(Instrs.begin(), Instrs.end());
       
-      // Skip very large functions that crash the IR backend (temporary workaround)
-      // The crash is in ir_emit_cond when handling certain COND patterns
-      constexpr size_t MaxInstrCount = 2000;
-      if (InstrVec.size() > MaxInstrCount) {
-        spdlog::debug("IR JIT: skip func {} (instr count {} > {})", FuncIdx,
-                     static_cast<uint32_t>(InstrVec.size()), MaxInstrCount);
-        CodeIdx++;
-        FuncIdx++;
-        continue;
-      }
       {
         
         // Build IR

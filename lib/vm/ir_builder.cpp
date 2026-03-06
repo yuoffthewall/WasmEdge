@@ -1341,22 +1341,29 @@ Expect<void> WasmToIRBuilder::visitParametric(const AST::Instruction &Instr) {
     ir_ref Val2 = pop();
     ir_ref Val1 = pop();
     
-    // Use IR's COND operation: COND(condition, true_val, false_val)
-    // COND returns true_val if condition != 0, else false_val
     // Infer result type from Val1 (in WebAssembly, Val1 and Val2 have same type)
     // Note: negative refs are constants, positive refs are instructions
     ir_type ResultType = IR_I32;  // default
     if (Val1 != IR_UNUSED) {
       if (Val1 > 0 && Val1 < static_cast<ir_ref>(Ctx.insns_count)) {
-        // Positive ref - instruction
         ResultType = static_cast<ir_type>(Ctx.ir_base[Val1].type);
       } else if (Val1 < 0) {
-        // Negative ref - constant. Constants are stored at negative offsets.
-        // In IR, constants are stored at &ir_base[Val1] (Val1 is negative).
         ResultType = static_cast<ir_type>(Ctx.ir_base[Val1].type);
       }
     }
-    ir_ref Result = ir_COND(ResultType, Cond, Val1, Val2);
+    
+    // If condition is a constant, evaluate at compile time
+    // IR backend crashes with COND having constant condition
+    ir_ref Result;
+    if (Cond < 0) {
+      // Constant condition - evaluate now
+      ir_insn *condInsn = &Ctx.ir_base[Cond];
+      int64_t condVal = condInsn->val.i64;
+      Result = (condVal != 0) ? Val1 : Val2;
+    } else {
+      // Use IR's COND operation: COND(condition, true_val, false_val)
+      Result = ir_COND(ResultType, Cond, Val1, Val2);
+    }
     push(Result);
     break;
   }
