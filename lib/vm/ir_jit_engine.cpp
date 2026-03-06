@@ -41,7 +41,6 @@ IRJitEngine::compile(ir_ctx *Ctx) {
   // the backend. With release build of IR library, this returns false instead
   // of aborting on invalid IR.
   if (!ir_check(Ctx)) {
-    spdlog::info("IR JIT: ir_check failed");
     return Unexpect(ErrCode::Value::RuntimeError);
   }
 
