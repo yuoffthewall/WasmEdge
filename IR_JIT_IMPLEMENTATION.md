@@ -583,11 +583,40 @@ Key flags:
 For faster iteration during development, you can build specific parts of the project in isolation:
 
 #### Building the IR Submodule Only
-If you only want to verify the `dstogov/ir` submodule compiles correctly:
+
+CMake builds `thirdparty/ir/libir.a` automatically when you run `make` inside the WasmEdge build directory. To trigger it in isolation:
+
 ```bash
 cd build
 make wasmedgeIRBuild
 ```
+
+To rebuild from scratch (e.g. after changing `ir_x86.dasc`), delete the cached library first:
+
+```bash
+rm thirdparty/ir/libir.a   # from WasmEdge repo root
+cd build && make wasmedgeIRBuild
+```
+
+**Manual build** — if you need to build `libir.a` by hand directly in the submodule:
+
+```bash
+cd thirdparty/ir
+
+# Debug build (assertions enabled, better GDB symbols — used by WasmEdge CMake by default)
+make BUILD=debug libir.a
+
+# Release build (no assertions, optimised)
+make BUILD=release libir.a
+
+# On Linux, add -fPIC so libir.a can link into libwasmedge.so:
+CFLAGS=-fPIC BUILD_CFLAGS=-fPIC make BUILD=debug libir.a
+
+# On AArch64 (Apple Silicon, ARM servers):
+make BUILD=debug TARGET=aarch64 libir.a
+```
+
+> **Note:** WasmEdge's CMake uses `BUILD=debug` by default (`thirdparty/CMakeLists.txt` line 29) on all platforms so that IR assertions catch codegen bugs during development. Switch to `BUILD=release` in the CMakeLists.txt `_ir_make_args` line for production builds where the extra checks are not needed.
 
 #### Building Specific Core Libraries
 To build just the individual static libraries (useful when modifying specific subsystems):
