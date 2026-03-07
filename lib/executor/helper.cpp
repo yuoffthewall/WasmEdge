@@ -277,24 +277,19 @@ Executor::enterFunction(Runtime::StackManager &StackMgr,
     
     // Get memory instance for memory operations
     void *MemoryBase = nullptr;
-    uint32_t MemorySize = 0;
     if (ModInst) {
       auto MemInsts = ModInst->getMemoryInstances();
       if (!MemInsts.empty() && MemInsts[0]) {
         MemoryBase = MemInsts[0]->getDataPtr();
-        // getPageSize() returns number of pages, each page is 64KB
-        MemorySize = MemInsts[0]->getPageSize() * 
-                     static_cast<uint32_t>(Runtime::Instance::MemoryInstance::kPageSize);
       }
     }
 
     // Get IR JIT engine (global instance - simplified for POC)
     static VM::IRJitEngine IREngine;
 
-    // Invoke the JIT compiled function
     auto Res = IREngine.invoke(Func.getIRJitNativeFunc(), FuncType, Args, Rets,
                                FuncTable, FuncTableSize, GlobalBase,
-                               MemoryBase, MemorySize);
+                               MemoryBase);
 
     if (!Res) {
       spdlog::error(Res.error());

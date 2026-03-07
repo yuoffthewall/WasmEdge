@@ -1228,8 +1228,11 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
   bool interpOnly = (modeEnv && (std::strcmp(modeEnv, "Interpreter") == 0));
   bool jitOnly = (modeEnv && (std::strcmp(modeEnv, "JIT") == 0));
   bool aotOnly = (modeEnv && (std::strcmp(modeEnv, "AOT") == 0));
+  bool irJitOnly = (modeEnv && (std::strcmp(modeEnv, "IR_JIT") == 0));
   const char *skipInterpEnv = std::getenv("WASMEDGE_SIGHTGLASS_SKIP_INTERP");
   bool skipInterp = (skipInterpEnv && skipInterpEnv[0] == '1');
+  const char *skipLlvmJitEnv = std::getenv("WASMEDGE_SIGHTGLASS_SKIP_LLVM_JIT");
+  bool skipLlvmJit = (skipLlvmJitEnv && skipLlvmJitEnv[0] == '1');
 
   if (kernels.empty()) {
     GTEST_SKIP() << "No .wasm kernels in sightglass/. Run utils/download_sightglass.sh";
@@ -1250,9 +1253,10 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
 
   for (const auto &wasmPath : kernels) {
     std::string kernelName = wasmPath.stem().string();
-    StdioCapture interpCap, jitCap, aotCap;
+    StdioCapture interpCap, jitCap, irJitCap, aotCap;
     bool interpOk = false;
     bool jitOk = false;
+    bool irJitOk = false;
     bool aotOk = false;
 
     // Helper: load .input files for this kernel into a WasiStubModule's virtual FS
@@ -1273,20 +1277,26 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
       }
     };
 
-    const char *modes[] = {"Interpreter", "JIT"};
+    const char *modes[] = {"Interpreter", "JIT", "IR_JIT"};
     for (const char *modeName : modes) {
       if (skipInterp && std::strcmp(modeName, "Interpreter") == 0) continue;
+      if (skipLlvmJit && std::strcmp(modeName, "JIT") == 0) continue;
       if (interpOnly && std::strcmp(modeName, "Interpreter") != 0) continue;
       if (jitOnly && std::strcmp(modeName, "JIT") != 0) continue;
+      if (irJitOnly && std::strcmp(modeName, "IR_JIT") != 0) continue;
       if (aotOnly) continue;
-      bool useJIT = (std::strcmp(modeName, "JIT") == 0);
-      StdioCapture *cap = useJIT ? &jitCap : &interpCap;
+      bool useLlvmJIT = (std::strcmp(modeName, "JIT") == 0);
+      bool useIRJIT = (std::strcmp(modeName, "IR_JIT") == 0);
+      StdioCapture *cap = useLlvmJIT ? &jitCap : (useIRJIT ? &irJitCap : &interpCap);
 
       WasmEdge::Configure Conf;
       Conf.getCompilerConfigure().setOptimizationLevel(
           WasmEdge::CompilerConfigure::OptimizationLevel::O0);
-      Conf.getRuntimeConfigure().setForceInterpreter(!useJIT);
-      Conf.getRuntimeConfigure().setEnableJIT(useJIT);
+      // Interpreter: ForceInterpreter=true,  EnableJIT=false
+      // JIT (LLVM):  ForceInterpreter=false, EnableJIT=true
+      // IR_JIT:      ForceInterpreter=false, EnableJIT=false (IR JIT runs in Executor::instantiate)
+      Conf.getRuntimeConfigure().setForceInterpreter(!useLlvmJIT && !useIRJIT);
+      Conf.getRuntimeConfigure().setEnableJIT(useLlvmJIT);
 
       WasiStubModule wasiStub(cap);
       loadVirtualFiles(wasiStub);
@@ -1332,7 +1342,8 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
         }
       }
 
-      if (useJIT) jitOk = true;
+      if (useLlvmJIT) jitOk = true;
+      else if (useIRJIT) irJitOk = true;
       else interpOk = true;
 
       double workTimeUs =
@@ -1352,7 +1363,7 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
     // Skip if WASMEDGE_SIGHTGLASS_SKIP_AOT=1 (e.g. for faster runs without LLVM AOT).
     const char *skipAotEnv = std::getenv("WASMEDGE_SIGHTGLASS_SKIP_AOT");
     const bool skipAOT = (skipAotEnv && skipAotEnv[0] == '1');
-    if (!skipAOT && (aotOnly || (!interpOnly && !jitOnly))) {
+    if (!skipAOT && (aotOnly || (!interpOnly && !jitOnly && !irJitOnly))) {
       const char *modeName = "AOT";
       WasmEdge::Configure compileConf;
       compileConf.getCompilerConfigure().setOptimizationLevel(
@@ -1458,22 +1469,9 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
     }
 #endif
 
-    // Correctness: JIT output must match Interpreter when both ran successfully
+    // Correctness: JIT output must match AOT when both ran successfully
     if (jitOk && aotOk) {
-      // Print captured stdout/stderr for manual inspection
       std::cout << "\n--- " << kernelName << " captured output ---\n";
-      /*
-      std::cout << "Interpreter stdout (" << interpCap.stdout_.size() << " bytes): ";
-      if (interpCap.stdout_.empty())
-        std::cout << "(empty)\n";
-      else
-        std::cout << "\n" << interpCap.stdout_ << "\n";
-      std::cout << "Interpreter stderr (" << interpCap.stderr_.size() << " bytes): ";
-      if (interpCap.stderr_.empty())
-        std::cout << "(empty)\n";
-      else
-        std::cout << "\n" << interpCap.stderr_ << "\n";
-      */
       std::cout << "JIT stdout (" << jitCap.stdout_.size() << " bytes): ";
       if (jitCap.stdout_.empty())
         std::cout << "(empty)\n";
@@ -1494,16 +1492,31 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
         std::cout << "(empty)\n";
       else
         std::cout << "\n" << aotCap.stderr_ << "\n";
-
       std::cout << "---\n";
 
       EXPECT_EQ(jitCap.stdout_,aotCap.stdout_)
-          << "Kernel " << kernelName << ": JIT stdout must match AOT";
+          << "Kernel " << kernelName << ": LLVM JIT stdout must match AOT";
       EXPECT_EQ(jitCap.stderr_, aotCap.stderr_)
-          << "Kernel " << kernelName << ": JIT stderr must match AOT";
+          << "Kernel " << kernelName << ": LLVM JIT stderr must match AOT";
       EXPECT_EQ(jitCap.exitCode, aotCap.exitCode)
-          << "Kernel " << kernelName << ": JIT proc_exit code must match AOT ("
+          << "Kernel " << kernelName << ": LLVM JIT proc_exit code must match AOT ("
           << jitCap.exitCode << " vs " << aotCap.exitCode << ")";
+    }
+
+    // Correctness: IR JIT output must match a reference (prefer Interpreter, then LLVM JIT, then AOT)
+    if (irJitOk) {
+      const std::string *refStdout = interpOk ? &interpCap.stdout_ : (jitOk ? &jitCap.stdout_ : (aotOk ? &aotCap.stdout_ : nullptr));
+      const std::string *refStderr = interpOk ? &interpCap.stderr_ : (jitOk ? &jitCap.stderr_ : (aotOk ? &aotCap.stderr_ : nullptr));
+      const int32_t *refExit = interpOk ? &interpCap.exitCode : (jitOk ? &jitCap.exitCode : (aotOk ? &aotCap.exitCode : nullptr));
+      const char *refLabel = interpOk ? "Interpreter" : (jitOk ? "LLVM JIT" : "AOT");
+      if (refStdout && refStderr && refExit) {
+        EXPECT_EQ(irJitCap.stdout_, *refStdout)
+            << "Kernel " << kernelName << ": IR JIT stdout must match " << refLabel;
+        EXPECT_EQ(irJitCap.stderr_, *refStderr)
+            << "Kernel " << kernelName << ": IR JIT stderr must match " << refLabel;
+        EXPECT_EQ(irJitCap.exitCode, *refExit)
+            << "Kernel " << kernelName << ": IR JIT exit code must match " << refLabel;
+      }
     }
 #ifdef WASMEDGE_USE_LLVM
     // Correctness: AOT output must match reference (Interpreter or JIT) when both ran
@@ -1547,6 +1560,7 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
     };
     checkExpected("Interpreter", interpCap, interpOk);
     checkExpected("JIT", jitCap, jitOk);
+    checkExpected("IR_JIT", irJitCap, irJitOk);
     checkExpected("AOT", aotCap, aotOk);
   }
   std::cout << std::endl;

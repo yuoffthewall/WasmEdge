@@ -58,6 +58,9 @@ IRJitEngine::compile(ir_ctx *Ctx) {
   // Track the code buffer
   CodeBuffers.push_back({NativeCode, CodeSize, CodeSize});
 
+  // Register with GDB JIT interface so breakpoints / disassembly work
+  ir_gdb_register("wasm_jit_func", NativeCode, CodeSize, 0, 0);
+
   CompileResult Result;
   Result.NativeFunc = NativeCode;
   Result.CodeSize = CodeSize;

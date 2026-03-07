@@ -2306,7 +2306,21 @@ Expect<void> WasmToIRBuilder::visitCall(const AST::Instruction &Instr) {
     }
     
     // Generate the call
-    ir_ref CallResult = ir_CALL_N(RetType, FuncPtr, 
+    uint32_t TotalParams = static_cast<uint32_t>(Args.size());
+    std::vector<uint8_t> ProtoParamTypes(TotalParams);
+    ProtoParamTypes[0] = IR_ADDR;
+    ProtoParamTypes[1] = IR_U32;
+    ProtoParamTypes[2] = IR_ADDR;
+    ProtoParamTypes[3] = IR_ADDR;
+    for (size_t i = 0; i < ParamTypes.size(); ++i) {
+      ProtoParamTypes[i + 4] = wasmTypeToIRType(ParamTypes[i]);
+    }
+    ir_ref Proto = ir_proto(ctx, IR_FASTCALL_FUNC, RetType,
+                            TotalParams, ProtoParamTypes.data());
+    ir_ref TypedFuncPtr = ir_emit2(ctx, IR_OPT(IR_PROTO, IR_ADDR),
+                                   FuncPtr, Proto);
+
+    ir_ref CallResult = ir_CALL_N(RetType, TypedFuncPtr, 
                                   static_cast<uint32_t>(Args.size()), 
                                   Args.data());
     
@@ -2363,7 +2377,21 @@ Expect<void> WasmToIRBuilder::visitCall(const AST::Instruction &Instr) {
   }
   
   // Generate the call
-  ir_ref CallResult = ir_CALL_N(RetType, FuncPtr, 
+  uint32_t TotalParams = static_cast<uint32_t>(Args.size());
+  std::vector<uint8_t> ProtoParamTypes(TotalParams);
+  ProtoParamTypes[0] = IR_ADDR;
+  ProtoParamTypes[1] = IR_U32;
+  ProtoParamTypes[2] = IR_ADDR;
+  ProtoParamTypes[3] = IR_ADDR;
+  for (size_t i = 0; i < ParamTypes.size(); ++i) {
+    ProtoParamTypes[i + 4] = wasmTypeToIRType(ParamTypes[i]);
+  }
+  ir_ref Proto = ir_proto(ctx, IR_FASTCALL_FUNC, RetType,
+                          TotalParams, ProtoParamTypes.data());
+  ir_ref TypedFuncPtr = ir_emit2(ctx, IR_OPT(IR_PROTO, IR_ADDR),
+                                 FuncPtr, Proto);
+
+  ir_ref CallResult = ir_CALL_N(RetType, TypedFuncPtr, 
                                 static_cast<uint32_t>(Args.size()), 
                                 Args.data());
   
