@@ -165,6 +165,74 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
       }
     }
     
+    // ----------------------------------------------------------------
+    // Pre-pass: determine which functions are safe to JIT-compile.
+    // A function is NOT safe to JIT if it directly calls an imported (host)
+    // function, because imported functions have nullptr in the JIT func table.
+    // Transitively, a function that calls a non-JIT function is also unsafe
+    // (the JIT code would call through nullptr and segfault).
+    // ----------------------------------------------------------------
+    const auto &CodeSegs = CodeSec.getContent();
+    uint32_t TotalDefined = static_cast<uint32_t>(CodeSegs.size());
+    std::vector<bool> SkipJit(ImportFuncNum + TotalDefined, false);
+
+    // All imported functions are inherently non-JIT.
+    for (uint32_t i = 0; i < ImportFuncNum; i++) {
+      SkipJit[i] = true;
+    }
+
+    // Mark functions that start with unreachable (trap stubs).
+    for (uint32_t ci = 0; ci < TotalDefined; ci++) {
+      auto Instrs = CodeSegs[ci].getExpr().getInstrs();
+      if (!Instrs.empty() &&
+          Instrs.begin()->getOpCode() == OpCode::Unreachable) {
+        SkipJit[ImportFuncNum + ci] = true;
+      }
+    }
+
+    // Fixed-point: mark any function that calls a SkipJit target or uses
+    // call_indirect (whose runtime target may be a host function with nullptr
+    // in the JIT func table).
+    bool Changed = true;
+    while (Changed) {
+      Changed = false;
+      for (uint32_t ci = 0; ci < TotalDefined; ci++) {
+        uint32_t FIdx = ImportFuncNum + ci;
+        if (SkipJit[FIdx])
+          continue;
+        auto Instrs = CodeSegs[ci].getExpr().getInstrs();
+        for (const auto &I : Instrs) {
+          if (I.getOpCode() == OpCode::Call_indirect ||
+              I.getOpCode() == OpCode::Return_call_indirect) {
+            SkipJit[FIdx] = true;
+            Changed = true;
+            break;
+          }
+          if (I.getOpCode() == OpCode::Call ||
+              I.getOpCode() == OpCode::Return_call) {
+            uint32_t Target = I.getTargetIndex();
+            if (Target < SkipJit.size() && SkipJit[Target]) {
+              SkipJit[FIdx] = true;
+              Changed = true;
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    // Log skip summary.
+    {
+      uint32_t SkipCount = 0;
+      for (uint32_t ci = 0; ci < TotalDefined; ci++) {
+        if (SkipJit[ImportFuncNum + ci]) SkipCount++;
+      }
+      if (SkipCount > 0) {
+        spdlog::info("IR JIT: skipping {}/{} funcs (call non-JIT targets)",
+                     SkipCount, TotalDefined);
+      }
+    }
+
     // Compile each defined (non-imported) wasm function
     // We use code segments from AST directly since FuncInst may already be
     // CompiledFunction (LLVM AOT) without accessible instructions.
@@ -173,10 +241,19 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
     uint32_t SuccessCount = 0;
     uint32_t InitFailCount = 0, BuildFailCount = 0, CompileFailCount = 0;
     uint32_t CodeIdx = 0;
-    for (const auto &CodeSeg : CodeSec.getContent()) {
+    for (const auto &CodeSeg : CodeSegs) {
       auto *FuncInst = ModInst->unsafeGetFunction(FuncIdx);
       
       if (!FuncInst) {
+        CodeIdx++;
+        FuncIdx++;
+        continue;
+      }
+
+      // Skip functions marked by the pre-pass (imports, trap stubs,
+      // or functions that transitively call non-JIT targets).
+      if (SkipJit[FuncIdx]) {
+        spdlog::debug("IR JIT: skip func {} (non-JIT call target)", FuncIdx);
         CodeIdx++;
         FuncIdx++;
         continue;
@@ -199,21 +276,7 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
       // Create InstrView from instruction vector
       std::vector<AST::Instruction> InstrVec(Instrs.begin(), Instrs.end());
       
-      // Skip functions that start with unreachable - these are trap stubs
-      // (libc/wasi stubs that exist for linking but should never be called).
-      // Any code after unreachable is dead code. The IR backend can't compile
-      // these (asserts on unreachable-only blocks), and there's no benefit
-      // to JIT-compiling a trap.
-      if (!InstrVec.empty() &&
-          InstrVec[0].getOpCode() == OpCode::Unreachable) {
-        spdlog::debug("IR JIT: skip func {} (starts with unreachable)", FuncIdx);
-        CodeIdx++;
-        FuncIdx++;
-        continue;
-      }
-      
       {
-        
         // Build IR
         IRBuilder.reset();
         
