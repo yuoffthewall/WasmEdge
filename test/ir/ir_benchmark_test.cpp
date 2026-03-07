@@ -1253,6 +1253,7 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
 
   for (const auto &wasmPath : kernels) {
     std::string kernelName = wasmPath.stem().string();
+    std::cout << "Running kernel: " << kernelName << std::endl;
     StdioCapture interpCap, jitCap, irJitCap, aotCap;
     bool interpOk = false;
     bool jitOk = false;

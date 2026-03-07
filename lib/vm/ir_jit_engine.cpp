@@ -46,7 +46,8 @@ IRJitEngine::compile(ir_ctx *Ctx) {
 
   // Use IR's built-in JIT compilation
   // Optimization level: 0 = no opt, 1 = light, 2 = full
-  // Using level 0 for now to avoid GCM assertion failures in IR backend
+  // O2 triggers GCM assertion failures and hangs on our PHI/loop structures.
+  // Staying at O0 until the IR builder produces GCM-safe IR.
   size_t CodeSize = 0;
   void *NativeCode = ir_jit_compile(Ctx, 0, &CodeSize);
   

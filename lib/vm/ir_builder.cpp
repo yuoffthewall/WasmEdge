@@ -173,11 +173,17 @@ ir_ref WasmToIRBuilder::pop() noexcept {
 
 ir_ref WasmToIRBuilder::ensureValidRef(ir_ref Ref, ir_type Type) noexcept {
   ir_ctx *ctx = &Ctx;
-  // Check if ref is valid: must be positive and within bounds
-  if (Ref > 0 && Ref < static_cast<ir_ref>(Ctx.insns_count)) {
-    return Ref;
+  // Check if ref is valid:
+  // - Negative refs are constants (always valid)
+  // - Positive refs must be within insns_count
+  // - IR_UNUSED (0) is not valid (needs replacement with zero constant)
+  if (Ref < 0) {
+    return Ref;  // Negative = constant, always valid
   }
-  // Invalid ref - emit a type-appropriate zero constant as fallback
+  if (Ref > 0 && Ref < static_cast<ir_ref>(Ctx.insns_count)) {
+    return Ref;  // Positive and within bounds
+  }
+  // Invalid ref (0 or out of bounds) - emit a type-appropriate zero constant
   switch (Type) {
   case IR_I32:
     return ir_CONST_I32(0);
@@ -199,9 +205,16 @@ ir_ref WasmToIRBuilder::ensureValidRef(ir_ref Ref, ir_type Type) noexcept {
 ir_ref WasmToIRBuilder::coerceToType(ir_ref Value, ir_type TargetType) noexcept {
   ir_ctx *ctx = &Ctx;
   
-  // If value is invalid, return a zero constant of target type
-  if (Value <= 0 || Value >= static_cast<ir_ref>(Ctx.insns_count)) {
+  // If value is IR_UNUSED (0), return a zero constant of target type.
+  // Note: Negative ir_refs are VALID - they represent constants in the IR.
+  if (Value == IR_UNUSED) {
     return ensureValidRef(IR_UNUSED, TargetType);  // Will emit zero constant
+  }
+  
+  // Validate the reference is within bounds
+  // Negative refs are constants (valid), positive refs must be < insns_count
+  if (Value > 0 && Value >= static_cast<ir_ref>(Ctx.insns_count)) {
+    return ensureValidRef(IR_UNUSED, TargetType);  // Invalid ref, use zero
   }
   
   ir_type SrcType = static_cast<ir_type>(Ctx.ir_base[Value].type);
@@ -1674,12 +1687,16 @@ Expect<void> WasmToIRBuilder::visitLoop(const AST::Instruction &) {
     ir_ref CoercedRef = coerceToType(LocalRef, LocalType);
     ir_ref Phi = ir_PHI_2(LocalType, CoercedRef, IR_UNUSED);
     
+    // Create a COPY of the PHI to materialize its value at the start of each iteration.
+    // This ensures we have a concrete SSA value to use when exiting the loop early.
+    ir_ref PhiCopy = ir_COPY(LocalType, Phi);
+    
     // Store mapping and original value
     Label.PreLoopLocals[LocalIdx] = LocalRef;
     Label.LoopLocalPhis[LocalIdx] = Phi;
     
-    // Update Locals to use the PHI node inside the loop
-    Locals[LocalIdx] = Phi;
+    // Update Locals to use the COPY (materialized PHI value) inside the loop
+    Locals[LocalIdx] = PhiCopy;
   }
 
   LabelStack.push_back(Label);
@@ -1859,18 +1876,11 @@ Expect<void> WasmToIRBuilder::visitEnd(const AST::Instruction &) {
   }
   
   case ControlKind::Loop: {
-    // Loop end: if we fall through (current path not terminated), 
-    // the control flow continues normally. The PHI nodes were set up
-    // at loop entry, and back-edges (from br) update them.
-    // If we're falling through, we need to restore original locals
-    // since we're exiting the loop.
-    if (!CurrentPathTerminated) {
-      // Falling through the loop - restore pre-loop local values
-      // (the PHIs inside the loop should not affect values outside)
-      for (auto &[LocalIdx, PreLoopVal] : Label.PreLoopLocals) {
-        Locals[LocalIdx] = PreLoopVal;
-      }
-    }
+    // Loop end: when falling through (exiting the loop normally),
+    // keep the current Locals values. They were updated by local.set
+    // instructions inside the loop and represent the final state.
+    // Do NOT restore pre-loop values - wasm semantics require locals
+    // to retain their modified values after exiting a loop.
     break;
   }
   
@@ -2059,10 +2069,8 @@ Expect<void> WasmToIRBuilder::visitBr(const AST::Instruction &Instr) {
   if (Target.Kind == ControlKind::Loop) {
     // Branch to loop: update PHI nodes with current local values before creating back-edge
     for (auto &[LocalIdx, PhiRef] : Target.LoopLocalPhis) {
-      // Get current value of this local
       auto it = Locals.find(LocalIdx);
       if (it != Locals.end()) {
-        // Coerce to match PHI type
         ir_type PhiType = IR_I32;
         auto typeIt = LocalTypes.find(LocalIdx);
         if (typeIt != LocalTypes.end()) {
@@ -2078,7 +2086,8 @@ Expect<void> WasmToIRBuilder::visitBr(const AST::Instruction &Instr) {
     ir_MERGE_SET_OP(Target.LoopHeader, 2, LoopEnd);
   } else {
     // Branch to block/if: create forward edge to merge at end
-    // Save current Locals state for restoration at merge point
+    // Locals now use COPY(PHI) values which are concrete SSA refs, so we can
+    // save them directly without special handling.
     ir_ref BrEnd = ir_END();
     Target.EndList.push_back(BrEnd);
     Target.EndLocals.push_back(Locals);
@@ -2114,7 +2123,6 @@ Expect<void> WasmToIRBuilder::visitBrIf(const AST::Instruction &Instr) {
     for (auto &[LocalIdx, PhiRef] : Target.LoopLocalPhis) {
       auto it = Locals.find(LocalIdx);
       if (it != Locals.end()) {
-        // Coerce to match PHI type
         ir_type PhiType = IR_I32;
         auto typeIt = LocalTypes.find(LocalIdx);
         if (typeIt != LocalTypes.end()) {
@@ -2129,7 +2137,7 @@ Expect<void> WasmToIRBuilder::visitBrIf(const AST::Instruction &Instr) {
     ir_MERGE_SET_OP(Target.LoopHeader, 2, LoopEnd);
   } else {
     // Branch to block/if: create forward edge
-    // Save current Locals state for restoration at merge point
+    // Locals now use COPY(PHI) values which are concrete SSA refs.
     ir_ref BrEnd = ir_END();
     Target.EndList.push_back(BrEnd);
     Target.EndLocals.push_back(Locals);
@@ -2188,7 +2196,6 @@ Expect<void> WasmToIRBuilder::visitBrTable(const AST::Instruction &Instr) {
       for (auto &[LocalIdx, PhiRef] : Target.LoopLocalPhis) {
         auto it = Locals.find(LocalIdx);
         if (it != Locals.end()) {
-          // Coerce to match PHI type
           ir_type PhiType = IR_I32;
           auto typeIt = LocalTypes.find(LocalIdx);
           if (typeIt != LocalTypes.end()) {
@@ -2203,6 +2210,7 @@ Expect<void> WasmToIRBuilder::visitBrTable(const AST::Instruction &Instr) {
     } else {
       ir_ref BrEnd = ir_END();
       Target.EndList.push_back(BrEnd);
+      Target.EndLocals.push_back(Locals);
     }
     
     // False branch: continue checking next case
@@ -2217,7 +2225,6 @@ Expect<void> WasmToIRBuilder::visitBrTable(const AST::Instruction &Instr) {
     for (auto &[LocalIdx, PhiRef] : DefaultTarget.LoopLocalPhis) {
       auto it = Locals.find(LocalIdx);
       if (it != Locals.end()) {
-        // Coerce to match PHI type
         ir_type PhiType = IR_I32;
         auto typeIt = LocalTypes.find(LocalIdx);
         if (typeIt != LocalTypes.end()) {
@@ -2232,6 +2239,7 @@ Expect<void> WasmToIRBuilder::visitBrTable(const AST::Instruction &Instr) {
   } else {
     ir_ref BrEnd = ir_END();
     DefaultTarget.EndList.push_back(BrEnd);
+    DefaultTarget.EndLocals.push_back(Locals);
   }
   
   // After br_table, code is unreachable (all paths branch away)
