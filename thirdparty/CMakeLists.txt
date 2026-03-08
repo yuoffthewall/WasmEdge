@@ -11,6 +11,7 @@ endif()
 if(WASMEDGE_BUILD_IR_JIT)
   set(WASMEDGE_IR_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ir")
   set(WASMEDGE_IR_LIB "${WASMEDGE_IR_SOURCE_DIR}/libir.a")
+  get_filename_component(WASMEDGE_IR_LIB_ABS "${WASMEDGE_IR_LIB}" ABSOLUTE)
 
   # Automatically build dstogov/ir when IR JIT is enabled so that a fresh
   # clone can be configured and built on Linux/macOS without manual steps.
@@ -40,11 +41,16 @@ if(WASMEDGE_BUILD_IR_JIT)
     list(APPEND _ir_make_args "CFLAGS=-I/usr/local/include -I/opt/homebrew/include")
   endif()
 
+  # Rebuild libir.a when any of these change. GLOB is at configure time.
+  file(GLOB _ir_sources "${WASMEDGE_IR_SOURCE_DIR}/*.c" "${WASMEDGE_IR_SOURCE_DIR}/*.dasc")
+  set(_ir_depends "${WASMEDGE_IR_SOURCE_DIR}/Makefile" ${_ir_sources})
+
   add_custom_command(
     OUTPUT "${WASMEDGE_IR_LIB}"
     COMMAND ${CMAKE_COMMAND} -E env ${_ir_env} ${CMAKE_MAKE_PROGRAM} ${_ir_make_args} libir.a
     WORKING_DIRECTORY "${WASMEDGE_IR_SOURCE_DIR}"
     COMMENT "Building dstogov/ir (libir.a) for IR JIT"
+    DEPENDS ${_ir_depends}
     VERBATIM
   )
 
@@ -55,5 +61,6 @@ if(WASMEDGE_BUILD_IR_JIT)
   set_target_properties(wasmedgeIR PROPERTIES
     IMPORTED_LOCATION "${WASMEDGE_IR_LIB}"
     INTERFACE_INCLUDE_DIRECTORIES "${WASMEDGE_IR_SOURCE_DIR}"
+    INTERFACE_LINK_DEPENDS "${WASMEDGE_IR_LIB_ABS}"
   )
 endif()
