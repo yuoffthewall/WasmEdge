@@ -8,6 +8,7 @@
 #include "ast/instruction.h"
 #include "ast/type.h"
 #include "common/errcode.h"
+#include "vm/ir_jit_engine.h"
 
 // Include dstogov/ir headers
 extern "C" {
@@ -17,6 +18,7 @@ extern "C" {
 
 #include <cassert>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <set>
 
@@ -41,7 +43,7 @@ uint64_t wasm_i64_rem_u(uint64_t a, uint64_t b) {
 }  // namespace
 
 WasmToIRBuilder::WasmToIRBuilder() noexcept
-    : Initialized(false), CurrentPathTerminated(false), FuncTablePtr(0), FuncTableSize(0), GlobalBasePtr(0), MemoryBase(0), MemorySize(0), LocalCount(0) {}
+    : Initialized(false), CurrentPathTerminated(false), EnvPtr(0), FuncTablePtr(0), FuncTableSize(0), GlobalBasePtr(0), MemoryBase(0), ArgsPtr(0), MemorySize(0), LocalCount(0) {}
 
 WasmToIRBuilder::~WasmToIRBuilder() noexcept { reset(); }
 
@@ -55,10 +57,12 @@ void WasmToIRBuilder::reset() noexcept {
   Locals.clear();
   LocalTypes.clear();
   LabelStack.clear();
+  EnvPtr = 0;
   FuncTablePtr = 0;
   FuncTableSize = 0;
   GlobalBasePtr = 0;
   MemoryBase = 0;
+  ArgsPtr = 0;
   MemorySize = 0;
   LocalCount = 0;
   ModuleFuncTypes.clear();
@@ -70,10 +74,18 @@ Expect<void> WasmToIRBuilder::initialize(
     Span<const std::pair<uint32_t, ValType>> LocalVars) {
   reset();
 
-  // Initialize IR context
-  // Note: IR_OPT_FOLDING requires opt_level > 0 in ir_jit_compile, which can
-  // trigger GCM assertion failures. Use IR_FUNCTION only for opt_level 0.
-  ir_init(&Ctx, IR_FUNCTION, IR_CONSTS_LIMIT_MIN, IR_INSNS_LIMIT_MIN);
+  // Initialize IR context. Default O2; override with WASMEDGE_IR_JIT_OPT_LEVEL=0|1 for debug.
+  int ir_opt_level = 2;
+  if (const char *e = std::getenv("WASMEDGE_IR_JIT_OPT_LEVEL")) {
+    if (e[0] == '0' && e[1] == '\0') ir_opt_level = 0;
+    else if (e[0] == '1' && e[1] == '\0') ir_opt_level = 1;
+  }
+  uint32_t ir_flags = IR_FUNCTION;
+  if (ir_opt_level > 0) {
+    ir_flags |= IR_OPT_FOLDING | IR_OPT_CFG | IR_OPT_CODEGEN;
+    if (ir_opt_level > 1) ir_flags |= IR_OPT_MEM2SSA | IR_OPT_INLINE;
+  }
+  ir_init(&Ctx, ir_flags, IR_CONSTS_LIMIT_MIN, IR_INSNS_LIMIT_MIN);
   Initialized = true;
 
   // Set return type
@@ -99,28 +111,24 @@ Expect<void> WasmToIRBuilder::initialize(
     LocalCount += Count;
   }
 
-  // First parameter: function table pointer (for call instructions)
-  // This is a pointer to an array of function pointers
-  FuncTablePtr = ir_PARAM(IR_ADDR, "func_table", 1);
-  
-  // Second parameter: function table size (for call_indirect bounds checking)
-  FuncTableSize = ir_PARAM(IR_U32, "func_table_size", 2);
-  
-  // Third parameter: globals base pointer (for global.get/set)
-  // Points to an array of ValVariant (16 bytes each, using first 8 bytes for value)
-  GlobalBasePtr = ir_PARAM(IR_ADDR, "global_base", 3);
-  
-  // Fourth parameter: memory base pointer (implicit, passed by runtime)
-  // This is an IR_ADDR (pointer) type for linear memory access
-  MemoryBase = ir_PARAM(IR_ADDR, "mem_base", 4);
-  
-  // Create IR PARAMs for function arguments (starting at index 5)
-  uint32_t paramIdx = 5;  // Start after func_table, func_table_size, global_base, and mem_base
+  // Uniform JIT signature: ret func(JitExecEnv* env, uint64_t* args)
+  // O2 emitter required; O0 fuses LOAD(addr)->ADDR with ADD incorrectly.
+  EnvPtr = ir_PARAM(IR_ADDR, "exec_env", 1);
+  ArgsPtr = ir_PARAM(IR_ADDR, "args", 2);
+
+  FuncTablePtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, FuncTable))));
+  FuncTableSize = ir_LOAD_U32(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, FuncTableSize))));
+  GlobalBasePtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, GlobalBase))));
+  MemoryBase = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, MemoryBase))));
+
+  // Load wasm parameters from the args array. Each slot is sizeof(uint64_t).
+  // On little-endian (x86_64), loading a narrower type from the slot address
+  // reads the correct lower bytes.
   for (uint32_t i = 0; i < ParamTypes.size(); ++i) {
     ir_type irType = wasmTypeToIRType(ParamTypes[i]);
-    Locals[i] = ir_PARAM(irType, "param", paramIdx);
-    LocalTypes[i] = irType;  // Track local type
-    paramIdx++;
+    ir_ref SlotAddr = ir_ADD_A(ArgsPtr, ir_CONST_ADDR(i * sizeof(uint64_t)));
+    Locals[i] = ir_LOAD(irType, SlotAddr);
+    LocalTypes[i] = irType;
   }
 
   // Initialize additional locals to zero
@@ -2204,150 +2212,89 @@ Expect<void> WasmToIRBuilder::visitCall(const AST::Instruction &Instr) {
   
   OpCode Op = Instr.getOpCode();
   
-  if (Op == OpCode::Call_indirect) {
-    // call_indirect: pop runtime index from stack, look up function in table
-    uint32_t TypeIdx = Instr.getTargetIndex();
-    
-    // Check if we have type information
-    if (TypeIdx >= ModuleFuncTypes.size()) {
-      return Unexpect(ErrCode::Value::RuntimeError);
-    }
-    
-    const AST::FunctionType *TargetFuncType = ModuleFuncTypes[TypeIdx];
-    if (!TargetFuncType) {
-      return Unexpect(ErrCode::Value::RuntimeError);
-    }
-    
-    const auto &ParamTypes = TargetFuncType->getParamTypes();
-    const auto &RetTypes = TargetFuncType->getReturnTypes();
-    
-    // Pop the runtime index from stack (this is the table index)
-    ir_ref TableIndex = ensureValidRef(pop(), IR_I32);
-    
-    // Build Args array with validated refs
-    std::vector<ir_ref> Args;
-    Args.resize(ParamTypes.size() + 4);
-    
-    // First four args: hidden params (func_table, func_table_size, global_base, mem_base)
-    Args[0] = ensureValidRef(FuncTablePtr, IR_ADDR);
-    Args[1] = ensureValidRef(FuncTableSize, IR_U32);
-    Args[2] = ensureValidRef(GlobalBasePtr, IR_ADDR);
-    Args[3] = ensureValidRef(MemoryBase, IR_ADDR);
-    
-    // Pop function arguments in reverse order and validate
-    for (size_t i = ParamTypes.size(); i > 0; --i) {
-      ir_type ParamIRType = wasmTypeToIRType(ParamTypes[i - 1]);
-      Args[i + 3] = ensureValidRef(pop(), ParamIRType);
-    }
-    
-    // Load function pointer from FuncTablePtr[TableIndex]
-    // Simplified: no bounds check (runtime will trap on null/invalid pointer)
-    ir_ref IndexExtended = ir_ZEXT_A(TableIndex);
-    ir_ref FuncOffset = ir_MUL_A(IndexExtended, ir_CONST_ADDR(sizeof(void*)));
-    ir_ref FuncPtrAddr = ir_ADD_A(Args[0], FuncOffset);  // Use validated FuncTablePtr
-    ir_ref FuncPtr = ir_LOAD_A(FuncPtrAddr);
-    
-    // Determine return type
-    ir_type RetType = IR_VOID;
-    if (!RetTypes.empty()) {
-      RetType = wasmTypeToIRType(RetTypes[0]);
-    }
-    
-    // Generate the call
-    uint32_t TotalParams = static_cast<uint32_t>(Args.size());
-    std::vector<uint8_t> ProtoParamTypes(TotalParams);
-    ProtoParamTypes[0] = IR_ADDR;
-    ProtoParamTypes[1] = IR_U32;
-    ProtoParamTypes[2] = IR_ADDR;
-    ProtoParamTypes[3] = IR_ADDR;
-    for (size_t i = 0; i < ParamTypes.size(); ++i) {
-      ProtoParamTypes[i + 4] = wasmTypeToIRType(ParamTypes[i]);
-    }
-    ir_ref Proto = ir_proto(ctx, IR_FASTCALL_FUNC, RetType,
-                            TotalParams, ProtoParamTypes.data());
-    ir_ref TypedFuncPtr = ir_emit2(ctx, IR_OPT(IR_PROTO, IR_ADDR),
-                                   FuncPtr, Proto);
+  // Resolve target function type
+  const AST::FunctionType *TargetFuncType = nullptr;
+  ir_ref FuncPtr = IR_UNUSED;
 
-    ir_ref CallResult = ir_CALL_N(RetType, TypedFuncPtr, 
-                                  static_cast<uint32_t>(Args.size()), 
-                                  Args.data());
-    
-    // Push return value to stack
-    if (!RetTypes.empty()) {
-      push(CallResult);
-    }
-    
-    return {};
+  if (Op == OpCode::Call_indirect) {
+    uint32_t TypeIdx = Instr.getTargetIndex();
+    if (TypeIdx >= ModuleFuncTypes.size())
+      return Unexpect(ErrCode::Value::RuntimeError);
+    TargetFuncType = ModuleFuncTypes[TypeIdx];
+  } else {
+    uint32_t FuncIdx = Instr.getTargetIndex();
+    if (FuncIdx >= ModuleFuncTypes.size())
+      return Unexpect(ErrCode::Value::RuntimeError);
+    TargetFuncType = ModuleFuncTypes[FuncIdx];
   }
-  
-  // Direct call: OpCode::Call
-  uint32_t FuncIdx = Instr.getTargetIndex();
-  
-  // Check if we have function type information
-  if (FuncIdx >= ModuleFuncTypes.size()) {
+  if (!TargetFuncType)
     return Unexpect(ErrCode::Value::RuntimeError);
-  }
-  
-  const AST::FunctionType *TargetFuncType = ModuleFuncTypes[FuncIdx];
-  if (!TargetFuncType) {
-    return Unexpect(ErrCode::Value::RuntimeError);
-  }
-  
+
   const auto &ParamTypes = TargetFuncType->getParamTypes();
   const auto &RetTypes = TargetFuncType->getReturnTypes();
-  
-  // Build Args array with validated refs
-  std::vector<ir_ref> Args;
-  Args.resize(ParamTypes.size() + 4);
-  
-  // First four args: hidden params (func_table, func_table_size, global_base, mem_base)
-  Args[0] = ensureValidRef(FuncTablePtr, IR_ADDR);
-  Args[1] = ensureValidRef(FuncTableSize, IR_U32);
-  Args[2] = ensureValidRef(GlobalBasePtr, IR_ADDR);
-  Args[3] = ensureValidRef(MemoryBase, IR_ADDR);
-  
-  // Pop function arguments in reverse order and validate
-  for (size_t i = ParamTypes.size(); i > 0; --i) {
-    ir_type ParamIRType = wasmTypeToIRType(ParamTypes[i - 1]);
-    Args[i + 3] = ensureValidRef(pop(), ParamIRType);
-  }
-  
-  // Load function pointer from FuncTablePtr[FuncIdx]
-  ir_ref FuncOffset = ir_MUL_A(ir_CONST_ADDR(static_cast<uintptr_t>(FuncIdx)), 
-                               ir_CONST_ADDR(sizeof(void*)));
-  ir_ref FuncPtrAddr = ir_ADD_A(Args[0], FuncOffset);  // Use validated FuncTablePtr
-  ir_ref FuncPtr = ir_LOAD_A(FuncPtrAddr);
-  
-  // Determine return type
-  ir_type RetType = IR_VOID;
-  if (!RetTypes.empty()) {
-    RetType = wasmTypeToIRType(RetTypes[0]);
-  }
-  
-  // Generate the call
-  uint32_t TotalParams = static_cast<uint32_t>(Args.size());
-  std::vector<uint8_t> ProtoParamTypes(TotalParams);
-  ProtoParamTypes[0] = IR_ADDR;
-  ProtoParamTypes[1] = IR_U32;
-  ProtoParamTypes[2] = IR_ADDR;
-  ProtoParamTypes[3] = IR_ADDR;
-  for (size_t i = 0; i < ParamTypes.size(); ++i) {
-    ProtoParamTypes[i + 4] = wasmTypeToIRType(ParamTypes[i]);
-  }
-  ir_ref Proto = ir_proto(ctx, IR_FASTCALL_FUNC, RetType,
-                          TotalParams, ProtoParamTypes.data());
-  ir_ref TypedFuncPtr = ir_emit2(ctx, IR_OPT(IR_PROTO, IR_ADDR),
-                                 FuncPtr, Proto);
 
-  ir_ref CallResult = ir_CALL_N(RetType, TypedFuncPtr, 
-                                static_cast<uint32_t>(Args.size()), 
-                                Args.data());
-  
-  // Push return value to stack
-  if (!RetTypes.empty()) {
-    push(CallResult);
+  // For call_indirect, pop the runtime table index before popping args.
+  ir_ref TableIndex = IR_UNUSED;
+  if (Op == OpCode::Call_indirect)
+    TableIndex = ensureValidRef(pop(), IR_I32);
+
+  // Pop wasm arguments in reverse order.
+  std::vector<ir_ref> WasmArgs(ParamTypes.size());
+  for (size_t i = ParamTypes.size(); i > 0; --i) {
+    ir_type T = wasmTypeToIRType(ParamTypes[i - 1]);
+    WasmArgs[i - 1] = ensureValidRef(pop(), T);
   }
-  
+
+  // Load function pointer from the function table.
+  ir_ref ValidFT = ensureValidRef(FuncTablePtr, IR_ADDR);
+  if (Op == OpCode::Call_indirect) {
+    ir_ref Idx = ir_ZEXT_A(TableIndex);
+    ir_ref Off = ir_MUL_A(Idx, ir_CONST_ADDR(sizeof(void *)));
+    FuncPtr = ir_LOAD_A(ir_ADD_A(ValidFT, Off));
+  } else {
+    uint32_t FuncIdx = Instr.getTargetIndex();
+    ir_ref Off = ir_MUL_A(ir_CONST_ADDR(static_cast<uintptr_t>(FuncIdx)),
+                          ir_CONST_ADDR(sizeof(void *)));
+    FuncPtr = ir_LOAD_A(ir_ADD_A(ValidFT, Off));
+  }
+
+  // Allocate callee args array on the stack: uint64_t args[N].
+  uint32_t NumArgs = static_cast<uint32_t>(ParamTypes.size());
+  ir_ref CalleeArgs = IR_UNUSED;
+  if (NumArgs > 0) {
+    CalleeArgs = ir_ALLOCA(ir_CONST_I32(NumArgs * sizeof(uint64_t)));
+    for (uint32_t i = 0; i < NumArgs; ++i) {
+      ir_ref SlotAddr =
+          ir_ADD_A(CalleeArgs, ir_CONST_ADDR(i * sizeof(uint64_t)));
+      ir_STORE(SlotAddr, WasmArgs[i]);
+    }
+  } else {
+    CalleeArgs = ir_CONST_ADDR(0);
+  }
+
+  // Determine return type.
+  ir_type RetType = IR_VOID;
+  if (!RetTypes.empty())
+    RetType = wasmTypeToIRType(RetTypes[0]);
+
+  // Build prototype: ret func(JitExecEnv* env, uint64_t* args)
+  uint8_t ProtoParams[2] = {IR_ADDR, IR_ADDR};
+  ir_ref Proto =
+      ir_proto(ctx, IR_FASTCALL_FUNC, RetType, 2, ProtoParams);
+  ir_ref TypedFuncPtr =
+      ir_emit2(ctx, IR_OPT(IR_PROTO, IR_ADDR), FuncPtr, Proto);
+
+  ir_ref CallArgs[2] = {ensureValidRef(EnvPtr, IR_ADDR), CalleeArgs};
+  ir_ref CallResult =
+      ir_CALL_N(RetType, TypedFuncPtr, 2, CallArgs);
+
+  // Free the stack allocation.
+  if (NumArgs > 0)
+    ir_AFREE(ir_CONST_I32(NumArgs * sizeof(uint64_t)));
+
+  if (!RetTypes.empty())
+    push(CallResult);
+
   return {};
 }
 

@@ -8,9 +8,9 @@ if (CMAKE_VERSION VERSION_GREATER_EQUAL "3.24.0")
 endif()
 project(WasmEdge LANGUAGES CXX C)
 
-# CMake build type.
+# CMake build type. Default Release for best performance; use -DCMAKE_BUILD_TYPE=Debug when debugging.
 if(NOT CMAKE_BUILD_TYPE)
-  set(CMAKE_BUILD_TYPE RelWithDebInfo)
+  set(CMAKE_BUILD_TYPE Release)
 endif()
 
 # Overwrite it if you want to use static MSVC runtime library.

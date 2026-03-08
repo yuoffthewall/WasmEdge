@@ -120,6 +120,14 @@ Consequently, WasmEdge faces a significant "cold start" problem, where applicati
 **Loop Variables**: ✅ Fixed - PHI nodes properly merge local variable values across loop iterations  
 **If Block Locals**: ✅ Fixed - Local variables modified in if branches correctly merged with PHI nodes
 
+### Build defaults and debugging
+- **Default build**: `CMAKE_BUILD_TYPE=Release` and IR JIT optimization level **O2** for best performance.
+- **When you hit bugs**: Use a **Debug** build and **lower the IR JIT opt level** so the O0 emitter and unoptimized IR are easier to debug:
+  1. Configure with Debug: `cmake -DCMAKE_BUILD_TYPE=Debug -B build`
+  2. At run time, force IR JIT to O0: `WASMEDGE_IR_JIT_OPT_LEVEL=0 ./test/ir/wasmedgeIRBenchmarkTests ...`
+  3. Optional O1: `WASMEDGE_IR_JIT_OPT_LEVEL=1` for light optimization.
+- **Env summary**: `WASMEDGE_IR_JIT_OPT_LEVEL=0|1|2` (default 2).
+
 ## Table of Contents
 
 1. [Overview](#overview)

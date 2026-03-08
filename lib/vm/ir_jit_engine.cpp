@@ -15,6 +15,7 @@ extern "C" {
 #include "ir.h"
 }
 
+#include <cstdlib>
 #include <cstring>
 #include <sys/mman.h>
 
@@ -44,12 +45,14 @@ IRJitEngine::compile(ir_ctx *Ctx) {
     return Unexpect(ErrCode::Value::RuntimeError);
   }
 
-  // Use IR's built-in JIT compilation
-  // Optimization level: 0 = no opt, 1 = light, 2 = full
-  // O2 triggers GCM assertion failures and hangs on our PHI/loop structures.
-  // Staying at O0 until the IR builder produces GCM-safe IR.
+  // Use IR's built-in JIT compilation. Default O2; override with WASMEDGE_IR_JIT_OPT_LEVEL=0|1 for debug.
+  int opt_level = 2;
+  if (const char *e = std::getenv("WASMEDGE_IR_JIT_OPT_LEVEL")) {
+    if (e[0] == '0' && e[1] == '\0') opt_level = 0;
+    else if (e[0] == '1' && e[1] == '\0') opt_level = 1;
+  }
   size_t CodeSize = 0;
-  void *NativeCode = ir_jit_compile(Ctx, 0, &CodeSize);
+  void *NativeCode = ir_jit_compile(Ctx, opt_level, &CodeSize);
   
   if (!NativeCode) {
     spdlog::info("IR JIT: ir_jit_compile failed");
@@ -81,97 +84,45 @@ Expect<void> IRJitEngine::invoke(void *NativeFunc,
     return Unexpect(ErrCode::Value::RuntimeError);
   }
 
-  (void)MemorySize; // Currently unused, but available for bounds checking
+  (void)MemorySize;
 
   const auto &ParamTypes = FuncType.getParamTypes();
   const auto &RetTypes = FuncType.getReturnTypes();
-  
-  // The IR-generated function has signature:
-  //   return_type func(void** func_table, uint32_t table_size, 
-  //                    void* global_base, void* mem_base, param1, param2, ...)
-  // where param types match the wasm function signature.
-  //
-  // For POC, we handle common cases (0-4 params) with explicit casts.
-  // A production implementation would use libffi or similar.
-  
-  uint64_t RetVal = 0;
-  
-  // Call based on number of parameters
-  switch (ParamTypes.size()) {
-  case 0: {
-    // func(void** ft, uint32_t ts, void* gb, void* mb) -> ret
-    if (RetTypes.empty()) {
-      using FnType = void (*)(void**, uint32_t, void*, void*);
-      reinterpret_cast<FnType>(NativeFunc)(FuncTable, FuncTableSize, GlobalBase, MemoryBase);
-    } else {
-      using FnType = uint64_t (*)(void**, uint32_t, void*, void*);
-      RetVal = reinterpret_cast<FnType>(NativeFunc)(FuncTable, FuncTableSize, GlobalBase, MemoryBase);
-    }
-    break;
-  }
-  case 1: {
-    // func(void** ft, uint32_t ts, void* gb, void* mb, arg0) -> ret
-    uint64_t a0 = valVariantToRaw(Args[0]);
-    if (RetTypes.empty()) {
-      using FnType = void (*)(void**, uint32_t, void*, void*, uint64_t);
-      reinterpret_cast<FnType>(NativeFunc)(FuncTable, FuncTableSize, GlobalBase, MemoryBase, a0);
-    } else {
-      using FnType = uint64_t (*)(void**, uint32_t, void*, void*, uint64_t);
-      RetVal = reinterpret_cast<FnType>(NativeFunc)(FuncTable, FuncTableSize, GlobalBase, MemoryBase, a0);
-    }
-    break;
-  }
-  case 2: {
-    // func(void** ft, uint32_t ts, void* gb, void* mb, arg0, arg1) -> ret
-    uint64_t a0 = valVariantToRaw(Args[0]);
-    uint64_t a1 = valVariantToRaw(Args[1]);
-    if (RetTypes.empty()) {
-      using FnType = void (*)(void**, uint32_t, void*, void*, uint64_t, uint64_t);
-      reinterpret_cast<FnType>(NativeFunc)(FuncTable, FuncTableSize, GlobalBase, MemoryBase, a0, a1);
-    } else {
-      using FnType = uint64_t (*)(void**, uint32_t, void*, void*, uint64_t, uint64_t);
-      RetVal = reinterpret_cast<FnType>(NativeFunc)(FuncTable, FuncTableSize, GlobalBase, MemoryBase, a0, a1);
-    }
-    break;
-  }
-  case 3: {
-    // func(void** ft, uint32_t ts, void* gb, void* mb, arg0, arg1, arg2) -> ret
-    uint64_t a0 = valVariantToRaw(Args[0]);
-    uint64_t a1 = valVariantToRaw(Args[1]);
-    uint64_t a2 = valVariantToRaw(Args[2]);
-    if (RetTypes.empty()) {
-      using FnType = void (*)(void**, uint32_t, void*, void*, uint64_t, uint64_t, uint64_t);
-      reinterpret_cast<FnType>(NativeFunc)(FuncTable, FuncTableSize, GlobalBase, MemoryBase, a0, a1, a2);
-    } else {
-      using FnType = uint64_t (*)(void**, uint32_t, void*, void*, uint64_t, uint64_t, uint64_t);
-      RetVal = reinterpret_cast<FnType>(NativeFunc)(FuncTable, FuncTableSize, GlobalBase, MemoryBase, a0, a1, a2);
-    }
-    break;
-  }
-  case 4: {
-    // func(void** ft, uint32_t ts, void* gb, void* mb, arg0, arg1, arg2, arg3) -> ret
-    uint64_t a0 = valVariantToRaw(Args[0]);
-    uint64_t a1 = valVariantToRaw(Args[1]);
-    uint64_t a2 = valVariantToRaw(Args[2]);
-    uint64_t a3 = valVariantToRaw(Args[3]);
-    if (RetTypes.empty()) {
-      using FnType = void (*)(void**, uint32_t, void*, void*, uint64_t, uint64_t, uint64_t, uint64_t);
-      reinterpret_cast<FnType>(NativeFunc)(FuncTable, FuncTableSize, GlobalBase, MemoryBase, a0, a1, a2, a3);
-    } else {
-      using FnType = uint64_t (*)(void**, uint32_t, void*, void*, uint64_t, uint64_t, uint64_t, uint64_t);
-      RetVal = reinterpret_cast<FnType>(NativeFunc)(FuncTable, FuncTableSize, GlobalBase, MemoryBase, a0, a1, a2, a3);
-    }
-    break;
-  }
-  default:
-    // More than 4 params not supported in POC
-    // Production would need libffi or varargs-based approach
-    return Unexpect(ErrCode::Value::RuntimeError);
-  }
 
-  // Process return value
-  if (!RetTypes.empty() && !Rets.empty()) {
-    Rets[0] = rawToValVariant(RetVal, RetTypes[0]);
+  JitExecEnv Env;
+  Env.FuncTable = FuncTable;
+  Env.FuncTableSize = FuncTableSize;
+  Env._pad = 0;
+  Env.GlobalBase = GlobalBase;
+  Env.MemoryBase = MemoryBase;
+
+  std::vector<uint64_t> ArgsRaw(ParamTypes.size());
+  for (size_t i = 0; i < ParamTypes.size(); ++i)
+    ArgsRaw[i] = valVariantToRaw(Args[i]);
+  uint64_t *ArgsData = ArgsRaw.empty() ? nullptr : ArgsRaw.data();
+
+  // Uniform JIT signature: ret func(JitExecEnv* env, uint64_t* args)
+  if (RetTypes.empty()) {
+    using Fn = void (*)(JitExecEnv *, uint64_t *);
+    reinterpret_cast<Fn>(NativeFunc)(&Env, ArgsData);
+  } else if (!Rets.empty()) {
+    auto Code = RetTypes[0].getCode();
+    if (Code == TypeCode::F32) {
+      using Fn = float (*)(JitExecEnv *, uint64_t *);
+      float F = reinterpret_cast<Fn>(NativeFunc)(&Env, ArgsData);
+      Rets[0] = ValVariant(F);
+    } else if (Code == TypeCode::F64) {
+      using Fn = double (*)(JitExecEnv *, uint64_t *);
+      double D = reinterpret_cast<Fn>(NativeFunc)(&Env, ArgsData);
+      Rets[0] = ValVariant(D);
+    } else {
+      using Fn = uint64_t (*)(JitExecEnv *, uint64_t *);
+      uint64_t Raw = reinterpret_cast<Fn>(NativeFunc)(&Env, ArgsData);
+      Rets[0] = rawToValVariant(Raw, RetTypes[0]);
+    }
+  } else {
+    using Fn = uint64_t (*)(JitExecEnv *, uint64_t *);
+    reinterpret_cast<Fn>(NativeFunc)(&Env, ArgsData);
   }
 
   return {};

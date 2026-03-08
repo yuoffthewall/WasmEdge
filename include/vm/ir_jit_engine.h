@@ -43,6 +43,18 @@ namespace VM {
 
 class WasmToIRBuilder;
 
+/// Execution environment passed as the first argument to every JIT-compiled
+/// function. Used with the uniform signature ret func(JitExecEnv*, uint64_t*).
+/// O0 code emitter has a bug fusing LOAD(addr)->ADDR with ADD; use O2
+/// (WASMEDGE_IR_JIT_OPT_LEVEL=2) when using this convention.
+struct JitExecEnv {
+  void **FuncTable;
+  uint32_t FuncTableSize;
+  uint32_t _pad;
+  void *GlobalBase;
+  void *MemoryBase;
+};
+
 /// IR JIT Engine - compiles and executes IR code
 class IRJitEngine {
 public:
@@ -63,9 +75,8 @@ public:
   /// Compile a function from IR context
   Expect<CompileResult> compile(ir_ctx *Ctx);
 
-  /// Execute a compiled function
-  /// JIT signature: RetType func(void** func_table, uint32_t table_size, 
-  ///                             void* global_base, void* mem_base, Params...)
+  /// Execute a compiled function.
+  /// Uniform calling convention: ret func(JitExecEnv* env, uint64_t* args)
   Expect<void> invoke(void *NativeFunc, const AST::FunctionType &FuncType,
                       Span<const ValVariant> Args, Span<ValVariant> Rets,
                       void **FuncTable = nullptr, uint32_t FuncTableSize = 0,

@@ -176,10 +176,12 @@ private:
   std::map<uint32_t, ir_ref> Locals;        // Local variables
   std::map<uint32_t, ir_type> LocalTypes;   // Types of local variables (fixed)
   std::vector<LabelInfo> LabelStack;        // Control flow label stack
-  ir_ref FuncTablePtr;                      // Pointer to function table (for calls)
-  ir_ref FuncTableSize;                     // Size of function table (for call_indirect bounds check)
-  ir_ref GlobalBasePtr;                     // Pointer to globals array (ValVariant*)
-  ir_ref MemoryBase;                        // Pointer to linear memory base
+  ir_ref EnvPtr;                            // JitExecEnv* (param 1)
+  ir_ref FuncTablePtr;                      // Loaded from EnvPtr
+  ir_ref FuncTableSize;                     // Loaded from EnvPtr
+  ir_ref GlobalBasePtr;                     // Loaded from EnvPtr
+  ir_ref MemoryBase;                        // Loaded from EnvPtr
+  ir_ref ArgsPtr;                           // uint64_t* args (param 2)
   ir_ref MemorySize;                        // Current memory size (in bytes)
   uint32_t LocalCount;                      // Total number of locals
   
