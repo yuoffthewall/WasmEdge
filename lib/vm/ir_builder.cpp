@@ -1865,9 +1865,49 @@ Expect<void> WasmToIRBuilder::visitEnd(const AST::Instruction &) {
     } else if (Label.EndList.size() > 2) {
       // Multiple paths, use MERGE_N
       ir_MERGE_N(static_cast<ir_ref>(Label.EndList.size()), Label.EndList.data());
-      // Simplified: use first path's locals
       if (!Label.EndLocals.empty()) {
-        Locals = Label.EndLocals[0];
+        size_t NumPaths = Label.EndLocals.size();
+        std::set<uint32_t> AllLocalIndices;
+        for (const auto &PathLocals : Label.EndLocals) {
+          for (const auto &[Idx, _] : PathLocals) {
+            AllLocalIndices.insert(Idx);
+          }
+        }
+        for (uint32_t LocalIdx : AllLocalIndices) {
+          std::vector<ir_ref> Values;
+          bool AllSame = true;
+          ir_ref FirstVal = IR_UNUSED;
+          for (const auto &PathLocals : Label.EndLocals) {
+            auto it = PathLocals.find(LocalIdx);
+            if (it != PathLocals.end()) {
+              if (FirstVal == IR_UNUSED) {
+                FirstVal = it->second;
+              } else if (it->second != FirstVal) {
+                AllSame = false;
+              }
+              Values.push_back(it->second);
+            }
+          }
+          if (Values.size() == NumPaths) {
+            if (AllSame) {
+              Locals[LocalIdx] = FirstVal;
+            } else {
+              ir_type LocalType = IR_I32;
+              auto typeIt = LocalTypes.find(LocalIdx);
+              if (typeIt != LocalTypes.end()) {
+                LocalType = typeIt->second;
+              }
+              std::vector<ir_ref> Coerced;
+              for (ir_ref V : Values) {
+                Coerced.push_back(coerceToType(V, LocalType));
+              }
+              ir_ref Phi = ir_PHI_N(LocalType,
+                                     static_cast<ir_ref>(Coerced.size()),
+                                     Coerced.data());
+              Locals[LocalIdx] = Phi;
+            }
+          }
+        }
       }
       CurrentPathTerminated = false;
     }
@@ -2029,9 +2069,49 @@ Expect<void> WasmToIRBuilder::visitEnd(const AST::Instruction &) {
     } else if (Label.EndList.size() > 2) {
       ir_MERGE_N(static_cast<ir_ref>(Label.EndList.size()), Label.EndList.data());
       CurrentPathTerminated = false;
-      // Simplified: use first path's locals for now (proper impl would create N-way PHIs)
       if (!Label.EndLocals.empty()) {
-        Locals = Label.EndLocals[0];
+        size_t NumPaths = Label.EndLocals.size();
+        std::set<uint32_t> AllLocalIndices;
+        for (const auto &PathLocals : Label.EndLocals) {
+          for (const auto &[Idx, _] : PathLocals) {
+            AllLocalIndices.insert(Idx);
+          }
+        }
+        for (uint32_t LocalIdx : AllLocalIndices) {
+          std::vector<ir_ref> Values;
+          bool AllSame = true;
+          ir_ref FirstVal = IR_UNUSED;
+          for (const auto &PathLocals : Label.EndLocals) {
+            auto it = PathLocals.find(LocalIdx);
+            if (it != PathLocals.end()) {
+              if (FirstVal == IR_UNUSED) {
+                FirstVal = it->second;
+              } else if (it->second != FirstVal) {
+                AllSame = false;
+              }
+              Values.push_back(it->second);
+            }
+          }
+          if (Values.size() == NumPaths) {
+            if (AllSame) {
+              Locals[LocalIdx] = FirstVal;
+            } else {
+              ir_type LocalType = IR_I32;
+              auto typeIt = LocalTypes.find(LocalIdx);
+              if (typeIt != LocalTypes.end()) {
+                LocalType = typeIt->second;
+              }
+              std::vector<ir_ref> Coerced;
+              for (ir_ref V : Values) {
+                Coerced.push_back(coerceToType(V, LocalType));
+              }
+              ir_ref Phi = ir_PHI_N(LocalType,
+                                     static_cast<ir_ref>(Coerced.size()),
+                                     Coerced.data());
+              Locals[LocalIdx] = Phi;
+            }
+          }
+        }
       }
       // Create PHI node for result value from multiple branches
       if (Label.Arity > 0 && Label.BranchResults.size() == Label.EndList.size()) {

@@ -1278,7 +1278,7 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
       }
     };
 
-    const char *modes[] = {"Interpreter", "JIT", "IR_JIT"};
+    const char *modes[] = {"Interpreter", "IR_JIT", "JIT"};
     for (const char *modeName : modes) {
       if (skipInterp && std::strcmp(modeName, "Interpreter") == 0) continue;
       if (skipLlvmJit && std::strcmp(modeName, "JIT") == 0) continue;
@@ -1471,8 +1471,20 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
 #endif
 
     // Correctness: JIT output must match AOT when both ran successfully
-    if (jitOk && aotOk) {
+    if (irJitOk && jitOk) {
       std::cout << "\n--- " << kernelName << " captured output ---\n";
+      
+      std::cout << "IR_JIT stdout (" << irJitCap.stdout_.size() << " bytes): ";
+      if (irJitCap.stdout_.empty())
+        std::cout << "(empty)\n";
+      else
+        std::cout << "\n" << irJitCap.stdout_ << "\n";
+      std::cout << "IR_JIT stderr (" << irJitCap.stderr_.size() << " bytes): ";
+      if (irJitCap.stderr_.empty())
+        std::cout << "(empty)\n";
+      else
+        std::cout << "\n" << irJitCap.stderr_ << "\n";
+
       std::cout << "JIT stdout (" << jitCap.stdout_.size() << " bytes): ";
       if (jitCap.stdout_.empty())
         std::cout << "(empty)\n";
@@ -1483,25 +1495,16 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
         std::cout << "(empty)\n";
       else
         std::cout << "\n" << jitCap.stderr_ << "\n";
-      std::cout << "AOT stdout (" << aotCap.stdout_.size() << " bytes): ";
-      if (aotCap.stdout_.empty())
-        std::cout << "(empty)\n";
-      else
-        std::cout << "\n" << aotCap.stdout_ << "\n";
-      std::cout << "AOT stderr (" << aotCap.stderr_.size() << " bytes): ";
-      if (aotCap.stderr_.empty())
-        std::cout << "(empty)\n";
-      else
-        std::cout << "\n" << aotCap.stderr_ << "\n";
+
       std::cout << "---\n";
 
-      EXPECT_EQ(jitCap.stdout_,aotCap.stdout_)
-          << "Kernel " << kernelName << ": LLVM JIT stdout must match AOT";
-      EXPECT_EQ(jitCap.stderr_, aotCap.stderr_)
-          << "Kernel " << kernelName << ": LLVM JIT stderr must match AOT";
-      EXPECT_EQ(jitCap.exitCode, aotCap.exitCode)
-          << "Kernel " << kernelName << ": LLVM JIT proc_exit code must match AOT ("
-          << jitCap.exitCode << " vs " << aotCap.exitCode << ")";
+      EXPECT_EQ(irJitCap.stdout_, jitCap.stdout_)
+          << "Kernel " << kernelName << ": IR JIT stdout must match LLVM JIT";
+      EXPECT_EQ(irJitCap.stderr_, jitCap.stderr_)
+          << "Kernel " << kernelName << ": IR JIT stderr must match LLVM JIT";
+      EXPECT_EQ(irJitCap.exitCode, jitCap.exitCode)
+          << "Kernel " << kernelName << ": IR JIT proc_exit code must match LLVM JIT ("
+          << irJitCap.exitCode << " vs " << jitCap.exitCode << ")";
     }
 
     // Correctness: IR JIT output must match a reference (prefer Interpreter, then LLVM JIT, then AOT)
