@@ -1616,6 +1616,107 @@ Expect<void> WasmToIRBuilder::visitControl(const AST::Instruction &Instr) {
   }
 }
 
+std::map<uint32_t, ir_ref> WasmToIRBuilder::mergeLocals(
+    const std::vector<std::map<uint32_t, ir_ref>> &EndLocals) {
+  ir_ctx *ctx = &Ctx;
+  size_t NumPaths = EndLocals.size();
+
+  std::set<uint32_t> AllLocalIndices;
+  for (const auto &PathLocals : EndLocals) {
+    for (const auto &[Idx, _] : PathLocals) {
+      AllLocalIndices.insert(Idx);
+    }
+  }
+
+  std::map<uint32_t, ir_ref> Merged;
+  for (uint32_t LocalIdx : AllLocalIndices) {
+    std::vector<ir_ref> Values;
+    bool AllSame = true;
+    ir_ref FirstVal = IR_UNUSED;
+    for (const auto &PathLocals : EndLocals) {
+      auto it = PathLocals.find(LocalIdx);
+      if (it != PathLocals.end()) {
+        if (FirstVal == IR_UNUSED) {
+          FirstVal = it->second;
+        } else if (it->second != FirstVal) {
+          AllSame = false;
+        }
+        Values.push_back(it->second);
+      } else if (FirstVal != IR_UNUSED) {
+        // Local missing on this path -- reuse the first path's value so the
+        // PHI input count matches the MERGE input count.
+        Values.push_back(FirstVal);
+      }
+    }
+    if (Values.size() != NumPaths) {
+      continue;
+    }
+    if (AllSame) {
+      Merged[LocalIdx] = FirstVal;
+    } else {
+      ir_type LocalType = IR_I32;
+      auto typeIt = LocalTypes.find(LocalIdx);
+      if (typeIt != LocalTypes.end()) {
+        LocalType = typeIt->second;
+      }
+      std::vector<ir_ref> Coerced;
+      for (ir_ref V : Values) {
+        Coerced.push_back(coerceToType(V, LocalType));
+      }
+      if (NumPaths == 2) {
+        ir_ref Phi = ir_PHI_2(LocalType, Coerced[0], Coerced[1]);
+        Merged[LocalIdx] = Phi;
+      } else {
+        ir_ref Phi = ir_PHI_N(LocalType,
+                               static_cast<ir_ref>(Coerced.size()),
+                               Coerced.data());
+        Merged[LocalIdx] = Phi;
+      }
+    }
+  }
+  return Merged;
+}
+
+void WasmToIRBuilder::mergeResults(const std::vector<ir_ref> &BranchResults,
+                                   ir_type ResultType) {
+  ir_ctx *ctx = &Ctx;
+  if (BranchResults.size() == 1) {
+    push(BranchResults[0]);
+  } else if (BranchResults.size() == 2) {
+    ir_ref C0 = coerceToType(BranchResults[0], ResultType);
+    ir_ref C1 = coerceToType(BranchResults[1], ResultType);
+    push(ir_PHI_2(ResultType, C0, C1));
+  } else {
+    std::vector<ir_ref> Coerced;
+    for (ir_ref R : BranchResults) {
+      Coerced.push_back(coerceToType(R, ResultType));
+    }
+    push(ir_PHI_N(ResultType, static_cast<ir_ref>(Coerced.size()),
+                  Coerced.data()));
+  }
+}
+
+void WasmToIRBuilder::emitLoopBackEdge(LabelInfo &Target) {
+  ir_ctx *ctx = &Ctx;
+
+  for (auto &[LocalIdx, PhiRef] : Target.LoopLocalPhis) {
+    auto it = Locals.find(LocalIdx);
+    if (it != Locals.end()) {
+      ir_type PhiType = IR_I32;
+      auto typeIt = LocalTypes.find(LocalIdx);
+      if (typeIt != LocalTypes.end()) {
+        PhiType = typeIt->second;
+      }
+      ir_ref CoercedVal = coerceToType(it->second, PhiType);
+      ir_PHI_SET_OP(PhiRef, 2, CoercedVal);
+    }
+  }
+
+  ir_ref LoopEnd = ir_LOOP_END();
+  ir_MERGE_SET_OP(Target.LoopHeader, 2, LoopEnd);
+  Target.BackEdgeEmitted = true;
+}
+
 Expect<void> WasmToIRBuilder::visitBlock(const AST::Instruction &Instr) {
   // Create label info for the block
   // Blocks are forward-jump targets: br jumps to AFTER the end
@@ -1646,11 +1747,9 @@ Expect<void> WasmToIRBuilder::visitBlock(const AST::Instruction &Instr) {
   return {};
 }
 
-Expect<void> WasmToIRBuilder::visitLoop(const AST::Instruction &) {
+Expect<void> WasmToIRBuilder::visitLoop(const AST::Instruction &Instr) {
   ir_ctx *ctx = &Ctx;
   
-  // Loops are backward-jump targets: br jumps to the loop header
-  // Create LOOP_BEGIN node
   ir_ref LoopEntry = ir_END();
   ir_ref LoopHeader = ir_LOOP_BEGIN(LoopEntry);
   
@@ -1659,7 +1758,16 @@ Expect<void> WasmToIRBuilder::visitLoop(const AST::Instruction &) {
   Label.LoopHeader = LoopHeader;
   Label.IfRef = IR_UNUSED;
   Label.ElseEnd = IR_UNUSED;
-  Label.Arity = 0;  // TODO: Get from block type
+
+  const BlockType &BType = Instr.getBlockType();
+  if (!BType.isEmpty() && BType.isValType()) {
+    Label.Arity = 1;
+    Label.ResultType = wasmTypeToIRType(BType.getValType());
+  } else {
+    Label.Arity = 0;
+    Label.ResultType = IR_VOID;
+  }
+
   Label.StackBase = static_cast<uint32_t>(ValueStack.size());
   Label.InElseBranch = false;
   Label.HasElse = false;
@@ -1823,91 +1931,17 @@ Expect<void> WasmToIRBuilder::visitEnd(const AST::Instruction &) {
       }
       CurrentPathTerminated = false;
     } else if (Label.EndList.size() == 2) {
-      // Two paths, use MERGE_2
       ir_MERGE_2(Label.EndList[0], Label.EndList[1]);
-      // For multiple paths, we need PHI nodes for locals that differ
-      // For now, use the first path's locals (simplified)
-      if (!Label.EndLocals.empty()) {
-        // Create PHI nodes for locals that have different values on different paths
-        if (Label.EndLocals.size() >= 2) {
-          for (auto &[LocalIdx, Val1] : Label.EndLocals[0]) {
-            auto it2 = Label.EndLocals[1].find(LocalIdx);
-            if (it2 != Label.EndLocals[1].end()) {
-              ir_ref Val2 = it2->second;
-              if (Val1 != Val2) {
-                // Different values, need PHI
-                // Use tracked local type (definitive)
-                ir_type LocalType = IR_I32;  // Default
-                auto typeIt = LocalTypes.find(LocalIdx);
-                if (typeIt != LocalTypes.end()) {
-                  LocalType = typeIt->second;
-                } else {
-                  // Local not in LocalTypes - infer from operand
-                  if (Val1 > 0 && Val1 < static_cast<ir_ref>(Ctx.insns_count)) {
-                    LocalType = static_cast<ir_type>(Ctx.ir_base[Val1].type);
-                  }
-                }
-                // Coerce operands to LocalType and create PHI
-                ir_ref Coerced1 = coerceToType(Val1, LocalType);
-                ir_ref Coerced2 = coerceToType(Val2, LocalType);
-                ir_ref Phi = ir_PHI_2(LocalType, Coerced1, Coerced2);
-                Locals[LocalIdx] = Phi;
-              } else {
-                Locals[LocalIdx] = Val1;
-              }
-            }
-          }
-        } else {
-          Locals = Label.EndLocals[0];
-        }
+      if (Label.EndLocals.size() >= 2) {
+        Locals = mergeLocals(Label.EndLocals);
+      } else if (!Label.EndLocals.empty()) {
+        Locals = Label.EndLocals[0];
       }
       CurrentPathTerminated = false;
     } else if (Label.EndList.size() > 2) {
-      // Multiple paths, use MERGE_N
       ir_MERGE_N(static_cast<ir_ref>(Label.EndList.size()), Label.EndList.data());
       if (!Label.EndLocals.empty()) {
-        size_t NumPaths = Label.EndLocals.size();
-        std::set<uint32_t> AllLocalIndices;
-        for (const auto &PathLocals : Label.EndLocals) {
-          for (const auto &[Idx, _] : PathLocals) {
-            AllLocalIndices.insert(Idx);
-          }
-        }
-        for (uint32_t LocalIdx : AllLocalIndices) {
-          std::vector<ir_ref> Values;
-          bool AllSame = true;
-          ir_ref FirstVal = IR_UNUSED;
-          for (const auto &PathLocals : Label.EndLocals) {
-            auto it = PathLocals.find(LocalIdx);
-            if (it != PathLocals.end()) {
-              if (FirstVal == IR_UNUSED) {
-                FirstVal = it->second;
-              } else if (it->second != FirstVal) {
-                AllSame = false;
-              }
-              Values.push_back(it->second);
-            }
-          }
-          if (Values.size() == NumPaths) {
-            if (AllSame) {
-              Locals[LocalIdx] = FirstVal;
-            } else {
-              ir_type LocalType = IR_I32;
-              auto typeIt = LocalTypes.find(LocalIdx);
-              if (typeIt != LocalTypes.end()) {
-                LocalType = typeIt->second;
-              }
-              std::vector<ir_ref> Coerced;
-              for (ir_ref V : Values) {
-                Coerced.push_back(coerceToType(V, LocalType));
-              }
-              ir_ref Phi = ir_PHI_N(LocalType,
-                                     static_cast<ir_ref>(Coerced.size()),
-                                     Coerced.data());
-              Locals[LocalIdx] = Phi;
-            }
-          }
-        }
+        Locals = mergeLocals(Label.EndLocals);
       }
       CurrentPathTerminated = false;
     }
@@ -2006,124 +2040,18 @@ Expect<void> WasmToIRBuilder::visitEnd(const AST::Instruction &) {
       if (Label.Arity > 0 && !Label.BranchResults.empty()) {
         push(Label.BranchResults[0]);
       }
-    } else if (Label.EndList.size() == 2) {
-      ir_MERGE_2(Label.EndList[0], Label.EndList[1]);
-      CurrentPathTerminated = false;
-      
-      // Create PHI nodes for locals that differ between branches
-      if (Label.EndLocals.size() == 2) {
-        std::map<uint32_t, ir_ref> MergedLocals;
-        const auto &Locals0 = Label.EndLocals[0];
-        const auto &Locals1 = Label.EndLocals[1];
-        
-        // Collect all local indices from both branches
-        std::set<uint32_t> AllLocalIndices;
-        for (const auto &[idx, _] : Locals0) AllLocalIndices.insert(idx);
-        for (const auto &[idx, _] : Locals1) AllLocalIndices.insert(idx);
-        
-        for (uint32_t LocalIdx : AllLocalIndices) {
-          auto it0 = Locals0.find(LocalIdx);
-          auto it1 = Locals1.find(LocalIdx);
-          
-          if (it0 != Locals0.end() && it1 != Locals1.end()) {
-            ir_ref Val0 = it0->second;
-            ir_ref Val1 = it1->second;
-            if (Val0 != Val1) {
-              // Different values, need PHI
-              // Use tracked local type (definitive)
-              ir_type LocalType = IR_I32;  // Default
-              auto typeIt = LocalTypes.find(LocalIdx);
-              if (typeIt != LocalTypes.end()) {
-                LocalType = typeIt->second;
-              } else {
-                // Local not in LocalTypes - infer from operand
-                if (Val0 > 0 && Val0 < static_cast<ir_ref>(Ctx.insns_count)) {
-                  LocalType = static_cast<ir_type>(Ctx.ir_base[Val0].type);
-                }
-              }
-              // Coerce operands to LocalType and create PHI
-              ir_ref Coerced0 = coerceToType(Val0, LocalType);
-              ir_ref Coerced1 = coerceToType(Val1, LocalType);
-              ir_ref Phi = ir_PHI_2(LocalType, Coerced0, Coerced1);
-              MergedLocals[LocalIdx] = Phi;
-            } else {
-              MergedLocals[LocalIdx] = Val0;  // Same value, no PHI needed
-            }
-          } else if (it0 != Locals0.end()) {
-            MergedLocals[LocalIdx] = it0->second;
-          } else if (it1 != Locals1.end()) {
-            MergedLocals[LocalIdx] = it1->second;
-          }
-        }
-        Locals = MergedLocals;
+    } else if (Label.EndList.size() >= 2) {
+      if (Label.EndList.size() == 2) {
+        ir_MERGE_2(Label.EndList[0], Label.EndList[1]);
+      } else {
+        ir_MERGE_N(static_cast<ir_ref>(Label.EndList.size()), Label.EndList.data());
       }
-      
-      // Create PHI node for result value
-      if (Label.Arity > 0 && Label.BranchResults.size() == 2) {
-        // Coerce operands to ensure types match
-        ir_ref Coerced0 = coerceToType(Label.BranchResults[0], Label.ResultType);
-        ir_ref Coerced1 = coerceToType(Label.BranchResults[1], Label.ResultType);
-        ir_ref ResultPhi = ir_PHI_2(Label.ResultType, Coerced0, Coerced1);
-        push(ResultPhi);
-      }
-    } else if (Label.EndList.size() > 2) {
-      ir_MERGE_N(static_cast<ir_ref>(Label.EndList.size()), Label.EndList.data());
       CurrentPathTerminated = false;
       if (!Label.EndLocals.empty()) {
-        size_t NumPaths = Label.EndLocals.size();
-        std::set<uint32_t> AllLocalIndices;
-        for (const auto &PathLocals : Label.EndLocals) {
-          for (const auto &[Idx, _] : PathLocals) {
-            AllLocalIndices.insert(Idx);
-          }
-        }
-        for (uint32_t LocalIdx : AllLocalIndices) {
-          std::vector<ir_ref> Values;
-          bool AllSame = true;
-          ir_ref FirstVal = IR_UNUSED;
-          for (const auto &PathLocals : Label.EndLocals) {
-            auto it = PathLocals.find(LocalIdx);
-            if (it != PathLocals.end()) {
-              if (FirstVal == IR_UNUSED) {
-                FirstVal = it->second;
-              } else if (it->second != FirstVal) {
-                AllSame = false;
-              }
-              Values.push_back(it->second);
-            }
-          }
-          if (Values.size() == NumPaths) {
-            if (AllSame) {
-              Locals[LocalIdx] = FirstVal;
-            } else {
-              ir_type LocalType = IR_I32;
-              auto typeIt = LocalTypes.find(LocalIdx);
-              if (typeIt != LocalTypes.end()) {
-                LocalType = typeIt->second;
-              }
-              std::vector<ir_ref> Coerced;
-              for (ir_ref V : Values) {
-                Coerced.push_back(coerceToType(V, LocalType));
-              }
-              ir_ref Phi = ir_PHI_N(LocalType,
-                                     static_cast<ir_ref>(Coerced.size()),
-                                     Coerced.data());
-              Locals[LocalIdx] = Phi;
-            }
-          }
-        }
+        Locals = mergeLocals(Label.EndLocals);
       }
-      // Create PHI node for result value from multiple branches
       if (Label.Arity > 0 && Label.BranchResults.size() == Label.EndList.size()) {
-        // Coerce all operands to ensure types match
-        std::vector<ir_ref> CoercedResults;
-        for (ir_ref R : Label.BranchResults) {
-          CoercedResults.push_back(coerceToType(R, Label.ResultType));
-        }
-        ir_ref ResultPhi = ir_PHI_N(Label.ResultType, 
-                                     static_cast<ir_ref>(CoercedResults.size()),
-                                     CoercedResults.data());
-        push(ResultPhi);
+        mergeResults(Label.BranchResults, Label.ResultType);
       }
     }
     // else: no live paths (shouldn't happen if we handled both-terminated case above)
@@ -2147,34 +2075,13 @@ Expect<void> WasmToIRBuilder::visitBr(const AST::Instruction &Instr) {
   LabelInfo &Target = LabelStack[LabelStack.size() - 1 - LabelIdx];
   
   if (Target.Kind == ControlKind::Loop) {
-    // Branch to loop: update PHI nodes with current local values before creating back-edge
-    for (auto &[LocalIdx, PhiRef] : Target.LoopLocalPhis) {
-      auto it = Locals.find(LocalIdx);
-      if (it != Locals.end()) {
-        ir_type PhiType = IR_I32;
-        auto typeIt = LocalTypes.find(LocalIdx);
-        if (typeIt != LocalTypes.end()) {
-          PhiType = typeIt->second;
-        }
-        ir_ref CoercedVal = coerceToType(it->second, PhiType);
-        ir_PHI_SET_OP(PhiRef, 2, CoercedVal);
-      }
-    }
-    
-    // Create back-edge
-    ir_ref LoopEnd = ir_LOOP_END();
-    ir_MERGE_SET_OP(Target.LoopHeader, 2, LoopEnd);
+    emitLoopBackEdge(Target);
   } else {
-    // Branch to block/if: create forward edge to merge at end
-    // Locals now use COPY(PHI) values which are concrete SSA refs, so we can
-    // save them directly without special handling.
     ir_ref BrEnd = ir_END();
     Target.EndList.push_back(BrEnd);
     Target.EndLocals.push_back(Locals);
   }
   
-  // After unconditional branch, code is unreachable
-  // Mark current path as terminated
   CurrentPathTerminated = true;
   
   return {};
@@ -2199,31 +2106,13 @@ Expect<void> WasmToIRBuilder::visitBrIf(const AST::Instruction &Instr) {
   ir_IF_TRUE(IfRef);
   
   if (Target.Kind == ControlKind::Loop) {
-    // Branch to loop: update PHI nodes with current local values
-    for (auto &[LocalIdx, PhiRef] : Target.LoopLocalPhis) {
-      auto it = Locals.find(LocalIdx);
-      if (it != Locals.end()) {
-        ir_type PhiType = IR_I32;
-        auto typeIt = LocalTypes.find(LocalIdx);
-        if (typeIt != LocalTypes.end()) {
-          PhiType = typeIt->second;
-        }
-        ir_ref CoercedVal = coerceToType(it->second, PhiType);
-        ir_PHI_SET_OP(PhiRef, 2, CoercedVal);
-      }
-    }
-    // Create back-edge
-    ir_ref LoopEnd = ir_LOOP_END();
-    ir_MERGE_SET_OP(Target.LoopHeader, 2, LoopEnd);
+    emitLoopBackEdge(Target);
   } else {
-    // Branch to block/if: create forward edge
-    // Locals now use COPY(PHI) values which are concrete SSA refs.
     ir_ref BrEnd = ir_END();
     Target.EndList.push_back(BrEnd);
     Target.EndLocals.push_back(Locals);
   }
   
-  // False branch: continue with fallthrough
   ir_IF_FALSE(IfRef);
   
   return {};
@@ -2272,28 +2161,13 @@ Expect<void> WasmToIRBuilder::visitBrTable(const AST::Instruction &Instr) {
     ir_IF_TRUE(IfRef);
     
     if (Target.Kind == ControlKind::Loop) {
-      // Update PHI nodes with current local values
-      for (auto &[LocalIdx, PhiRef] : Target.LoopLocalPhis) {
-        auto it = Locals.find(LocalIdx);
-        if (it != Locals.end()) {
-          ir_type PhiType = IR_I32;
-          auto typeIt = LocalTypes.find(LocalIdx);
-          if (typeIt != LocalTypes.end()) {
-            PhiType = typeIt->second;
-          }
-          ir_ref CoercedVal = coerceToType(it->second, PhiType);
-          ir_PHI_SET_OP(PhiRef, 2, CoercedVal);
-        }
-      }
-      ir_ref LoopEnd = ir_LOOP_END();
-      ir_MERGE_SET_OP(Target.LoopHeader, 2, LoopEnd);
+      emitLoopBackEdge(Target);
     } else {
       ir_ref BrEnd = ir_END();
       Target.EndList.push_back(BrEnd);
       Target.EndLocals.push_back(Locals);
     }
     
-    // False branch: continue checking next case
     ir_IF_FALSE(IfRef);
   }
   
@@ -2301,21 +2175,7 @@ Expect<void> WasmToIRBuilder::visitBrTable(const AST::Instruction &Instr) {
   LabelInfo &DefaultTarget = LabelStack[LabelStack.size() - 1 - DefaultLabelIdx];
   
   if (DefaultTarget.Kind == ControlKind::Loop) {
-    // Update PHI nodes with current local values
-    for (auto &[LocalIdx, PhiRef] : DefaultTarget.LoopLocalPhis) {
-      auto it = Locals.find(LocalIdx);
-      if (it != Locals.end()) {
-        ir_type PhiType = IR_I32;
-        auto typeIt = LocalTypes.find(LocalIdx);
-        if (typeIt != LocalTypes.end()) {
-          PhiType = typeIt->second;
-        }
-        ir_ref CoercedVal = coerceToType(it->second, PhiType);
-        ir_PHI_SET_OP(PhiRef, 2, CoercedVal);
-      }
-    }
-    ir_ref LoopEnd = ir_LOOP_END();
-    ir_MERGE_SET_OP(DefaultTarget.LoopHeader, 2, LoopEnd);
+    emitLoopBackEdge(DefaultTarget);
   } else {
     ir_ref BrEnd = ir_END();
     DefaultTarget.EndList.push_back(BrEnd);

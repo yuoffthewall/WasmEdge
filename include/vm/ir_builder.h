@@ -99,6 +99,7 @@ private:
     // For loops: PHI nodes for local variables
     std::map<uint32_t, ir_ref> LoopLocalPhis;  // LocalIdx -> PHI node ref
     std::map<uint32_t, ir_ref> PreLoopLocals;  // LocalIdx -> value before loop
+    bool BackEdgeEmitted = false;              // Has a loop back-edge been emitted already?
     
     // For if: locals state at the start of if (before any branch executes)
     std::map<uint32_t, ir_ref> PreIfLocals;    // LocalIdx -> value before if
@@ -154,6 +155,18 @@ private:
   /// Coerce a value to a target type, emitting conversion if needed.
   /// Returns the original value if types are compatible, or a converted value.
   ir_ref coerceToType(ir_ref Value, ir_type TargetType) noexcept;
+
+  /// Merge locals from multiple control flow paths, creating PHI nodes where
+  /// values differ. Returns the merged locals map.
+  std::map<uint32_t, ir_ref> mergeLocals(
+      const std::vector<std::map<uint32_t, ir_ref>> &EndLocals);
+
+  /// Merge result values from multiple branches, creating a PHI and pushing it.
+  void mergeResults(const std::vector<ir_ref> &BranchResults,
+                    ir_type ResultType);
+
+  /// Emit a loop back-edge, merging with any previously emitted back-edge.
+  void emitLoopBackEdge(LabelInfo &Target);
 
 private:
   ir_ctx Ctx;                               // IR context (stack allocated)
