@@ -59,6 +59,20 @@ public:
   void setModuleFunctions(Span<const AST::FunctionType *> FuncTypes) noexcept {
     ModuleFuncTypes.assign(FuncTypes.begin(), FuncTypes.end());
   }
+
+  /// Set the number of imported functions. Indices < ImportFuncNum are imports
+  /// and call to them will go through the host call trampoline.
+  void setImportFuncNum(uint32_t Num) noexcept { ImportFuncNum = Num; }
+
+  /// Set the max number of call arguments across all calls in the function.
+  /// Used to pre-allocate a shared args buffer in the function prologue.
+  void setMaxCallArgs(uint32_t N) noexcept { MaxCallArgs = N; }
+
+  /// Set module types from the type section (indexed by type index).
+  /// Used for call_indirect type resolution.
+  void setModuleTypes(Span<const AST::FunctionType *> Types) noexcept {
+    ModuleTypeSection.assign(Types.begin(), Types.end());
+  }
   
   /// Set module global types for global.get/set instructions
   /// Must be called before buildFromInstructions if the function uses globals
@@ -100,6 +114,10 @@ private:
     std::map<uint32_t, ir_ref> LoopLocalPhis;  // LocalIdx -> PHI node ref
     std::map<uint32_t, ir_ref> PreLoopLocals;  // LocalIdx -> value before loop
     bool BackEdgeEmitted = false;              // Has a loop back-edge been emitted already?
+
+    // For loops: collected back-edge ENDs (finalized at loop end)
+    std::vector<ir_ref> LoopBackEdgeEnds;
+    std::vector<std::map<uint32_t, ir_ref>> LoopBackEdgeLocals;
     
     // For if: locals state at the start of if (before any branch executes)
     std::map<uint32_t, ir_ref> PreIfLocals;    // LocalIdx -> value before if
@@ -181,12 +199,19 @@ private:
   ir_ref FuncTableSize;                     // Loaded from EnvPtr
   ir_ref GlobalBasePtr;                     // Loaded from EnvPtr
   ir_ref MemoryBase;                        // Loaded from EnvPtr
+  ir_ref HostCallFnPtr;                     // jit_host_call address from EnvPtr
   ir_ref ArgsPtr;                           // uint64_t* args (param 2)
   ir_ref MemorySize;                        // Current memory size (in bytes)
   uint32_t LocalCount;                      // Total number of locals
   
   // Module-level information for function calls
-  std::vector<const AST::FunctionType *> ModuleFuncTypes;  // Function types for all module functions
+  std::vector<const AST::FunctionType *> ModuleFuncTypes;  // Function types indexed by module function index
+  std::vector<const AST::FunctionType *> ModuleTypeSection; // Function types indexed by type index
+  uint32_t ImportFuncNum = 0;  // Number of imported functions
+  
+  // Pre-allocated args buffer for call instructions (avoids per-call ir_ALLOCA)
+  uint32_t MaxCallArgs = 0;    // Max parameter count across all calls in function
+  ir_ref SharedCallArgs;       // Pre-allocated buffer: uint64_t[MaxCallArgs]
   
   // Module-level information for globals
   std::vector<ValType> ModuleGlobalTypes;  // Types of all module globals

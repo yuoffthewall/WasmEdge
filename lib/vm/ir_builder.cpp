@@ -43,7 +43,7 @@ uint64_t wasm_i64_rem_u(uint64_t a, uint64_t b) {
 }  // namespace
 
 WasmToIRBuilder::WasmToIRBuilder() noexcept
-    : Initialized(false), CurrentPathTerminated(false), EnvPtr(0), FuncTablePtr(0), FuncTableSize(0), GlobalBasePtr(0), MemoryBase(0), ArgsPtr(0), MemorySize(0), LocalCount(0) {}
+    : Initialized(false), CurrentPathTerminated(false), EnvPtr(0), FuncTablePtr(0), FuncTableSize(0), GlobalBasePtr(0), MemoryBase(0), HostCallFnPtr(0), ArgsPtr(0), MemorySize(0), LocalCount(0), SharedCallArgs(0) {}
 
 WasmToIRBuilder::~WasmToIRBuilder() noexcept { reset(); }
 
@@ -62,9 +62,12 @@ void WasmToIRBuilder::reset() noexcept {
   FuncTableSize = 0;
   GlobalBasePtr = 0;
   MemoryBase = 0;
+  HostCallFnPtr = 0;
   ArgsPtr = 0;
   MemorySize = 0;
   LocalCount = 0;
+  MaxCallArgs = 0;
+  SharedCallArgs = 0;
   ModuleFuncTypes.clear();
   ModuleGlobalTypes.clear();
 }
@@ -120,6 +123,7 @@ Expect<void> WasmToIRBuilder::initialize(
   FuncTableSize = ir_LOAD_U32(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, FuncTableSize))));
   GlobalBasePtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, GlobalBase))));
   MemoryBase = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, MemoryBase))));
+  HostCallFnPtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, HostCallFn))));
 
   // Load wasm parameters from the args array. Each slot is sizeof(uint64_t).
   // On little-endian (x86_64), loading a narrower type from the slot address
@@ -161,6 +165,14 @@ Expect<void> WasmToIRBuilder::initialize(
 
 Expect<void>
 WasmToIRBuilder::buildFromInstructions(Span<const AST::Instruction> Instrs) {
+  // Pre-allocate a shared args buffer for all call instructions.
+  // This single ir_ALLOCA in the prologue replaces per-call dynamic allocation,
+  // preventing stack growth in functions with many calls (e.g. 887 in ed25519).
+  if (MaxCallArgs > 0) {
+    ir_ctx *ctx = &Ctx;
+    SharedCallArgs = ir_ALLOCA(ir_CONST_I32(MaxCallArgs * sizeof(uint64_t)));
+  }
+
   for (const auto &Instr : Instrs) {
     auto Res = visitInstruction(Instr);
     if (!Res) {
@@ -1707,6 +1719,7 @@ void WasmToIRBuilder::mergeResults(const std::vector<ir_ref> &BranchResults,
 void WasmToIRBuilder::emitLoopBackEdge(LabelInfo &Target) {
   ir_ctx *ctx = &Ctx;
 
+  std::map<uint32_t, ir_ref> BackEdgeLocals;
   for (auto &[LocalIdx, PhiRef] : Target.LoopLocalPhis) {
     auto it = Locals.find(LocalIdx);
     if (it != Locals.end()) {
@@ -1715,13 +1728,13 @@ void WasmToIRBuilder::emitLoopBackEdge(LabelInfo &Target) {
       if (typeIt != LocalTypes.end()) {
         PhiType = typeIt->second;
       }
-      ir_ref CoercedVal = coerceToType(it->second, PhiType);
-      ir_PHI_SET_OP(PhiRef, 2, CoercedVal);
+      BackEdgeLocals[LocalIdx] = coerceToType(it->second, PhiType);
     }
   }
 
-  ir_ref LoopEnd = ir_LOOP_END();
-  ir_MERGE_SET_OP(Target.LoopHeader, 2, LoopEnd);
+  ir_ref BackEnd = ir_END();
+  Target.LoopBackEdgeEnds.push_back(BackEnd);
+  Target.LoopBackEdgeLocals.push_back(std::move(BackEdgeLocals));
   Target.BackEdgeEmitted = true;
 }
 
@@ -1958,11 +1971,67 @@ Expect<void> WasmToIRBuilder::visitEnd(const AST::Instruction &) {
   }
   
   case ControlKind::Loop: {
-    // Loop end: when falling through (exiting the loop normally),
-    // keep the current Locals values. They were updated by local.set
-    // instructions inside the loop and represent the final state.
-    // Do NOT restore pre-loop values - wasm semantics require locals
-    // to retain their modified values after exiting a loop.
+    // Finalize back-edges: merge all collected back-edge ENDs into a
+    // single LOOP_END and wire it to the LOOP_BEGIN.
+    if (!Label.LoopBackEdgeEnds.empty()) {
+      // Save the fall-through path (if not terminated)
+      ir_ref FallthroughEnd = IR_UNUSED;
+      if (!CurrentPathTerminated) {
+        FallthroughEnd = ir_END();
+      }
+
+      size_t NumBackEdges = Label.LoopBackEdgeEnds.size();
+      if (NumBackEdges == 1) {
+        ir_BEGIN(Label.LoopBackEdgeEnds[0]);
+      } else {
+        ir_MERGE_N(static_cast<ir_ref>(NumBackEdges),
+                    Label.LoopBackEdgeEnds.data());
+      }
+
+      // Wire PHI values for loop locals
+      for (auto &[LocalIdx, PhiRef] : Label.LoopLocalPhis) {
+        if (NumBackEdges == 1) {
+          auto it = Label.LoopBackEdgeLocals[0].find(LocalIdx);
+          if (it != Label.LoopBackEdgeLocals[0].end()) {
+            ir_PHI_SET_OP(PhiRef, 2, it->second);
+          }
+        } else {
+          // Multiple back-edges: create intermediate PHI at the merge
+          std::vector<ir_ref> Vals;
+          ir_type PhiType = IR_I32;
+          auto typeIt = LocalTypes.find(LocalIdx);
+          if (typeIt != LocalTypes.end())
+            PhiType = typeIt->second;
+          for (size_t i = 0; i < NumBackEdges; ++i) {
+            auto it = Label.LoopBackEdgeLocals[i].find(LocalIdx);
+            if (it != Label.LoopBackEdgeLocals[i].end()) {
+              Vals.push_back(it->second);
+            } else {
+              // Fallback: use the pre-loop value
+              auto preIt = Label.PreLoopLocals.find(LocalIdx);
+              Vals.push_back(preIt != Label.PreLoopLocals.end()
+                                 ? preIt->second
+                                 : IR_UNUSED);
+            }
+          }
+          ir_ref MergedVal = ir_PHI_N(PhiType,
+                                       static_cast<ir_ref>(Vals.size()),
+                                       Vals.data());
+          ir_PHI_SET_OP(PhiRef, 2, MergedVal);
+        }
+      }
+
+      ir_ref LoopEnd = ir_LOOP_END();
+      ir_MERGE_SET_OP(Label.LoopHeader, 2, LoopEnd);
+
+      // Restore the fall-through path
+      if (FallthroughEnd != IR_UNUSED) {
+        ir_BEGIN(FallthroughEnd);
+        CurrentPathTerminated = false;
+      } else {
+        CurrentPathTerminated = true;
+      }
+    }
     break;
   }
   
@@ -2209,23 +2278,23 @@ Expect<void> WasmToIRBuilder::visitReturn(const AST::Instruction &) {
 
 Expect<void> WasmToIRBuilder::visitCall(const AST::Instruction &Instr) {
   ir_ctx *ctx = &Ctx;
-  
+
   OpCode Op = Instr.getOpCode();
-  
+
   // Resolve target function type
   const AST::FunctionType *TargetFuncType = nullptr;
-  ir_ref FuncPtr = IR_UNUSED;
+  uint32_t ResolvedFuncIdx = 0;
 
   if (Op == OpCode::Call_indirect) {
     uint32_t TypeIdx = Instr.getTargetIndex();
-    if (TypeIdx >= ModuleFuncTypes.size())
+    if (TypeIdx >= ModuleTypeSection.size())
       return Unexpect(ErrCode::Value::RuntimeError);
-    TargetFuncType = ModuleFuncTypes[TypeIdx];
+    TargetFuncType = ModuleTypeSection[TypeIdx];
   } else {
-    uint32_t FuncIdx = Instr.getTargetIndex();
-    if (FuncIdx >= ModuleFuncTypes.size())
+    ResolvedFuncIdx = Instr.getTargetIndex();
+    if (ResolvedFuncIdx >= ModuleFuncTypes.size())
       return Unexpect(ErrCode::Value::RuntimeError);
-    TargetFuncType = ModuleFuncTypes[FuncIdx];
+    TargetFuncType = ModuleFuncTypes[ResolvedFuncIdx];
   }
   if (!TargetFuncType)
     return Unexpect(ErrCode::Value::RuntimeError);
@@ -2245,24 +2314,11 @@ Expect<void> WasmToIRBuilder::visitCall(const AST::Instruction &Instr) {
     WasmArgs[i - 1] = ensureValidRef(pop(), T);
   }
 
-  // Load function pointer from the function table.
-  ir_ref ValidFT = ensureValidRef(FuncTablePtr, IR_ADDR);
-  if (Op == OpCode::Call_indirect) {
-    ir_ref Idx = ir_ZEXT_A(TableIndex);
-    ir_ref Off = ir_MUL_A(Idx, ir_CONST_ADDR(sizeof(void *)));
-    FuncPtr = ir_LOAD_A(ir_ADD_A(ValidFT, Off));
-  } else {
-    uint32_t FuncIdx = Instr.getTargetIndex();
-    ir_ref Off = ir_MUL_A(ir_CONST_ADDR(static_cast<uintptr_t>(FuncIdx)),
-                          ir_CONST_ADDR(sizeof(void *)));
-    FuncPtr = ir_LOAD_A(ir_ADD_A(ValidFT, Off));
-  }
-
-  // Allocate callee args array on the stack: uint64_t args[N].
+  // Marshal args into the pre-allocated shared buffer (or null for 0 args).
   uint32_t NumArgs = static_cast<uint32_t>(ParamTypes.size());
   ir_ref CalleeArgs = IR_UNUSED;
   if (NumArgs > 0) {
-    CalleeArgs = ir_ALLOCA(ir_CONST_I32(NumArgs * sizeof(uint64_t)));
+    CalleeArgs = SharedCallArgs;
     for (uint32_t i = 0; i < NumArgs; ++i) {
       ir_ref SlotAddr =
           ir_ADD_A(CalleeArgs, ir_CONST_ADDR(i * sizeof(uint64_t)));
@@ -2277,23 +2333,68 @@ Expect<void> WasmToIRBuilder::visitCall(const AST::Instruction &Instr) {
   if (!RetTypes.empty())
     RetType = wasmTypeToIRType(RetTypes[0]);
 
-  // Build prototype: ret func(JitExecEnv* env, uint64_t* args)
-  uint8_t ProtoParams[2] = {IR_ADDR, IR_ADDR};
-  ir_ref Proto =
-      ir_proto(ctx, IR_FASTCALL_FUNC, RetType, 2, ProtoParams);
-  ir_ref TypedFuncPtr =
-      ir_emit2(ctx, IR_OPT(IR_PROTO, IR_ADDR), FuncPtr, Proto);
+  ir_ref EnvPtrVal = ensureValidRef(EnvPtr, IR_ADDR);
 
-  ir_ref CallArgs[2] = {ensureValidRef(EnvPtr, IR_ADDR), CalleeArgs};
-  ir_ref CallResult =
-      ir_CALL_N(RetType, TypedFuncPtr, 2, CallArgs);
+  bool IsHostCall = (Op == OpCode::Call_indirect) ||
+                    (Op == OpCode::Call && ResolvedFuncIdx < ImportFuncNum);
 
-  // Free the stack allocation.
-  if (NumArgs > 0)
-    ir_AFREE(ir_CONST_I32(NumArgs * sizeof(uint64_t)));
+  if (IsHostCall) {
+    // Route through jit_host_call trampoline.
+    // Prototype: uint64_t jit_host_call(JitExecEnv*, uint32_t funcIdx,
+    //                                   uint64_t* args)
+    ir_ref HCFn = ensureValidRef(HostCallFnPtr, IR_ADDR);
+    uint8_t HCProtoParams[3] = {IR_ADDR, IR_I32, IR_ADDR};
+    ir_ref HCProto =
+        ir_proto(ctx, IR_FASTCALL_FUNC, IR_I64, 3, HCProtoParams);
+    ir_ref TypedHC =
+        ir_emit2(ctx, IR_OPT(IR_PROTO, IR_ADDR), HCFn, HCProto);
 
-  if (!RetTypes.empty())
-    push(CallResult);
+    // For call_indirect, encode the table-slot with bit 31 set so
+    // jit_host_call can distinguish it from a direct import call.
+    ir_ref FuncIdxArg;
+    if (Op == OpCode::Call_indirect)
+      FuncIdxArg = ir_OR_I32(TableIndex, ir_CONST_I32(0x80000000u));
+    else
+      FuncIdxArg = ir_CONST_I32(ResolvedFuncIdx);
+    ir_ref HCArgs[3] = {EnvPtrVal, FuncIdxArg, CalleeArgs};
+    ir_ref HCResult = ir_CALL_N(IR_I64, TypedHC, 3, HCArgs);
+
+    if (!RetTypes.empty()) {
+      if (RetType == IR_I32)
+        push(ir_TRUNC_I32(HCResult));
+      else if (RetType == IR_I64)
+        push(HCResult);
+      else if (RetType == IR_FLOAT) {
+        ir_ref tmp = ir_ALLOCA(ir_CONST_I32(8));
+        ir_STORE(tmp, HCResult);
+        push(ir_LOAD_F(tmp));
+      } else if (RetType == IR_DOUBLE) {
+        ir_ref tmp = ir_ALLOCA(ir_CONST_I32(8));
+        ir_STORE(tmp, HCResult);
+        push(ir_LOAD_D(tmp));
+      } else {
+        push(HCResult);
+      }
+    }
+  } else {
+    // Direct JIT-to-JIT call: load function pointer from the function table.
+    ir_ref ValidFT = ensureValidRef(FuncTablePtr, IR_ADDR);
+    ir_ref Off = ir_MUL_A(ir_CONST_ADDR(static_cast<uintptr_t>(ResolvedFuncIdx)),
+                          ir_CONST_ADDR(sizeof(void *)));
+    ir_ref FuncPtr = ir_LOAD_A(ir_ADD_A(ValidFT, Off));
+
+    uint8_t JitProtoParams[2] = {IR_ADDR, IR_ADDR};
+    ir_ref JitProto =
+        ir_proto(ctx, IR_FASTCALL_FUNC, RetType, 2, JitProtoParams);
+    ir_ref TypedFuncPtr =
+        ir_emit2(ctx, IR_OPT(IR_PROTO, IR_ADDR), FuncPtr, JitProto);
+
+    ir_ref JitArgs[2] = {EnvPtrVal, CalleeArgs};
+    ir_ref CallResult = ir_CALL_N(RetType, TypedFuncPtr, 2, JitArgs);
+
+    if (!RetTypes.empty())
+      push(CallResult);
+  }
 
   return {};
 }

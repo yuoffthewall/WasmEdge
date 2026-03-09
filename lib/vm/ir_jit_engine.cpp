@@ -45,12 +45,23 @@ IRJitEngine::compile(ir_ctx *Ctx) {
     return Unexpect(ErrCode::Value::RuntimeError);
   }
 
-  // Use IR's built-in JIT compilation. Default O2; override with WASMEDGE_IR_JIT_OPT_LEVEL=0|1 for debug.
+  // Default O2; override with WASMEDGE_IR_JIT_OPT_LEVEL=0|1 for debug.
   int opt_level = 2;
   if (const char *e = std::getenv("WASMEDGE_IR_JIT_OPT_LEVEL")) {
     if (e[0] == '0' && e[1] == '\0') opt_level = 0;
     else if (e[0] == '1' && e[1] == '\0') opt_level = 1;
   }
+
+  static int _dbg_func_id = 0;
+  int _dbg_cur_id = _dbg_func_id++;
+  bool _dbg_dump = std::getenv("WASMEDGE_IR_JIT_DUMP") != nullptr;
+  if (_dbg_dump) {
+    char fname[256];
+    snprintf(fname, sizeof(fname), "/tmp/wasmedge_ir_%03d_before.ir", _dbg_cur_id);
+    FILE *f = fopen(fname, "w");
+    if (f) { ir_save(Ctx, 0, f); fclose(f); }
+  }
+
   size_t CodeSize = 0;
   void *NativeCode = ir_jit_compile(Ctx, opt_level, &CodeSize);
   
@@ -59,11 +70,22 @@ IRJitEngine::compile(ir_ctx *Ctx) {
     return Unexpect(ErrCode::Value::RuntimeError);
   }
 
+  if (_dbg_dump) {
+    char fname[256];
+    snprintf(fname, sizeof(fname), "/tmp/wasmedge_ir_%03d_after.ir", _dbg_cur_id);
+    FILE *f = fopen(fname, "w");
+    if (f) { ir_save(Ctx, IR_SAVE_CFG, f); fclose(f); }
+  }
+
   // Track the code buffer
   CodeBuffers.push_back({NativeCode, CodeSize, CodeSize});
 
   // Register with GDB JIT interface so breakpoints / disassembly work
-  ir_gdb_register("wasm_jit_func", NativeCode, CodeSize, 0, 0);
+  {
+    char gdb_name[64];
+    snprintf(gdb_name, sizeof(gdb_name), "wasm_jit_%03d", _dbg_cur_id);
+    ir_gdb_register(gdb_name, NativeCode, CodeSize, 0, 0);
+  }
 
   CompileResult Result;
   Result.NativeFunc = NativeCode;
@@ -95,6 +117,7 @@ Expect<void> IRJitEngine::invoke(void *NativeFunc,
   Env._pad = 0;
   Env.GlobalBase = GlobalBase;
   Env.MemoryBase = MemoryBase;
+  Env.HostCallFn = reinterpret_cast<void *>(&jit_host_call);
 
   std::vector<uint64_t> ArgsRaw(ParamTypes.size());
   for (size_t i = 0; i < ParamTypes.size(); ++i)

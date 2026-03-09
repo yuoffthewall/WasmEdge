@@ -53,7 +53,15 @@ struct JitExecEnv {
   uint32_t _pad;
   void *GlobalBase;
   void *MemoryBase;
+  void *HostCallFn;   // Pointer to jit_host_call trampoline (extern "C")
 };
+
+/// Host call trampoline: dispatches calls to non-JIT functions (imports)
+/// through the WasmEdge executor.  For direct `call` instructions to imports.
+/// For `call_indirect`, the funcIdx encodes the table slot with bit 31 set:
+/// pass (0x80000000 | tableSlot) as funcIdx.
+extern "C" uint64_t jit_host_call(JitExecEnv *env, uint32_t funcIdx,
+                                  uint64_t *args);
 
 /// IR JIT Engine - compiles and executes IR code
 class IRJitEngine {

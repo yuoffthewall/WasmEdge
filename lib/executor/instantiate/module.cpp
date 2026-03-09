@@ -151,10 +151,17 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
       GlobalTypes.push_back(GlobInst->getGlobalType().getValType());
     }
     
-    // Collect function types for call instructions
+    // Collect function types for call instructions (indexed by function index)
     std::vector<const AST::FunctionType *> FuncTypes;
     for (const auto *FuncInst : ModInst->getFunctionInstances()) {
       FuncTypes.push_back(&FuncInst->getFuncType());
+    }
+
+    // Collect type section entries (indexed by type index) for call_indirect
+    std::vector<const AST::FunctionType *> TypeSection;
+    for (auto &SubType : Mod.getTypeSection().getContent()) {
+      TypeSection.push_back(
+          &SubType.getCompositeType().getFuncType());
     }
     
     // Get number of imported functions (skip these - they're not wasm functions)
@@ -190,36 +197,9 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
       }
     }
 
-    // Fixed-point: mark any function that calls a SkipJit target or uses
-    // call_indirect (whose runtime target may be a host function with nullptr
-    // in the JIT func table).
-    bool Changed = true;
-    while (Changed) {
-      Changed = false;
-      for (uint32_t ci = 0; ci < TotalDefined; ci++) {
-        uint32_t FIdx = ImportFuncNum + ci;
-        if (SkipJit[FIdx])
-          continue;
-        auto Instrs = CodeSegs[ci].getExpr().getInstrs();
-        for (const auto &I : Instrs) {
-          if (I.getOpCode() == OpCode::Call_indirect ||
-              I.getOpCode() == OpCode::Return_call_indirect) {
-            SkipJit[FIdx] = true;
-            Changed = true;
-            break;
-          }
-          if (I.getOpCode() == OpCode::Call ||
-              I.getOpCode() == OpCode::Return_call) {
-            uint32_t Target = I.getTargetIndex();
-            if (Target < SkipJit.size() && SkipJit[Target]) {
-              SkipJit[FIdx] = true;
-              Changed = true;
-              break;
-            }
-          }
-        }
-      }
-    }
+    // Transitive skip removed: the IR builder now routes calls to imports
+    // through jit_host_call and call_indirect through the same trampoline,
+    // so functions that call imports or use call_indirect can be JIT-compiled.
 
     // Log skip summary.
     {
@@ -289,7 +269,31 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
         }
         // IMPORTANT: Set module context AFTER initialize() since initialize() calls reset()
         IRBuilder.setModuleFunctions(FuncTypes);
+        IRBuilder.setModuleTypes(TypeSection);
         IRBuilder.setModuleGlobals(GlobalTypes);
+        IRBuilder.setImportFuncNum(ImportFuncNum);
+        
+        // Pre-scan to find max call args for shared buffer allocation
+        {
+          uint32_t MaxArgs = 0;
+          for (const auto &I : InstrVec) {
+            auto IOp = I.getOpCode();
+            if (IOp == OpCode::Call) {
+              uint32_t Idx = I.getTargetIndex();
+              if (Idx < FuncTypes.size()) {
+                auto N = static_cast<uint32_t>(FuncTypes[Idx]->getParamTypes().size());
+                if (N > MaxArgs) MaxArgs = N;
+              }
+            } else if (IOp == OpCode::Call_indirect) {
+              uint32_t TIdx = I.getTargetIndex();
+              if (TIdx < TypeSection.size()) {
+                auto N = static_cast<uint32_t>(TypeSection[TIdx]->getParamTypes().size());
+                if (N > MaxArgs) MaxArgs = N;
+              }
+            }
+          }
+          IRBuilder.setMaxCallArgs(MaxArgs);
+        }
         
         spdlog::debug("IR JIT: Building func {}", FuncIdx);
         auto BuildRes = IRBuilder.buildFromInstructions(InstrVec);

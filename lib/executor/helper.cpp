@@ -9,14 +9,158 @@
 
 #ifdef WASMEDGE_BUILD_IR_JIT
 #include "vm/ir_jit_engine.h"
+#include <cstring>
 #endif
 
 #include <cstdint>
 #include <utility>
 #include <vector>
 
+#ifdef WASMEDGE_BUILD_IR_JIT
+static thread_local WasmEdge::Executor::Executor *g_jitExecutor = nullptr;
+static thread_local WasmEdge::Runtime::StackManager *g_jitStackMgr = nullptr;
+static thread_local const WasmEdge::Runtime::Instance::ModuleInstance *g_jitModInst = nullptr;
+static thread_local WasmEdge::Runtime::Instance::TableInstance *g_jitTable0 = nullptr;
+
+extern "C" uint64_t jit_host_call(WasmEdge::VM::JitExecEnv *env,
+                                  uint32_t funcIdx, uint64_t *args) {
+  (void)env;
+  if (!g_jitExecutor || !g_jitStackMgr || !g_jitModInst)
+    return 0;
+
+  const WasmEdge::Runtime::Instance::FunctionInstance *funcInst = nullptr;
+
+  if (funcIdx & 0x80000000u) {
+    // call_indirect: bit 31 set, lower bits = table slot index
+    uint32_t tableSlot = funcIdx & 0x7FFFFFFFu;
+    if (!g_jitTable0)
+      return 0;
+    auto refRes = g_jitTable0->getRefAddr(tableSlot);
+    if (!refRes)
+      return 0;
+    funcInst =
+        (*refRes).getPtr<const WasmEdge::Runtime::Instance::FunctionInstance>();
+    if (!funcInst)
+      return 0;
+
+    // Fast path: if the target is a JIT function, call it directly
+    // instead of going through the executor (avoids deep stack recursion).
+    if (funcInst->isIRJitFunction()) {
+      void *nativeFunc = funcInst->getIRJitNativeFunc();
+      if (nativeFunc) {
+        const auto &ft = funcInst->getFuncType();
+        const auto &retTypes = ft.getReturnTypes();
+        if (retTypes.empty()) {
+          using Fn = void (*)(WasmEdge::VM::JitExecEnv *, uint64_t *);
+          reinterpret_cast<Fn>(nativeFunc)(env, args);
+          return 0;
+        } else {
+          using Fn = uint64_t (*)(WasmEdge::VM::JitExecEnv *, uint64_t *);
+          return reinterpret_cast<Fn>(nativeFunc)(env, args);
+        }
+      }
+    }
+  } else {
+    auto funcs = g_jitModInst->getFunctionInstances();
+    if (funcIdx >= funcs.size())
+      return 0;
+    funcInst = funcs[funcIdx];
+    if (!funcInst)
+      return 0;
+  }
+
+  const auto &funcType = funcInst->getFuncType();
+  const auto &paramTypes = funcType.getParamTypes();
+  const auto &retTypes = funcType.getReturnTypes();
+
+  std::vector<WasmEdge::ValVariant> params(paramTypes.size());
+  for (size_t i = 0; i < paramTypes.size(); ++i) {
+    auto code = paramTypes[i].getCode();
+    if (code == WasmEdge::TypeCode::F32) {
+      float f;
+      std::memcpy(&f, &args[i], sizeof(float));
+      params[i] = WasmEdge::ValVariant(f);
+    } else if (code == WasmEdge::TypeCode::F64) {
+      double d;
+      std::memcpy(&d, &args[i], sizeof(double));
+      params[i] = WasmEdge::ValVariant(d);
+    } else if (code == WasmEdge::TypeCode::I32) {
+      params[i] = WasmEdge::ValVariant(static_cast<uint32_t>(args[i]));
+    } else {
+      params[i] = WasmEdge::ValVariant(static_cast<uint64_t>(args[i]));
+    }
+  }
+
+  auto res = g_jitExecutor->jitCallFunction(*g_jitStackMgr, *funcInst, params,
+                                            g_jitModInst);
+  if (!res) {
+    if (res.error() != WasmEdge::ErrCode::Value::Terminated) {
+      spdlog::error("jit_host_call: func {} failed: {}", funcIdx,
+                    WasmEdge::ErrCode(res.error()));
+    }
+    return 0;
+  }
+
+  uint64_t retVal = 0;
+  if (!retTypes.empty()) {
+    auto val = g_jitStackMgr->pop();
+    auto code = retTypes[0].getCode();
+    if (code == WasmEdge::TypeCode::F32) {
+      float f = val.get<float>();
+      std::memcpy(&retVal, &f, sizeof(float));
+    } else if (code == WasmEdge::TypeCode::F64) {
+      double d = val.get<double>();
+      std::memcpy(&retVal, &d, sizeof(double));
+    } else {
+      retVal = val.get<uint64_t>();
+    }
+  }
+  return retVal;
+}
+#endif
+
 namespace WasmEdge {
 namespace Executor {
+
+#ifdef WASMEDGE_BUILD_IR_JIT
+Expect<void> Executor::jitCallFunction(
+    Runtime::StackManager &StackMgr,
+    const Runtime::Instance::FunctionInstance &Func,
+    Span<const ValVariant> Params,
+    const Runtime::Instance::ModuleInstance *CallerMod) {
+  // Push a dummy frame with the CALLER's module so that host functions
+  // (e.g. WASI) get the correct CallingFrame and can access the caller's
+  // memory.  runFunction uses nullptr here, which breaks host functions
+  // that need memory access when called from JIT code.
+  StackMgr.pushFrame(
+      const_cast<Runtime::Instance::ModuleInstance *>(CallerMod),
+      AST::InstrView::iterator(), 0, 0);
+
+  const auto &PTypes = Func.getFuncType().getParamTypes();
+  for (uint32_t I = 0; I < Params.size(); I++) {
+    if (PTypes[I].isRefType() && Params[I].get<RefVariant>().getPtr<void>() &&
+        Params[I].get<RefVariant>().getType().isNullableRefType()) {
+      auto Val = Params[I];
+      Val.get<RefVariant>().getType().toNonNullableRef();
+      StackMgr.push(Val);
+    } else {
+      StackMgr.push(Params[I]);
+    }
+  }
+
+  Expect<void> Res =
+      enterFunction(StackMgr, Func, Func.getInstrs().end())
+          .and_then([&](AST::InstrView::iterator StartIt) {
+            return execute(StackMgr, StartIt, Func.getInstrs().end());
+          });
+
+  if (!Res && likely(Res.error() == ErrCode::Value::Terminated)) {
+    StackMgr.reset();
+  }
+
+  return Res;
+}
+#endif
 
 Executor::SavedThreadLocal::SavedThreadLocal(
     Executor &Ex, Runtime::StackManager &StackMgr,
@@ -286,6 +430,19 @@ Executor::enterFunction(Runtime::StackManager &StackMgr,
 
     // Get IR JIT engine (global instance - simplified for POC)
     static VM::IRJitEngine IREngine;
+
+    // Set up TLS context for jit_host_call trampoline
+    g_jitExecutor = this;
+    g_jitStackMgr = &StackMgr;
+    g_jitModInst = ModInst;
+    // Modules without a table (e.g. noop) have empty TabInsts; getTabInstByIdx
+    // would UB. Use safe getTable and set null when no table.
+    if (ModInst) {
+      auto tabRes = ModInst->getTable(0);
+      g_jitTable0 = tabRes ? *tabRes : nullptr;
+    } else {
+      g_jitTable0 = nullptr;
+    }
 
     auto Res = IREngine.invoke(Func.getIRJitNativeFunc(), FuncType, Args, Rets,
                                FuncTable, FuncTableSize, GlobalBase,

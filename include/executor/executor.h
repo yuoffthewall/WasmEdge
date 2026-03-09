@@ -205,6 +205,16 @@ public:
     atomicNotifyAll();
   }
 
+#ifdef WASMEDGE_BUILD_IR_JIT
+  /// Call a function from JIT code (host call trampoline).
+  /// Unlike runFunction, pushes the caller's module into the dummy frame
+  /// so host functions get the correct CallingFrame with access to memory.
+  Expect<void> jitCallFunction(Runtime::StackManager &StackMgr,
+                               const Runtime::Instance::FunctionInstance &Func,
+                               Span<const ValVariant> Params,
+                               const Runtime::Instance::ModuleInstance *CallerMod);
+#endif
+
 private:
   /// Run Wasm bytecode expression for initialization.
   Expect<void> runExpression(Runtime::StackManager &StackMgr,
