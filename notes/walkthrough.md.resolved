@@ -1,0 +1,45 @@
+# Walkthrough: Sightglass Benchmark Input/Output Support
+
+## Problem
+
+The shootout benchmarks in `SightglassSuite` were broken in two ways:
+
+1. **`shootout-ackermann` was idling** — it reads parameters from [.input](file:///home/tommy/Desktop/sightglass/benchmarks/shootout/shootout-ackermann.n.input) files via WASI `path_open` + `fd_read`, but the stub always returned EOF
+2. **[StubFdPrestatGet](file:///home/tommy/Desktop/wasmedge/test/ir/ir_benchmark_test.cpp#139-157) caused a ~239-second startup delay** — it returned success for *all* fds, causing wasi-libc's pre-open enumeration to loop ~2 billion times
+3. **No output verification** — captured stdout/stderr was never compared against sightglass [.expected](file:///home/tommy/Desktop/sightglass/benchmarks/shootout/shootout-fib2.stderr.expected) reference files
+
+## Changes Made
+
+### [download_sightglass.sh](file:///home/tommy/Desktop/wasmedge/utils/download_sightglass.sh)
+
+Added a section to download [.input](file:///home/tommy/Desktop/sightglass/benchmarks/shootout/shootout-ackermann.n.input), [.stdout.expected](file:///home/tommy/Desktop/sightglass/benchmarks/shootout/shootout-fib2.stdout.expected), and [.stderr.expected](file:///home/tommy/Desktop/sightglass/benchmarks/shootout/shootout-fib2.stderr.expected) files for all shootout benchmarks.
+
+---
+
+### [ir_benchmark_test.cpp](file:///home/tommy/Desktop/wasmedge/test/ir/ir_benchmark_test.cpp)
+
+**Virtual filesystem** — Added [VirtualFd](file:///home/tommy/Desktop/wasmedge/test/ir/ir_benchmark_test.cpp#76-80) struct, `virtualFiles` map, `openFds` map, and [addVirtualFile()](file:///home/tommy/Desktop/wasmedge/test/ir/ir_benchmark_test.cpp#101-107) method to [WasiStubModule](file:///home/tommy/Desktop/wasmedge/test/ir/ir_benchmark_test.cpp#83-100).
+
+**StubFdPrestatGet** — Now returns `BADF` for all fds except fd 3 (the `.` pre-opened directory), fixing the infinite-loop startup bug.
+
+**StubFdPrestatDirName** — Now writes `"."` into guest memory instead of being a no-op.
+
+**StubPathOpen** — Extracts the requested path from guest memory, matches it against preloaded virtual files (stripping `./` prefix), allocates a new fd, and returns it. Returns `ENOENT` if not found.
+
+**StubFdRead** — Checks if the fd is a virtual file, reads from it into guest iovecs respecting offset, and advances the position. Falls through to EOF for stdin/unknown fds.
+
+**StubFdClose** — Removes the fd from the open-fd map.
+
+**SightglassSuite test** — Added `loadVirtualFiles()` lambda that scans the sightglass directory for [.input](file:///home/tommy/Desktop/sightglass/benchmarks/shootout/shootout-ackermann.n.input) files matching each kernel name. Added [.expected](file:///home/tommy/Desktop/sightglass/benchmarks/shootout/shootout-fib2.stderr.expected) output verification using `EXPECT_EQ` after each kernel run.
+
+## Test Results
+
+```
+shootout-ackermann  JIT   165796µs inst  1929µs work  174131µs TtV
+shootout-ackermann  AOT       93µs inst  1440µs work    1901µs TtV
+
+JIT stdout: [ackermann] running with M = 3 and N = 7 / [ackermann] returned 1021 ✅
+AOT stdout: [ackermann] running with M = 3 and N = 7 / [ackermann] returned 1021 ✅
+Expected output verification: PASSED
+Total test time: 216ms (was 239 seconds before the prestat fix)
+```

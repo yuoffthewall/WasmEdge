@@ -1,0 +1,76 @@
+# Add Input/Output Support to Sightglass Benchmarks
+
+The shootout benchmarks are currently idling because the WASI stub layer doesn't serve input files. Additionally, there is no verification of captured stdout/stderr against the sightglass [.expected](file:///home/tommy/Desktop/sightglass/benchmarks/shootout/shootout-fib2.stderr.expected) files.
+
+## Problem
+
+1. **`shootout-ackermann` hangs**: It calls `open("./shootout-ackermann.m.input")` and `open("./shootout-ackermann.n.input")` to read parameters via WASI `path_open` + `fd_read`. The current [StubPathOpen](file:///home/tommy/Desktop/wasmedge/test/ir/ir_benchmark_test.cpp#259-272) returns fd 0, and [StubFdRead](file:///home/tommy/Desktop/wasmedge/test/ir/ir_benchmark_test.cpp#202-214) always returns 0 bytes (EOF), so `atoi()` gets an empty buffer and produces bogus results (or hangs in a read loop).
+
+2. **No output verification**: The test captures stdout/stderr via [StdioCapture](file:///home/tommy/Desktop/wasmedge/test/ir/ir_benchmark_test.cpp#66-71) but only compares JIT vs AOT output. It never checks against the sightglass [.stdout.expected](file:///home/tommy/Desktop/sightglass/benchmarks/shootout/shootout-fib2.stdout.expected) / [.stderr.expected](file:///home/tommy/Desktop/sightglass/benchmarks/shootout/shootout-fib2.stderr.expected) reference files.
+
+3. **No [.input](file:///home/tommy/Desktop/sightglass/benchmarks/shootout/shootout-ackermann.n.input)/[.expected](file:///home/tommy/Desktop/sightglass/benchmarks/shootout/shootout-fib2.stderr.expected) files in testdata**: The download script only copies [.wasm](file:///home/tommy/Desktop/wasmedge/test/ir/testdata/sightglass/noop.wasm) files.
+
+## Proposed Changes
+
+### Download Script
+
+#### [MODIFY] [download_sightglass.sh](file:///home/tommy/Desktop/wasmedge/utils/download_sightglass.sh)
+
+Add a section to also download/copy all `*.input`, `*.stdout.expected`, and `*.stderr.expected` files from `benchmarks/shootout/` into the sightglass testdata directory. These are small text files. Currently the list of supporting files is:
+- `shootout-ackermann.m.input` (2 bytes: `"1\n"`)
+- `shootout-ackermann.n.input` (2 bytes: `"1\n"`)
+- `shootout-*.stdout.expected` (one per benchmark)
+- `shootout-*.stderr.expected` (one per benchmark, all empty)
+
+---
+
+### WasiStubModule
+
+#### [MODIFY] [ir_benchmark_test.cpp](file:///home/tommy/Desktop/wasmedge/test/ir/ir_benchmark_test.cpp)
+
+**1. Add a virtual filesystem to `WasiStubModule`**
+
+Add a `std::map<std::string, std::string> virtualFiles` field and a `std::map<int32_t, VirtualFd>` field (tracking open fds with current read position). Add a method `void addVirtualFile(std::string path, std::string content)` to populate the map before running a kernel.
+
+**2. Update `StubPathOpen`**
+
+Instead of always returning fd 0, match the requested path against `virtualFiles`. If found, allocate a new fd number (starting at 10 to avoid stdin/stdout/stderr), store it in the open-fd map, and return that fd to the guest. If not found, return `ENOENT` (errno 44).
+
+**3. Update `StubFdRead`**
+
+When the fd matches an open virtual file, copy bytes from the virtual file content (respecting the current offset) into the guest memory iovecs, advance the offset, and return the number of bytes read. For fd 0 (stdin), keep returning 0 (EOF). For unknown fds, return 0.
+
+**4. Update `StubFdClose`**
+
+Remove the fd from the open-fd map.
+
+**5. Load `.input` files and provide them to `WasiStubModule`**
+
+In the `SightglassSuite` test, before running each kernel, scan `SightglassDir` for `{kernelName}*.input` files (e.g., `shootout-ackermann.m.input`) and load their contents. Pass them to the `WasiStubModule` via `addVirtualFile()` (keyed by `"./" + filename`, matching how the C code opens them).
+
+**6. Load `.expected` files and verify output**
+
+After running each kernel (for each mode), load the corresponding `.stdout.expected` and `.stderr.expected` files from `SightglassDir`. If they exist and are non-empty, compare the captured `StdioCapture` output against them using `EXPECT_EQ`.
+
+---
+
+## Verification Plan
+
+### Automated Tests
+
+Run the existing benchmark test suite targeting just the ackermann kernel:
+
+```bash
+cd /home/tommy/Desktop/wasmedge/build
+cmake --build . --target wasmedgeIRBenchmarkTests -j$(nproc) 2>&1 | tail -20
+WASMEDGE_SIGHTGLASS_KERNEL=shootout-ackermann ./test/ir/wasmedgeIRBenchmarkTests --gtest_filter="*SightglassSuite*"
+```
+
+Expected: ackermann should produce stdout matching `shootout-ackermann.stdout.expected` (`[ackermann] running with M = 1 and N = 1\n[ackermann] returned 3\n`) instead of hanging.
+
+Then run the full suite:
+```bash
+./test/ir/wasmedgeIRBenchmarkTests --gtest_filter="*SightglassSuite*"
+```
+
+Expected: All benchmarks pass with stdout/stderr matching `.expected` files where available.
