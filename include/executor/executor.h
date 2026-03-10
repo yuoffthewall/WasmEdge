@@ -42,6 +42,10 @@
 #include <utility>
 #include <vector>
 
+#ifdef WASMEDGE_BUILD_IR_JIT
+#include "vm/ir_jit_engine.h"
+#endif
+
 namespace WasmEdge {
 namespace Executor {
 
@@ -213,6 +217,14 @@ public:
                                const Runtime::Instance::FunctionInstance &Func,
                                Span<const ValVariant> Params,
                                const Runtime::Instance::ModuleInstance *CallerMod);
+
+  /// Lazy access to the single IR JIT engine (used by instantiate and enterFunction).
+  VM::IRJitEngine &getIRJitEngine() const {
+    if (!IRJitEngine_) {
+      IRJitEngine_ = std::make_unique<VM::IRJitEngine>();
+    }
+    return *IRJitEngine_;
+  }
 #endif
 
 private:
@@ -1131,6 +1143,21 @@ private:
   std::atomic_uint32_t StopToken = 0;
   /// Executor Host Function Handler
   HostFuncHandler HostFuncHelper = {};
+
+#ifdef WASMEDGE_BUILD_IR_JIT
+  /// Per-module cache for JIT env (FuncTable, GlobalBase, MemoryBase).
+  struct IRJitEnvCache {
+    std::vector<void *> FuncTable;
+    std::vector<ValVariant *> GlobalPtrs;
+    void *MemoryBase = nullptr;
+  };
+  mutable std::unordered_map<const Runtime::Instance::ModuleInstance *,
+                             IRJitEnvCache>
+      IRJitEnvCache_;
+
+  /// Single IR JIT engine instance (lazy-initialized).
+  mutable std::unique_ptr<VM::IRJitEngine> IRJitEngine_;
+#endif
 };
 
 } // namespace Executor

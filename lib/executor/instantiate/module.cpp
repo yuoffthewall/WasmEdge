@@ -13,6 +13,8 @@
 
 #include <cstdint>
 #include <string_view>
+#include <chrono>
+#include <fstream>
 
 namespace WasmEdge {
 namespace Executor {
@@ -142,7 +144,7 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
   const bool isAOTModule =
       !CodeSegsAOTCheck.empty() && CodeSegsAOTCheck[0].getSymbol();
   if (!Conf.getRuntimeConfigure().isForceInterpreter() && !isAOTModule) {
-    static VM::IRJitEngine IREngine;
+    VM::IRJitEngine &IREngine = getIRJitEngine();
     VM::WasmToIRBuilder IRBuilder;
     
     // Collect global types for global.get/set instructions
@@ -171,7 +173,17 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
         ImportFuncNum++;
       }
     }
-    
+    // #region agent log
+    {
+      auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+      char buf[256];
+      std::snprintf(buf, sizeof(buf),
+        "{\"sessionId\":\"d32b78\",\"location\":\"module.cpp:instantiate\",\"message\":\"ImportFuncNum\",\"data\":{\"ImportFuncNum\":%u,\"TotalDefined\":%u},\"runId\":\"run1\",\"hypothesisId\":\"H1\",\"timestamp\":%lld}\n",
+        (unsigned)ImportFuncNum, (unsigned)CodeSec.getContent().size(), (long long)ts);
+      std::ofstream f("/home/tommy/Desktop/wasmedge/.cursor/debug-d32b78.log", std::ios::app); if (f) f << buf; f.close();
+    }
+    // #endregion
+    const auto &CodeSegs = CodeSec.getContent();
     // ----------------------------------------------------------------
     // Pre-pass: determine which functions are safe to JIT-compile.
     // A function is NOT safe to JIT if it directly calls an imported (host)
@@ -179,7 +191,6 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
     // Transitively, a function that calls a non-JIT function is also unsafe
     // (the JIT code would call through nullptr and segfault).
     // ----------------------------------------------------------------
-    const auto &CodeSegs = CodeSec.getContent();
     uint32_t TotalDefined = static_cast<uint32_t>(CodeSegs.size());
     std::vector<bool> SkipJit(ImportFuncNum + TotalDefined, false);
 

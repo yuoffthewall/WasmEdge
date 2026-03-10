@@ -53,7 +53,8 @@ struct JitExecEnv {
   uint32_t _pad;
   void *GlobalBase;
   void *MemoryBase;
-  void *HostCallFn;   // Pointer to jit_host_call trampoline (extern "C")
+  void *HostCallFn;      // Pointer to jit_host_call trampoline (extern "C")
+  void *DirectOrHostFn; // Pointer to jit_direct_or_host (null-safe direct call)
 };
 
 /// Host call trampoline: dispatches calls to non-JIT functions (imports)
@@ -62,6 +63,14 @@ struct JitExecEnv {
 /// pass (0x80000000 | tableSlot) as funcIdx.
 extern "C" uint64_t jit_host_call(JitExecEnv *env, uint32_t funcIdx,
                                   uint64_t *args);
+/// Null-safe direct call: if funcPtr is null, dispatches via jit_host_call.
+/// retTypeCode: 0=void, 1=i32, 2=i64, 3=f32, 4=f64
+extern "C" uint64_t jit_direct_or_host(JitExecEnv *env, void *funcPtr,
+                                        uint32_t funcIdx, uint64_t *args,
+                                        uint32_t retTypeCode);
+/// JMP buf for unwinding on proc_exit (Terminated). Used by jit_host_call to
+/// longjmp back to invoke() so we do not return to JIT and run unreachable.
+extern "C" void *wasmedge_ir_jit_get_termination_buf(void);
 
 /// IR JIT Engine - compiles and executes IR code
 class IRJitEngine {
@@ -111,14 +120,16 @@ private:
   /// Free executable memory
   void freeExecutable(void *Ptr, size_t Size) noexcept;
 
-  /// Convert ValVariant to raw value
-  uint64_t valVariantToRaw(const ValVariant &Val) const noexcept;
+  /// Convert ValVariant to raw 64-bit value (type-aware; preserves F32/F64 bits)
+  uint64_t valVariantToRaw(const ValVariant &Val, ValType Type) const noexcept;
 
   /// Convert raw value to ValVariant
   ValVariant rawToValVariant(uint64_t Raw, ValType Type) const noexcept;
 
 private:
   std::vector<CodeBuffer> CodeBuffers; // Track allocated code buffers
+  /// Reusable buffer for marshalling args in invoke() (avoids per-call allocation)
+  mutable std::vector<uint64_t> ArgsBuffer_;
 };
 
 } // namespace VM

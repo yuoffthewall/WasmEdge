@@ -43,7 +43,7 @@ uint64_t wasm_i64_rem_u(uint64_t a, uint64_t b) {
 }  // namespace
 
 WasmToIRBuilder::WasmToIRBuilder() noexcept
-    : Initialized(false), CurrentPathTerminated(false), EnvPtr(0), FuncTablePtr(0), FuncTableSize(0), GlobalBasePtr(0), MemoryBase(0), HostCallFnPtr(0), ArgsPtr(0), MemorySize(0), LocalCount(0), SharedCallArgs(0) {}
+    : Initialized(false), CurrentPathTerminated(false), EnvPtr(0), FuncTablePtr(0), FuncTableSize(0), GlobalBasePtr(0), MemoryBase(0), HostCallFnPtr(0), DirectOrHostFnPtr(0), ArgsPtr(0), MemorySize(0), LocalCount(0), SharedCallArgs(0) {}
 
 WasmToIRBuilder::~WasmToIRBuilder() noexcept { reset(); }
 
@@ -63,9 +63,11 @@ void WasmToIRBuilder::reset() noexcept {
   GlobalBasePtr = 0;
   MemoryBase = 0;
   HostCallFnPtr = 0;
+  DirectOrHostFnPtr = 0;
   ArgsPtr = 0;
   MemorySize = 0;
   LocalCount = 0;
+  CurrFuncNumParams = 0;
   MaxCallArgs = 0;
   SharedCallArgs = 0;
   ModuleFuncTypes.clear();
@@ -107,7 +109,8 @@ Expect<void> WasmToIRBuilder::initialize(
 
   // Set up function parameters as locals
   const auto &ParamTypes = FuncType.getParamTypes();
-  
+  CurrFuncNumParams = static_cast<uint32_t>(ParamTypes.size());
+
   // Calculate total locals
   LocalCount = ParamTypes.size();
   for (const auto &[Count, Type] : LocalVars) {
@@ -124,6 +127,7 @@ Expect<void> WasmToIRBuilder::initialize(
   GlobalBasePtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, GlobalBase))));
   MemoryBase = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, MemoryBase))));
   HostCallFnPtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, HostCallFn))));
+  DirectOrHostFnPtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, DirectOrHostFn))));
 
   // Load wasm parameters from the args array. Each slot is sizeof(uint64_t).
   // On little-endian (x86_64), loading a narrower type from the slot address
@@ -2377,23 +2381,51 @@ Expect<void> WasmToIRBuilder::visitCall(const AST::Instruction &Instr) {
       }
     }
   } else {
-    // Direct JIT-to-JIT call: load function pointer from the function table.
+    // Direct JIT-to-JIT call via null-safe trampoline (handles null table
+    // entries when ImportFuncNum is wrong or target is not JIT-compiled).
     ir_ref ValidFT = ensureValidRef(FuncTablePtr, IR_ADDR);
     ir_ref Off = ir_MUL_A(ir_CONST_ADDR(static_cast<uintptr_t>(ResolvedFuncIdx)),
                           ir_CONST_ADDR(sizeof(void *)));
     ir_ref FuncPtr = ir_LOAD_A(ir_ADD_A(ValidFT, Off));
 
-    uint8_t JitProtoParams[2] = {IR_ADDR, IR_ADDR};
-    ir_ref JitProto =
-        ir_proto(ctx, IR_FASTCALL_FUNC, RetType, 2, JitProtoParams);
-    ir_ref TypedFuncPtr =
-        ir_emit2(ctx, IR_OPT(IR_PROTO, IR_ADDR), FuncPtr, JitProto);
+    // retTypeCode for jit_direct_or_host: 0=void, 1=i32, 2=i64, 3=f32, 4=f64
+    uint32_t retTypeCode = 0;
+    if (!RetTypes.empty()) {
+      switch (RetType) {
+      case IR_I32: retTypeCode = 1; break;
+      case IR_I64: retTypeCode = 2; break;
+      case IR_FLOAT: retTypeCode = 3; break;
+      case IR_DOUBLE: retTypeCode = 4; break;
+      default: break;
+      }
+    }
+    ir_ref DOHFn = ensureValidRef(DirectOrHostFnPtr, IR_ADDR);
+    uint8_t DOHProtoParams[5] = {IR_ADDR, IR_ADDR, IR_I32, IR_ADDR, IR_I32};
+    ir_ref DOHProto =
+        ir_proto(ctx, IR_FASTCALL_FUNC, IR_I64, 5, DOHProtoParams);
+    ir_ref TypedDOH =
+        ir_emit2(ctx, IR_OPT(IR_PROTO, IR_ADDR), DOHFn, DOHProto);
+    ir_ref DOHArgs[5] = {EnvPtrVal, FuncPtr, ir_CONST_I32(static_cast<int32_t>(ResolvedFuncIdx)),
+                        CalleeArgs, ir_CONST_I32(static_cast<int32_t>(retTypeCode))};
+    ir_ref CallResult = ir_CALL_N(IR_I64, TypedDOH, 5, DOHArgs);
 
-    ir_ref JitArgs[2] = {EnvPtrVal, CalleeArgs};
-    ir_ref CallResult = ir_CALL_N(RetType, TypedFuncPtr, 2, JitArgs);
-
-    if (!RetTypes.empty())
-      push(CallResult);
+    if (!RetTypes.empty()) {
+      if (RetType == IR_I32)
+        push(ir_TRUNC_I32(CallResult));
+      else if (RetType == IR_I64)
+        push(CallResult);
+      else if (RetType == IR_FLOAT) {
+        ir_ref tmp = ir_ALLOCA(ir_CONST_I32(8));
+        ir_STORE(tmp, CallResult);
+        push(ir_LOAD_F(tmp));
+      } else if (RetType == IR_DOUBLE) {
+        ir_ref tmp = ir_ALLOCA(ir_CONST_I32(8));
+        ir_STORE(tmp, CallResult);
+        push(ir_LOAD_D(tmp));
+      } else {
+        push(CallResult);
+      }
+    }
   }
 
   return {};

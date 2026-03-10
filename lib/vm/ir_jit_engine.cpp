@@ -15,9 +15,20 @@ extern "C" {
 #include "ir.h"
 }
 
+#include <csetjmp>
 #include <cstdlib>
 #include <cstring>
 #include <sys/mman.h>
+#include <chrono>
+#include <fstream>
+
+namespace {
+static thread_local jmp_buf g_termination_buf;
+}
+
+extern "C" void *wasmedge_ir_jit_get_termination_buf(void) {
+  return &g_termination_buf;
+}
 
 namespace WasmEdge {
 namespace VM {
@@ -118,11 +129,28 @@ Expect<void> IRJitEngine::invoke(void *NativeFunc,
   Env.GlobalBase = GlobalBase;
   Env.MemoryBase = MemoryBase;
   Env.HostCallFn = reinterpret_cast<void *>(&jit_host_call);
+  Env.DirectOrHostFn = reinterpret_cast<void *>(&jit_direct_or_host);
 
-  std::vector<uint64_t> ArgsRaw(ParamTypes.size());
+  // #region agent log
+  {
+    auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    char buf[384];
+    std::snprintf(buf, sizeof(buf),
+      "{\"sessionId\":\"d32b78\",\"location\":\"ir_jit_engine.cpp:invoke\",\"message\":\"pre_call\",\"data\":{\"Env\":\"%p\",\"HostCallFn\":\"%p\",\"DirectOrHostFn\":\"%p\",\"FuncTable\":\"%p\",\"NativeFunc\":\"%p\"},\"runId\":\"run1\",\"hypothesisId\":\"H2,H3\",\"timestamp\":%lld}\n",
+      (void*)&Env, (void*)Env.HostCallFn, (void*)Env.DirectOrHostFn, (void*)FuncTable, (void*)NativeFunc, (long long)ts);
+    std::ofstream f("/home/tommy/Desktop/wasmedge/.cursor/debug-d32b78.log", std::ios::app); if (f) f << buf; f.close();
+  }
+  // #endregion
+
+  ArgsBuffer_.resize(ParamTypes.size());
   for (size_t i = 0; i < ParamTypes.size(); ++i)
-    ArgsRaw[i] = valVariantToRaw(Args[i]);
-  uint64_t *ArgsData = ArgsRaw.empty() ? nullptr : ArgsRaw.data();
+    ArgsBuffer_[i] = valVariantToRaw(Args[i], ParamTypes[i]);
+  uint64_t *ArgsData = ArgsBuffer_.empty() ? nullptr : ArgsBuffer_.data();
+
+  void *termBuf = wasmedge_ir_jit_get_termination_buf();
+  if (termBuf && setjmp(*static_cast<jmp_buf *>(termBuf)) != 0) {
+    return Unexpect(ErrCode::Value::Terminated);
+  }
 
   // Uniform JIT signature: ret func(JitExecEnv* env, uint64_t* args)
   if (RetTypes.empty()) {
@@ -147,6 +175,17 @@ Expect<void> IRJitEngine::invoke(void *NativeFunc,
     using Fn = uint64_t (*)(JitExecEnv *, uint64_t *);
     reinterpret_cast<Fn>(NativeFunc)(&Env, ArgsData);
   }
+
+  // #region agent log
+  {
+    auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    char buf[192];
+    std::snprintf(buf, sizeof(buf),
+      "{\"sessionId\":\"d32b78\",\"location\":\"ir_jit_engine.cpp:invoke\",\"message\":\"post_call\",\"data\":{},\"runId\":\"run1\",\"hypothesisId\":\"H6\",\"timestamp\":%lld}\n",
+      (long long)ts);
+    std::ofstream f("/home/tommy/Desktop/wasmedge/.cursor/debug-d32b78.log", std::ios::app); if (f) f << buf; f.close();
+  }
+  // #endregion
 
   return {};
 }
@@ -190,10 +229,28 @@ void IRJitEngine::freeExecutable(void *Ptr, size_t Size) noexcept {
   }
 }
 
-uint64_t IRJitEngine::valVariantToRaw(const ValVariant &Val) const noexcept {
-  // Convert ValVariant to raw 64-bit value
-  // This is simplified - actual implementation needs proper type handling
-  return Val.get<uint64_t>();
+uint64_t IRJitEngine::valVariantToRaw(const ValVariant &Val,
+                                      ValType Type) const noexcept {
+  auto Code = Type.getCode();
+  if (Code == TypeCode::I32) {
+    return static_cast<uint64_t>(Val.get<uint32_t>());
+  }
+  if (Code == TypeCode::I64) {
+    return Val.get<uint64_t>();
+  }
+  if (Code == TypeCode::F32) {
+    uint64_t Raw = 0;
+    float F = Val.get<float>();
+    std::memcpy(&Raw, &F, sizeof(float));
+    return Raw;
+  }
+  if (Code == TypeCode::F64) {
+    uint64_t Raw = 0;
+    double D = Val.get<double>();
+    std::memcpy(&Raw, &D, sizeof(double));
+    return Raw;
+  }
+  return 0;
 }
 
 ValVariant IRJitEngine::rawToValVariant(uint64_t Raw,

@@ -200,10 +200,12 @@ private:
   ir_ref GlobalBasePtr;                     // Loaded from EnvPtr
   ir_ref MemoryBase;                        // Loaded from EnvPtr
   ir_ref HostCallFnPtr;                     // jit_host_call address from EnvPtr
+  ir_ref DirectOrHostFnPtr;                 // jit_direct_or_host (null-safe call) from EnvPtr
   ir_ref ArgsPtr;                           // uint64_t* args (param 2)
   ir_ref MemorySize;                        // Current memory size (in bytes)
   uint32_t LocalCount;                      // Total number of locals
-  
+  uint32_t CurrFuncNumParams = 0;           // Current function's parameter count (for call_indirect table-index fix)
+
   // Module-level information for function calls
   std::vector<const AST::FunctionType *> ModuleFuncTypes;  // Function types indexed by module function index
   std::vector<const AST::FunctionType *> ModuleTypeSection; // Function types indexed by type index

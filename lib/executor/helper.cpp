@@ -9,7 +9,10 @@
 
 #ifdef WASMEDGE_BUILD_IR_JIT
 #include "vm/ir_jit_engine.h"
+#include <csetjmp>
 #include <cstring>
+#include <chrono>
+#include <fstream>
 #endif
 
 #include <cstdint>
@@ -24,6 +27,16 @@ static thread_local WasmEdge::Runtime::Instance::TableInstance *g_jitTable0 = nu
 
 extern "C" uint64_t jit_host_call(WasmEdge::VM::JitExecEnv *env,
                                   uint32_t funcIdx, uint64_t *args) {
+  // #region agent log
+  {
+    auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    char buf[384];
+    std::snprintf(buf, sizeof(buf),
+      "{\"sessionId\":\"d32b78\",\"location\":\"helper.cpp:jit_host_call\",\"message\":\"entry\",\"data\":{\"env\":\"%p\",\"funcIdx\":%u,\"HostCallFn\":\"%p\",\"g_jitExecutor\":\"%p\",\"g_jitModInst\":\"%p\"},\"runId\":\"run1\",\"hypothesisId\":\"H3,H4\",\"timestamp\":%lld}\n",
+      (void*)env, funcIdx, env ? env->HostCallFn : (void*)0, (void*)g_jitExecutor, (void*)g_jitModInst, (long long)ts);
+    std::ofstream f("/home/tommy/Desktop/wasmedge/.cursor/debug-d32b78.log", std::ios::app); if (f) f << buf; f.close();
+  }
+  // #endregion
   (void)env;
   if (!g_jitExecutor || !g_jitStackMgr || !g_jitModInst)
     return 0;
@@ -98,6 +111,11 @@ extern "C" uint64_t jit_host_call(WasmEdge::VM::JitExecEnv *env,
       spdlog::error("jit_host_call: func {} failed: {}", funcIdx,
                     WasmEdge::ErrCode(res.error()));
     }
+    if (res.error() == WasmEdge::ErrCode::Value::Terminated) {
+      void *buf = WasmEdge::VM::wasmedge_ir_jit_get_termination_buf();
+      if (buf)
+        longjmp(*static_cast<jmp_buf *>(buf), 1);
+    }
     return 0;
   }
 
@@ -115,7 +133,59 @@ extern "C" uint64_t jit_host_call(WasmEdge::VM::JitExecEnv *env,
       retVal = val.get<uint64_t>();
     }
   }
+  // #region agent log
+  {
+    auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    char buf[192];
+    std::snprintf(buf, sizeof(buf),
+      "{\"sessionId\":\"d32b78\",\"location\":\"helper.cpp:jit_host_call_exit\",\"message\":\"return\",\"data\":{\"funcIdx\":%u},\"runId\":\"run1\",\"hypothesisId\":\"H6\",\"timestamp\":%lld}\n",
+      funcIdx, (long long)ts);
+    std::ofstream f("/home/tommy/Desktop/wasmedge/.cursor/debug-d32b78.log", std::ios::app); if (f) f << buf; f.close();
+  }
+  // #endregion
   return retVal;
+}
+
+/// Trampoline for direct "call": if funcPtr is null (import), dispatch via
+/// jit_host_call; otherwise call the JIT function. Prevents null deref when
+/// ImportFuncNum is wrong or table entry is null.
+/// retTypeCode: 0=void, 1=i32, 2=i64, 3=f32, 4=f64
+extern "C" uint64_t jit_direct_or_host(WasmEdge::VM::JitExecEnv *env,
+                                       void *funcPtr, uint32_t funcIdx,
+                                       uint64_t *args, uint32_t retTypeCode) {
+  if (!funcPtr)
+    return jit_host_call(env, funcIdx, args);
+  switch (retTypeCode) {
+  case 0: {
+    using Fn = void (*)(WasmEdge::VM::JitExecEnv *, uint64_t *);
+    reinterpret_cast<Fn>(funcPtr)(env, args);
+    return 0;
+  }
+  case 1: {
+    using Fn = uint64_t (*)(WasmEdge::VM::JitExecEnv *, uint64_t *);
+    return reinterpret_cast<Fn>(funcPtr)(env, args) & 0xFFFFFFFFu;
+  }
+  case 2: {
+    using Fn = uint64_t (*)(WasmEdge::VM::JitExecEnv *, uint64_t *);
+    return reinterpret_cast<Fn>(funcPtr)(env, args);
+  }
+  case 3: {
+    using Fn = float (*)(WasmEdge::VM::JitExecEnv *, uint64_t *);
+    float f = reinterpret_cast<Fn>(funcPtr)(env, args);
+    uint64_t u;
+    std::memcpy(&u, &f, sizeof(f));
+    return u;
+  }
+  case 4: {
+    using Fn = double (*)(WasmEdge::VM::JitExecEnv *, uint64_t *);
+    double d = reinterpret_cast<Fn>(funcPtr)(env, args);
+    uint64_t u;
+    std::memcpy(&u, &d, sizeof(d));
+    return u;
+  }
+  default:
+    return 0;
+  }
 }
 #endif
 
@@ -128,6 +198,16 @@ Expect<void> Executor::jitCallFunction(
     const Runtime::Instance::FunctionInstance &Func,
     Span<const ValVariant> Params,
     const Runtime::Instance::ModuleInstance *CallerMod) {
+  // #region agent log
+  {
+    auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+      "{\"sessionId\":\"d32b78\",\"location\":\"helper.cpp:jitCallFunction\",\"message\":\"entry\",\"data\":{\"CallerMod\":\"%p\",\"StackMgrFrames\":%zu},\"runId\":\"run1\",\"hypothesisId\":\"H7\",\"timestamp\":%lld}\n",
+      (void*)CallerMod, StackMgr.getFramesSpan().size(), (long long)ts);
+    std::ofstream f("/home/tommy/Desktop/wasmedge/.cursor/debug-d32b78.log", std::ios::app); if (f) f << buf; f.close();
+  }
+  // #endregion
   // Push a dummy frame with the CALLER's module so that host functions
   // (e.g. WASI) get the correct CallingFrame and can access the caller's
   // memory.  runFunction uses nullptr here, which breaks host functions
@@ -154,8 +234,37 @@ Expect<void> Executor::jitCallFunction(
             return execute(StackMgr, StartIt, Func.getInstrs().end());
           });
 
+  // #region agent log
+  {
+    auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    char buf[320];
+    std::snprintf(buf, sizeof(buf),
+      "{\"sessionId\":\"d32b78\",\"location\":\"helper.cpp:jitCallFunction\",\"message\":\"pre_return\",\"data\":{\"Res\":%s,\"Terminated\":%d},\"runId\":\"run1\",\"hypothesisId\":\"H7\",\"timestamp\":%lld}\n",
+      Res ? "ok" : "err", (!Res && Res.error() == ErrCode::Value::Terminated) ? 1 : 0, (long long)ts);
+    std::ofstream f("/home/tommy/Desktop/wasmedge/.cursor/debug-d32b78.log", std::ios::app); if (f) f << buf; f.close();
+  }
+  // #endregion
   if (!Res && likely(Res.error() == ErrCode::Value::Terminated)) {
-    StackMgr.reset();
+    // When called from JIT (jit_host_call), the stack still has the JIT
+    // caller's frame. reset() would wipe it and cause a segfault when
+    // returning to the JIT. Only undo what we pushed: host frame + dummy frame.
+    size_t nFrames = StackMgr.getFramesSpan().size();
+    if (nFrames >= 2) {
+      StackMgr.popFrame();
+      StackMgr.popFrame();
+      // #region agent log
+      {
+        auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+          "{\"sessionId\":\"d32b78\",\"location\":\"helper.cpp:jitCallFunction\",\"message\":\"after_pop2\",\"data\":{\"nFramesBefore\":%zu},\"runId\":\"run1\",\"hypothesisId\":\"H7\",\"timestamp\":%lld}\n",
+          nFrames, (long long)ts);
+        std::ofstream f("/home/tommy/Desktop/wasmedge/.cursor/debug-d32b78.log", std::ios::app); if (f) f << buf; f.close();
+      }
+      // #endregion
+    } else {
+      StackMgr.reset();
+    }
   }
 
   return Res;
@@ -372,69 +481,64 @@ Executor::enterFunction(Runtime::StackManager &StackMgr,
 
     // Get module instance for runtime data
     const auto *ModInst = Func.getModule();
-    
-    // Get function table (for call/call_indirect)
-    // Build function table from ModInst's function instances
-    static thread_local std::vector<void*> FuncTableStorage;
-    void **FuncTable = nullptr;
-    uint32_t FuncTableSize = 0;
-    
-    if (ModInst) {
-      auto FuncInsts = ModInst->getFunctionInstances();
-      FuncTableSize = static_cast<uint32_t>(FuncInsts.size());
-      
-      if (FuncTableSize > 0) {
-        FuncTableStorage.resize(FuncTableSize);
-        
-        for (uint32_t I = 0; I < FuncTableSize; ++I) {
-          const auto *Func = FuncInsts[I];
-          if (Func->isIRJitFunction()) {
-            // IR JIT compiled function - use native pointer
-            FuncTableStorage[I] = Func->getIRJitNativeFunc();
-          } else if (Func->isCompiledFunction()) {
-            // AOT compiled function - use symbol
-            FuncTableStorage[I] = Func->getSymbol().get();
-          } else {
-            // Interpreter or host function - set to nullptr
-            // These require special handling via trampoline (future work)
-            FuncTableStorage[I] = nullptr;
-          }
-        }
-        FuncTable = FuncTableStorage.data();
-      }
-    }
-    
-    // Get globals base (for global.get/set)
-    // Build array of pointers to global values
-    static thread_local std::vector<ValVariant*> GlobalPtrStorage;
-    void *GlobalBase = nullptr;
-    if (ModInst) {
-      auto GlobInsts = ModInst->getGlobalInstances();
-      if (!GlobInsts.empty()) {
-        GlobalPtrStorage.resize(GlobInsts.size());
-        for (size_t I = 0; I < GlobInsts.size(); ++I) {
-          GlobalPtrStorage[I] = const_cast<ValVariant*>(&GlobInsts[I]->getValue());
-        }
-        GlobalBase = reinterpret_cast<void*>(GlobalPtrStorage.data());
-      }
-    }
-    
-    // Get memory instance for memory operations
-    void *MemoryBase = nullptr;
-    if (ModInst) {
-      auto MemInsts = ModInst->getMemoryInstances();
-      if (!MemInsts.empty() && MemInsts[0]) {
-        MemoryBase = MemInsts[0]->getDataPtr();
-      }
-    }
 
-    // Get IR JIT engine (global instance - simplified for POC)
-    static VM::IRJitEngine IREngine;
+    // Get or build cached JIT env (FuncTable, GlobalBase, MemoryBase) for this module
+    IRJitEnvCache &Cache = IRJitEnvCache_[ModInst];
+    const bool needBuild =
+        ModInst &&
+        (Cache.FuncTable.size() != ModInst->getFunctionInstances().size() ||
+         Cache.GlobalPtrs.size() != ModInst->getGlobalInstances().size());
+    if (needBuild) {
+      auto FuncInsts = ModInst->getFunctionInstances();
+      Cache.FuncTable.resize(FuncInsts.size());
+      for (uint32_t I = 0; I < FuncInsts.size(); ++I) {
+        const auto *F = FuncInsts[I];
+        if (F->isIRJitFunction()) {
+          Cache.FuncTable[I] = F->getIRJitNativeFunc();
+        } else if (F->isCompiledFunction()) {
+          Cache.FuncTable[I] = F->getSymbol().get();
+        } else {
+          Cache.FuncTable[I] = nullptr;
+        }
+      }
+      auto GlobInsts = ModInst->getGlobalInstances();
+      Cache.GlobalPtrs.resize(GlobInsts.size());
+      for (size_t I = 0; I < GlobInsts.size(); ++I) {
+        Cache.GlobalPtrs[I] =
+            const_cast<ValVariant *>(&GlobInsts[I]->getValue());
+      }
+      auto MemInsts = ModInst->getMemoryInstances();
+      Cache.MemoryBase =
+          (!MemInsts.empty() && MemInsts[0]) ? MemInsts[0]->getDataPtr() : nullptr;
+    }
+    void **FuncTable =
+        Cache.FuncTable.empty() ? nullptr : Cache.FuncTable.data();
+    uint32_t FuncTableSize =
+        static_cast<uint32_t>(Cache.FuncTable.size());
+    void *GlobalBase =
+        Cache.GlobalPtrs.empty() ? nullptr : Cache.GlobalPtrs.data();
+    void *MemoryBase = Cache.MemoryBase;
+
+    // Use the Executor's single IR JIT engine
+    VM::IRJitEngine &IREngine = getIRJitEngine();
 
     // Set up TLS context for jit_host_call trampoline
     g_jitExecutor = this;
     g_jitStackMgr = &StackMgr;
     g_jitModInst = ModInst;
+    // #region agent log
+    {
+      auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+      char buf[512];
+      std::snprintf(buf, sizeof(buf),
+        "{\"sessionId\":\"d32b78\",\"location\":\"helper.cpp:pre_invoke\",\"message\":\"cache_and_env\",\"data\":{\"FuncTable\":\"%p\",\"FuncTableSize\":%u,\"Ft0\":\"%p\",\"Ft1\":\"%p\",\"NativeFunc\":\"%p\",\"g_jitModInst\":\"%p\"},\"runId\":\"run1\",\"hypothesisId\":\"H1,H5\",\"timestamp\":%lld}\n",
+        (void*)FuncTable, (unsigned)FuncTableSize,
+        FuncTable && FuncTableSize > 0 ? (void*)FuncTable[0] : (void*)0,
+        FuncTable && FuncTableSize > 1 ? (void*)FuncTable[1] : (void*)0,
+        (void*)Func.getIRJitNativeFunc(), (void*)g_jitModInst, (long long)ts);
+      std::ofstream f("/home/tommy/Desktop/wasmedge/.cursor/debug-d32b78.log", std::ios::app); if (f) f << buf; f.close();
+    }
+    // #endregion
     // Modules without a table (e.g. noop) have empty TabInsts; getTabInstByIdx
     // would UB. Use safe getTable and set null when no table.
     if (ModInst) {
@@ -449,7 +553,9 @@ Executor::enterFunction(Runtime::StackManager &StackMgr,
                                MemoryBase);
 
     if (!Res) {
-      spdlog::error(Res.error());
+      if (Res.error() != ErrCode::Value::Terminated) {
+        spdlog::error(Res.error());
+      }
       return Unexpect(Res);
     }
 
