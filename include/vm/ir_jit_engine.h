@@ -57,6 +57,8 @@ struct JitExecEnv {
   void *DirectOrHostFn; // Pointer to jit_direct_or_host (null-safe direct call)
   void *MemoryGrowFn;   // Pointer to jit_memory_grow trampoline
   void *MemorySizeFn;   // Pointer to jit_memory_size trampoline
+  /// 16-byte buffer for ref-return helpers (jit_ref_func, jit_table_get).
+  uint64_t RefResultBuf[2];
 };
 
 /// Host call trampoline: dispatches calls to non-JIT functions (imports)
@@ -78,6 +80,30 @@ extern "C" void *wasmedge_ir_jit_get_termination_buf(void);
 extern "C" int32_t jit_memory_grow(JitExecEnv *env, uint32_t nPages);
 /// memory.size trampoline: returns current memory size in pages.
 extern "C" int32_t jit_memory_size(JitExecEnv *env);
+/// ref.func helper: writes RefVariant for function at funcIdx to env->RefResultBuf.
+extern "C" void jit_ref_func(JitExecEnv *env, uint32_t funcIdx);
+/// table.get: writes table[tableIdx][idx] to env->RefResultBuf. Traps on OOB.
+extern "C" void jit_table_get(JitExecEnv *env, uint32_t tableIdx, uint32_t idx);
+/// table.set: reads RefVariant from refPtr, sets table[tableIdx][idx]. Traps on OOB.
+extern "C" void jit_table_set(JitExecEnv *env, uint32_t tableIdx, uint32_t idx,
+                              const uint64_t *refPtr);
+/// table.size: returns current size of table[tableIdx].
+extern "C" uint32_t jit_table_size(JitExecEnv *env, uint32_t tableIdx);
+/// table.grow: grows table by n, init with ref at refPtr. Returns old size or (uint32_t)-1.
+extern "C" uint32_t jit_table_grow(JitExecEnv *env, uint32_t tableIdx,
+                                   uint32_t n, const uint64_t *refPtr);
+/// table.fill: fills table[tableIdx][offset..offset+len-1] with ref at refPtr. Traps on OOB.
+extern "C" void jit_table_fill(JitExecEnv *env, uint32_t tableIdx,
+                               uint32_t offset, uint32_t len, const uint64_t *refPtr);
+/// table.copy: copies len refs from srcTable[src] to dstTable[dst]. Traps on OOB.
+extern "C" void jit_table_copy(JitExecEnv *env, uint32_t dstTableIdx,
+                               uint32_t srcTableIdx, uint32_t dst, uint32_t src,
+                               uint32_t len);
+/// table.init: copies len refs from elem[elemIdx][src] to table[tableIdx][dst]. Traps on OOB.
+extern "C" void jit_table_init(JitExecEnv *env, uint32_t tableIdx, uint32_t elemIdx,
+                               uint32_t dst, uint32_t src, uint32_t len);
+/// elem.drop: clears element segment elemIdx.
+extern "C" void jit_elem_drop(JitExecEnv *env, uint32_t elemIdx);
 
 /// IR JIT Engine - compiles and executes IR code
 class IRJitEngine {

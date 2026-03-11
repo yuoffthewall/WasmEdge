@@ -44,6 +44,24 @@
 
 #ifdef WASMEDGE_BUILD_IR_JIT
 #include "vm/ir_jit_engine.h"
+// Forward declare JIT table helpers in global namespace so friend declarations resolve.
+namespace WasmEdge { namespace VM { struct JitExecEnv; } }
+extern "C" {
+uint64_t jit_host_call(WasmEdge::VM::JitExecEnv *, uint32_t, uint64_t *);
+void jit_table_get(WasmEdge::VM::JitExecEnv *, uint32_t, uint32_t);
+void jit_table_set(WasmEdge::VM::JitExecEnv *, uint32_t, uint32_t,
+                   const uint64_t *);
+uint32_t jit_table_size(WasmEdge::VM::JitExecEnv *, uint32_t);
+uint32_t jit_table_grow(WasmEdge::VM::JitExecEnv *, uint32_t, uint32_t,
+                        const uint64_t *);
+void jit_table_fill(WasmEdge::VM::JitExecEnv *, uint32_t, uint32_t, uint32_t,
+                    const uint64_t *);
+void jit_table_copy(WasmEdge::VM::JitExecEnv *, uint32_t, uint32_t,
+                    uint32_t, uint32_t, uint32_t);
+void jit_table_init(WasmEdge::VM::JitExecEnv *, uint32_t, uint32_t,
+                    uint32_t, uint32_t, uint32_t);
+void jit_elem_drop(WasmEdge::VM::JitExecEnv *, uint32_t);
+}
 #endif
 
 namespace WasmEdge {
@@ -131,6 +149,25 @@ private:
 
 /// Executor flow control class.
 class Executor {
+  /// IR JIT table/elem helpers and jit_host_call need getTabInstByIdx/getElemInstByIdx.
+#ifdef WASMEDGE_BUILD_IR_JIT
+  friend uint64_t ::jit_host_call(WasmEdge::VM::JitExecEnv *, uint32_t,
+                                  uint64_t *);
+  friend void ::jit_table_get(WasmEdge::VM::JitExecEnv *, uint32_t, uint32_t);
+  friend void ::jit_table_set(WasmEdge::VM::JitExecEnv *, uint32_t, uint32_t,
+                              const uint64_t *);
+  friend uint32_t ::jit_table_size(WasmEdge::VM::JitExecEnv *, uint32_t);
+  friend uint32_t ::jit_table_grow(WasmEdge::VM::JitExecEnv *, uint32_t,
+                                   uint32_t, const uint64_t *);
+  friend void ::jit_table_fill(WasmEdge::VM::JitExecEnv *, uint32_t, uint32_t,
+                              uint32_t, const uint64_t *);
+  friend void ::jit_table_copy(WasmEdge::VM::JitExecEnv *, uint32_t, uint32_t,
+                               uint32_t, uint32_t, uint32_t);
+  friend void ::jit_table_init(WasmEdge::VM::JitExecEnv *, uint32_t, uint32_t,
+                               uint32_t, uint32_t, uint32_t);
+  friend void ::jit_elem_drop(WasmEdge::VM::JitExecEnv *, uint32_t);
+#endif
+
 public:
   Executor(const Configure &Conf, Statistics::Statistics *S = nullptr) noexcept
       : Conf(Conf) {

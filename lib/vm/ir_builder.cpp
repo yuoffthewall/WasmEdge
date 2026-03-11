@@ -597,6 +597,23 @@ Expect<void> WasmToIRBuilder::visitInstruction(const AST::Instruction &Instr) {
   case OpCode::I64__trunc_sat_f64_u:
     return visitConversion(Op);
 
+  // Reference types
+  case OpCode::Ref__null:
+  case OpCode::Ref__is_null:
+  case OpCode::Ref__func:
+    return visitRefType(Instr);
+
+  // Table operations
+  case OpCode::Table__get:
+  case OpCode::Table__set:
+  case OpCode::Table__size:
+  case OpCode::Table__grow:
+  case OpCode::Table__fill:
+  case OpCode::Table__copy:
+  case OpCode::Table__init:
+  case OpCode::Elem__drop:
+    return visitTable(Instr);
+
   // Bulk memory operations
   case OpCode::Memory__copy: {
     // memory.copy: dst, src, n -> copies n bytes from src to dst
@@ -1619,6 +1636,161 @@ Expect<void> WasmToIRBuilder::visitMemory(const AST::Instruction &Instr) {
   return {};
 }
 
+Expect<void> WasmToIRBuilder::visitRefType(const AST::Instruction &Instr) {
+  OpCode Op = Instr.getOpCode();
+  ir_ctx *ctx = &Ctx;
+
+  switch (Op) {
+  case OpCode::Ref__null: {
+    // Push null ref: RefVariant(type, nullptr) as two i64 slots (type, ptr).
+    WasmEdge::RefVariant rv(Instr.getValType());
+    WasmEdge::uint64x2_t raw = rv.getRawData();
+    pushRef(ir_CONST_I64(static_cast<int64_t>(raw[0])),
+            ir_CONST_I64(static_cast<int64_t>(raw[1])));
+    return {};
+  }
+  case OpCode::Ref__is_null: {
+    auto [PtrRef, TypeRef] = popRef();
+    // ref.is_null: 1 if ptr is null, else 0. ir_EQ returns BOOL; convert to i32.
+    ir_ref PtrI32 = ir_TRUNC_I32(ensureValidRef(PtrRef, IR_I64));
+    ir_ref Cmp = ir_EQ(PtrI32, ir_CONST_I32(0));
+    push(ir_COND(IR_I32, Cmp, ir_CONST_I32(1), ir_CONST_I32(0)));
+    return {};
+  }
+  case OpCode::Ref__func: {
+    // Call jit_ref_func(env, funcIdx); result written to env->RefResultBuf. Load and push.
+    uint32_t funcIdx = Instr.getTargetIndex();
+    ir_ref EnvPtrVal = ensureValidRef(EnvPtr, IR_ADDR);
+    ir_ref ResultBuf =
+        ir_ADD_A(EnvPtrVal, ir_CONST_ADDR(offsetof(JitExecEnv, RefResultBuf)));
+    uint8_t ProtoParams[2] = {IR_ADDR, IR_U32};
+    ir_ref Proto = ir_proto(ctx, IR_FASTCALL_FUNC, IR_VOID, 2, ProtoParams);
+    ir_ref Fn = ir_const_func_addr(ctx, (uintptr_t)&jit_ref_func, Proto);
+    ir_CALL_2(IR_VOID, Fn, EnvPtrVal, ir_CONST_I32(static_cast<int32_t>(funcIdx)));
+    ir_ref TypePart = ir_LOAD_I64(ResultBuf);
+    ir_ref PtrPart =
+        ir_LOAD_I64(ir_ADD_A(ResultBuf, ir_CONST_ADDR(sizeof(uint64_t))));
+    pushRef(TypePart, PtrPart);
+    return {};
+  }
+  default:
+    return Unexpect(ErrCode::Value::RuntimeError);
+  }
+}
+
+Expect<void> WasmToIRBuilder::visitTable(const AST::Instruction &Instr) {
+  OpCode Op = Instr.getOpCode();
+  ir_ctx *ctx = &Ctx;
+  uint32_t tableIdx = Instr.getTargetIndex();
+  uint32_t elemIdx = Instr.getSourceIndex();
+  ir_ref EnvPtrVal = ensureValidRef(EnvPtr, IR_ADDR);
+  ir_ref ResultBuf =
+      ir_ADD_A(EnvPtrVal, ir_CONST_ADDR(offsetof(JitExecEnv, RefResultBuf)));
+
+  switch (Op) {
+  case OpCode::Table__get: {
+    ir_ref Idx = ensureValidRef(pop(), IR_I32);
+    uint8_t ProtoParams[3] = {IR_ADDR, IR_U32, IR_U32};
+    ir_ref Proto = ir_proto(ctx, IR_FASTCALL_FUNC, IR_VOID, 3, ProtoParams);
+    ir_ref Fn = ir_const_func_addr(ctx, (uintptr_t)&jit_table_get, Proto);
+    ir_CALL_3(IR_VOID, Fn, EnvPtrVal, ir_CONST_I32(static_cast<int32_t>(tableIdx)),
+              ir_ZEXT_U32(Idx));
+    pushRef(ir_LOAD_I64(ResultBuf),
+            ir_LOAD_I64(ir_ADD_A(ResultBuf, ir_CONST_ADDR(sizeof(uint64_t)))));
+    return {};
+  }
+  case OpCode::Table__set: {
+    auto [PtrRef, TypeRef] = popRef();
+    ir_ref Idx = ensureValidRef(pop(), IR_I32);
+    // Store ref to a temp (ResultBuf), then call jit_table_set(env, tableIdx, idx, buf).
+    ir_STORE(ResultBuf, TypeRef);
+    ir_STORE(ir_ADD_A(ResultBuf, ir_CONST_ADDR(sizeof(uint64_t))), PtrRef);
+    uint8_t ProtoParams[4] = {IR_ADDR, IR_U32, IR_U32, IR_ADDR};
+    ir_ref Proto = ir_proto(ctx, IR_FASTCALL_FUNC, IR_VOID, 4, ProtoParams);
+    ir_ref Fn = ir_const_func_addr(ctx, (uintptr_t)&jit_table_set, Proto);
+    ir_CALL_4(IR_VOID, Fn, EnvPtrVal,
+              ir_CONST_I32(static_cast<int32_t>(tableIdx)), ir_ZEXT_U32(Idx),
+              ResultBuf);
+    return {};
+  }
+  case OpCode::Table__size: {
+    uint8_t ProtoParams[2] = {IR_ADDR, IR_U32};
+    ir_ref Proto = ir_proto(ctx, IR_FASTCALL_FUNC, IR_I32, 2, ProtoParams);
+    ir_ref Fn = ir_const_func_addr(ctx, (uintptr_t)&jit_table_size, Proto);
+    ir_ref Result = ir_CALL_2(IR_I32, Fn, EnvPtrVal,
+                              ir_CONST_I32(static_cast<int32_t>(tableIdx)));
+    push(Result);
+    return {};
+  }
+  case OpCode::Table__grow: {
+    auto [PtrRef, TypeRef] = popRef();
+    ir_ref N = ensureValidRef(pop(), IR_I32);
+    ir_STORE(ResultBuf, TypeRef);
+    ir_STORE(ir_ADD_A(ResultBuf, ir_CONST_ADDR(sizeof(uint64_t))), PtrRef);
+    uint8_t ProtoParams[4] = {IR_ADDR, IR_U32, IR_U32, IR_ADDR};
+    ir_ref Proto = ir_proto(ctx, IR_FASTCALL_FUNC, IR_I32, 4, ProtoParams);
+    ir_ref Fn = ir_const_func_addr(ctx, (uintptr_t)&jit_table_grow, Proto);
+    ir_ref Result = ir_CALL_4(IR_I32, Fn, EnvPtrVal,
+                              ir_CONST_I32(static_cast<int32_t>(tableIdx)),
+                              ir_ZEXT_U32(N), ResultBuf);
+    push(Result);
+    return {};
+  }
+  case OpCode::Table__fill: {
+    ir_ref Len = ensureValidRef(pop(), IR_I32);
+    auto [PtrRef, TypeRef] = popRef();
+    ir_ref Off = ensureValidRef(pop(), IR_I32);
+    ir_STORE(ResultBuf, TypeRef);
+    ir_STORE(ir_ADD_A(ResultBuf, ir_CONST_ADDR(sizeof(uint64_t))), PtrRef);
+    uint8_t ProtoParams[5] = {IR_ADDR, IR_U32, IR_U32, IR_U32, IR_ADDR};
+    ir_ref Proto = ir_proto(ctx, IR_FASTCALL_FUNC, IR_VOID, 5, ProtoParams);
+    ir_ref Fn = ir_const_func_addr(ctx, (uintptr_t)&jit_table_fill, Proto);
+    ir_CALL_5(IR_VOID, Fn, EnvPtrVal,
+              ir_CONST_I32(static_cast<int32_t>(tableIdx)), ir_ZEXT_U32(Off),
+              ir_ZEXT_U32(Len), ResultBuf);
+    return {};
+  }
+  case OpCode::Table__copy: {
+    uint32_t dstTableIdx = tableIdx;
+    uint32_t srcTableIdx = elemIdx;  // getSourceIndex() is src table for copy
+    ir_ref Len = ensureValidRef(pop(), IR_I32);
+    ir_ref Src = ensureValidRef(pop(), IR_I32);
+    ir_ref Dst = ensureValidRef(pop(), IR_I32);
+    uint8_t ProtoParams[6] = {IR_ADDR, IR_U32, IR_U32, IR_U32, IR_U32, IR_U32};
+    ir_ref Proto = ir_proto(ctx, IR_FASTCALL_FUNC, IR_VOID, 6, ProtoParams);
+    ir_ref Fn = ir_const_func_addr(ctx, (uintptr_t)&jit_table_copy, Proto);
+    ir_CALL_6(IR_VOID, Fn, EnvPtrVal,
+              ir_CONST_I32(static_cast<int32_t>(dstTableIdx)),
+              ir_CONST_I32(static_cast<int32_t>(srcTableIdx)), ir_ZEXT_U32(Dst),
+              ir_ZEXT_U32(Src), ir_ZEXT_U32(Len));
+    return {};
+  }
+  case OpCode::Table__init: {
+    ir_ref Len = ensureValidRef(pop(), IR_I32);
+    ir_ref Src = ensureValidRef(pop(), IR_I32);
+    ir_ref Dst = ensureValidRef(pop(), IR_I32);
+    uint8_t ProtoParams[6] = {IR_ADDR, IR_U32, IR_U32, IR_U32, IR_U32, IR_U32};
+    ir_ref Proto = ir_proto(ctx, IR_FASTCALL_FUNC, IR_VOID, 6, ProtoParams);
+    ir_ref Fn = ir_const_func_addr(ctx, (uintptr_t)&jit_table_init, Proto);
+    ir_CALL_6(IR_VOID, Fn, EnvPtrVal,
+              ir_CONST_I32(static_cast<int32_t>(tableIdx)),
+              ir_CONST_I32(static_cast<int32_t>(elemIdx)), ir_ZEXT_U32(Dst),
+              ir_ZEXT_U32(Src), ir_ZEXT_U32(Len));
+    return {};
+  }
+  case OpCode::Elem__drop: {
+    uint8_t ProtoParams[2] = {IR_ADDR, IR_U32};
+    ir_ref Proto = ir_proto(ctx, IR_FASTCALL_FUNC, IR_VOID, 2, ProtoParams);
+    ir_ref Fn = ir_const_func_addr(ctx, (uintptr_t)&jit_elem_drop, Proto);
+    ir_CALL_2(IR_VOID, Fn, EnvPtrVal,
+              ir_CONST_I32(static_cast<int32_t>(Instr.getTargetIndex())));
+    return {};
+  }
+  default:
+    return Unexpect(ErrCode::Value::RuntimeError);
+  }
+}
+
 Expect<void> WasmToIRBuilder::visitControl(const AST::Instruction &Instr) {
   OpCode Op = Instr.getOpCode();
 
@@ -1773,6 +1945,7 @@ Expect<void> WasmToIRBuilder::visitBlock(const AST::Instruction &Instr) {
   if (!BType.isEmpty() && BType.isValType()) {
     Label.Arity = 1;
     Label.ResultType = wasmTypeToIRType(BType.getValType());
+    Label.ResultIsRef = BType.getValType().isRefType();
   } else {
     Label.Arity = 0;
     Label.ResultType = IR_VOID;
@@ -1805,6 +1978,7 @@ Expect<void> WasmToIRBuilder::visitLoop(const AST::Instruction &Instr) {
   if (!BType.isEmpty() && BType.isValType()) {
     Label.Arity = 1;
     Label.ResultType = wasmTypeToIRType(BType.getValType());
+    Label.ResultIsRef = BType.getValType().isRefType();
   } else {
     Label.Arity = 0;
     Label.ResultType = IR_VOID;
@@ -1877,6 +2051,7 @@ Expect<void> WasmToIRBuilder::visitIf(const AST::Instruction &Instr) {
   if (!BType.isEmpty() && BType.isValType()) {
     Label.Arity = 1;
     Label.ResultType = wasmTypeToIRType(BType.getValType());
+    Label.ResultIsRef = BType.getValType().isRefType();
   } else {
     Label.Arity = 0;
     Label.ResultType = IR_VOID;
@@ -1912,8 +2087,13 @@ Expect<void> WasmToIRBuilder::visitElse(const AST::Instruction &) {
   
   // Save result value from true branch (if there's a result type and branch didn't terminate)
   if (Label.Arity > 0 && !CurrentPathTerminated) {
-    ir_ref TrueResult = pop();  // Pop the result value
-    Label.BranchResults.push_back(TrueResult);
+    if (Label.ResultIsRef) {
+      auto [ptrRef, typeRef] = popRef();
+      Label.RefBranchResults.push_back({typeRef, ptrRef});
+    } else {
+      ir_ref TrueResult = pop();
+      Label.BranchResults.push_back(TrueResult);
+    }
   }
   
   // Save the true branch's locals state (for PHI creation at merge)
@@ -1959,6 +2139,14 @@ Expect<void> WasmToIRBuilder::visitEnd(const AST::Instruction &) {
     // Block end: merge all branches that targeted this block
     // Only add current path's END if it wasn't already terminated
     if (!CurrentPathTerminated) {
+      if (Label.Arity > 0) {
+        if (Label.ResultIsRef) {
+          auto [ptrRef, typeRef] = popRef();
+          Label.RefBranchResults.push_back({typeRef, ptrRef});
+        } else {
+          Label.BranchResults.push_back(pop());
+        }
+      }
       ir_ref CurrentEnd = ir_END();
       Label.EndList.push_back(CurrentEnd);
       Label.EndLocals.push_back(Locals);  // Save current Locals
@@ -1971,6 +2159,13 @@ Expect<void> WasmToIRBuilder::visitEnd(const AST::Instruction &) {
       if (!Label.EndLocals.empty()) {
         Locals = Label.EndLocals[0];
       }
+      if (Label.Arity > 0) {
+        if (Label.ResultIsRef && !Label.RefBranchResults.empty()) {
+          pushRef(Label.RefBranchResults[0].first, Label.RefBranchResults[0].second);
+        } else if (!Label.BranchResults.empty()) {
+          push(Label.BranchResults[0]);
+        }
+      }
       CurrentPathTerminated = false;
     } else if (Label.EndList.size() == 2) {
       ir_MERGE_2(Label.EndList[0], Label.EndList[1]);
@@ -1979,11 +2174,36 @@ Expect<void> WasmToIRBuilder::visitEnd(const AST::Instruction &) {
       } else if (!Label.EndLocals.empty()) {
         Locals = Label.EndLocals[0];
       }
+      if (Label.Arity > 0 && Label.RefBranchResults.size() == 2) {
+        ir_ref PhiType = ir_PHI_2(IR_I64, Label.RefBranchResults[0].first,
+                                  Label.RefBranchResults[1].first);
+        ir_ref PhiPtr = ir_PHI_2(IR_I64, Label.RefBranchResults[0].second,
+                                 Label.RefBranchResults[1].second);
+        pushRef(PhiType, PhiPtr);
+      } else if (Label.Arity > 0 && Label.BranchResults.size() == 2) {
+        mergeResults(Label.BranchResults, Label.ResultType);
+      }
       CurrentPathTerminated = false;
     } else if (Label.EndList.size() > 2) {
       ir_MERGE_N(static_cast<ir_ref>(Label.EndList.size()), Label.EndList.data());
       if (!Label.EndLocals.empty()) {
         Locals = mergeLocals(Label.EndLocals);
+      }
+      if (Label.Arity > 0 && Label.RefBranchResults.size() == Label.EndList.size()) {
+        std::vector<ir_ref> TypeVals, PtrVals;
+        for (const auto &p : Label.RefBranchResults) {
+          TypeVals.push_back(p.first);
+          PtrVals.push_back(p.second);
+        }
+        ir_ref PhiType = (TypeVals.size() == 2)
+            ? ir_PHI_2(IR_I64, TypeVals[0], TypeVals[1])
+            : ir_PHI_N(IR_I64, static_cast<ir_ref>(TypeVals.size()), TypeVals.data());
+        ir_ref PhiPtr = (PtrVals.size() == 2)
+            ? ir_PHI_2(IR_I64, PtrVals[0], PtrVals[1])
+            : ir_PHI_N(IR_I64, static_cast<ir_ref>(PtrVals.size()), PtrVals.data());
+        pushRef(PhiType, PhiPtr);
+      } else if (Label.Arity > 0 && Label.BranchResults.size() == Label.EndList.size()) {
+        mergeResults(Label.BranchResults, Label.ResultType);
       }
       CurrentPathTerminated = false;
     }
@@ -2087,8 +2307,13 @@ Expect<void> WasmToIRBuilder::visitEnd(const AST::Instruction &) {
     
     // Save result value from current branch (if there's a result type and branch didn't terminate)
     if (Label.Arity > 0 && !CurrentPathTerminated) {
-      ir_ref BranchResult = pop();  // Pop the result value
-      Label.BranchResults.push_back(BranchResult);
+      if (Label.ResultIsRef) {
+        auto [ptrRef, typeRef] = popRef();
+        Label.RefBranchResults.push_back({typeRef, ptrRef});
+      } else {
+        ir_ref BranchResult = pop();
+        Label.BranchResults.push_back(BranchResult);
+      }
     }
     
     // Only add current end if branch didn't terminate
@@ -2106,20 +2331,22 @@ Expect<void> WasmToIRBuilder::visitEnd(const AST::Instruction &) {
       Label.EndLocals.push_back(Label.PreIfLocals);
       
       if (Label.Arity > 0) {
-        // Need a default value for the "no else" case
-        // This shouldn't happen in well-formed Wasm with result types
-        // but provide a default just in case
-        ir_ref DefaultVal = IR_UNUSED;
-        if (Label.ResultType == IR_I32) {
-          DefaultVal = ir_CONST_I32(0);
-        } else if (Label.ResultType == IR_I64) {
-          DefaultVal = ir_CONST_I64(0);
-        } else if (Label.ResultType == IR_FLOAT) {
-          DefaultVal = ir_CONST_FLOAT(0.0f);
-        } else if (Label.ResultType == IR_DOUBLE) {
-          DefaultVal = ir_CONST_DOUBLE(0.0);
+        if (Label.ResultIsRef) {
+          // Default null ref (type part, ptr part)
+          Label.RefBranchResults.push_back({ir_CONST_I64(0), ir_CONST_I64(0)});
+        } else {
+          ir_ref DefaultVal = IR_UNUSED;
+          if (Label.ResultType == IR_I32) {
+            DefaultVal = ir_CONST_I32(0);
+          } else if (Label.ResultType == IR_I64) {
+            DefaultVal = ir_CONST_I64(0);
+          } else if (Label.ResultType == IR_FLOAT) {
+            DefaultVal = ir_CONST_FLOAT(0.0f);
+          } else if (Label.ResultType == IR_DOUBLE) {
+            DefaultVal = ir_CONST_DOUBLE(0.0);
+          }
+          Label.BranchResults.push_back(DefaultVal);
         }
-        Label.BranchResults.push_back(DefaultVal);
       }
       ir_ref FalseEnd = ir_END();
       Label.EndList.push_back(FalseEnd);
@@ -2130,13 +2357,15 @@ Expect<void> WasmToIRBuilder::visitEnd(const AST::Instruction &) {
       // Single path continuing
       ir_BEGIN(Label.EndList[0]);
       CurrentPathTerminated = false;
-      // Use that path's locals directly
       if (!Label.EndLocals.empty()) {
         Locals = Label.EndLocals[0];
       }
-      // Push single result value
-      if (Label.Arity > 0 && !Label.BranchResults.empty()) {
-        push(Label.BranchResults[0]);
+      if (Label.Arity > 0) {
+        if (Label.ResultIsRef && !Label.RefBranchResults.empty()) {
+          pushRef(Label.RefBranchResults[0].first, Label.RefBranchResults[0].second);
+        } else if (!Label.BranchResults.empty()) {
+          push(Label.BranchResults[0]);
+        }
       }
     } else if (Label.EndList.size() >= 2) {
       if (Label.EndList.size() == 2) {
@@ -2148,8 +2377,23 @@ Expect<void> WasmToIRBuilder::visitEnd(const AST::Instruction &) {
       if (!Label.EndLocals.empty()) {
         Locals = mergeLocals(Label.EndLocals);
       }
-      if (Label.Arity > 0 && Label.BranchResults.size() == Label.EndList.size()) {
+      if (Label.Arity > 0 && Label.BranchResults.size() == Label.EndList.size() &&
+          !Label.ResultIsRef) {
         mergeResults(Label.BranchResults, Label.ResultType);
+      } else if (Label.Arity > 0 && Label.RefBranchResults.size() == Label.EndList.size()) {
+        // Merge ref results: two PHIs (type and ptr)
+        std::vector<ir_ref> TypeVals, PtrVals;
+        for (const auto &p : Label.RefBranchResults) {
+          TypeVals.push_back(p.first);
+          PtrVals.push_back(p.second);
+        }
+        ir_ref PhiType = (TypeVals.size() == 2)
+            ? ir_PHI_2(IR_I64, TypeVals[0], TypeVals[1])
+            : ir_PHI_N(IR_I64, static_cast<ir_ref>(TypeVals.size()), TypeVals.data());
+        ir_ref PhiPtr = (PtrVals.size() == 2)
+            ? ir_PHI_2(IR_I64, PtrVals[0], PtrVals[1])
+            : ir_PHI_N(IR_I64, static_cast<ir_ref>(PtrVals.size()), PtrVals.data());
+        pushRef(PhiType, PhiPtr);
       }
     }
     // else: no live paths (shouldn't happen if we handled both-terminated case above)
@@ -2175,6 +2419,14 @@ Expect<void> WasmToIRBuilder::visitBr(const AST::Instruction &Instr) {
   if (Target.Kind == ControlKind::Loop) {
     emitLoopBackEdge(Target);
   } else {
+    if (Target.Arity > 0) {
+      if (Target.ResultIsRef) {
+        auto [ptrRef, typeRef] = popRef();
+        Target.RefBranchResults.push_back({typeRef, ptrRef});
+      } else {
+        Target.BranchResults.push_back(pop());
+      }
+    }
     ir_ref BrEnd = ir_END();
     Target.EndList.push_back(BrEnd);
     Target.EndLocals.push_back(Locals);
@@ -2206,6 +2458,14 @@ Expect<void> WasmToIRBuilder::visitBrIf(const AST::Instruction &Instr) {
   if (Target.Kind == ControlKind::Loop) {
     emitLoopBackEdge(Target);
   } else {
+    if (Target.Arity > 0) {
+      if (Target.ResultIsRef) {
+        auto [ptrRef, typeRef] = popRef();
+        Target.RefBranchResults.push_back({typeRef, ptrRef});
+      } else {
+        Target.BranchResults.push_back(pop());
+      }
+    }
     ir_ref BrEnd = ir_END();
     Target.EndList.push_back(BrEnd);
     Target.EndLocals.push_back(Locals);
@@ -2261,6 +2521,14 @@ Expect<void> WasmToIRBuilder::visitBrTable(const AST::Instruction &Instr) {
     if (Target.Kind == ControlKind::Loop) {
       emitLoopBackEdge(Target);
     } else {
+      if (Target.Arity > 0) {
+        if (Target.ResultIsRef) {
+          auto [ptrRef, typeRef] = popRef();
+          Target.RefBranchResults.push_back({typeRef, ptrRef});
+        } else {
+          Target.BranchResults.push_back(pop());
+        }
+      }
       ir_ref BrEnd = ir_END();
       Target.EndList.push_back(BrEnd);
       Target.EndLocals.push_back(Locals);
@@ -2275,6 +2543,14 @@ Expect<void> WasmToIRBuilder::visitBrTable(const AST::Instruction &Instr) {
   if (DefaultTarget.Kind == ControlKind::Loop) {
     emitLoopBackEdge(DefaultTarget);
   } else {
+    if (DefaultTarget.Arity > 0) {
+      if (DefaultTarget.ResultIsRef) {
+        auto [ptrRef, typeRef] = popRef();
+        DefaultTarget.RefBranchResults.push_back({typeRef, ptrRef});
+      } else {
+        DefaultTarget.BranchResults.push_back(pop());
+      }
+    }
     ir_ref BrEnd = ir_END();
     DefaultTarget.EndList.push_back(BrEnd);
     DefaultTarget.EndLocals.push_back(Locals);

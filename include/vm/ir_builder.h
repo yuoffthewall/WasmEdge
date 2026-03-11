@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <utility>
 #include <vector>
 
 // Include IR library headers
@@ -102,8 +103,10 @@ private:
     std::vector<ir_ref> EndList;  // List of ir_END() refs to merge at end
     std::vector<std::map<uint32_t, ir_ref>> EndLocals;  // Locals state at each EndList entry
     std::vector<ir_ref> BranchResults; // Result values from each branch (for result types)
+    std::vector<std::pair<ir_ref, ir_ref>> RefBranchResults; // When result is ref: (type, ptr) per branch
     uint32_t Arity;            // Number of values expected at branch (0 or 1)
     ir_type ResultType;        // IR type of result (IR_VOID if no result)
+    bool ResultIsRef = false;  // True when block/if result type is ref (two stack slots)
     uint32_t StackBase;        // Stack base for this label
     bool InElseBranch;         // For if: are we in the else branch?
     bool HasElse;              // For if: does this have an else clause?
@@ -128,6 +131,18 @@ private:
   ir_ref pop() noexcept;
   ir_ref peek(uint32_t Depth = 0) const noexcept;
 
+  /// Ref (RefVariant) as two stack slots: type (first), ptr (second). Match RefVariant layout.
+  void pushRef(ir_ref TypeRef, ir_ref PtrRef) noexcept {
+    push(TypeRef);
+    push(PtrRef);
+  }
+  /// Pops ptr then type (reverse of pushRef). Returns (PtrRef, TypeRef).
+  std::pair<ir_ref, ir_ref> popRef() noexcept {
+    ir_ref PtrRef = pop();
+    ir_ref TypeRef = pop();
+    return {PtrRef, TypeRef};
+  }
+
   /// Process single instruction
   Expect<void> visitInstruction(const AST::Instruction &Instr);
 
@@ -143,6 +158,8 @@ private:
   Expect<void> visitMemory(const AST::Instruction &Instr);
   Expect<void> visitControl(const AST::Instruction &Instr);
   Expect<void> visitCall(const AST::Instruction &Instr);
+  Expect<void> visitRefType(const AST::Instruction &Instr);
+  Expect<void> visitTable(const AST::Instruction &Instr);
 
   /// Control flow helpers
   Expect<void> visitBlock(const AST::Instruction &Instr);

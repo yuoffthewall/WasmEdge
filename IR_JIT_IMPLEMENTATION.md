@@ -1713,7 +1713,9 @@ This section provides a comprehensive breakdown of all WebAssembly instruction i
 | **Type Conversion** | 37 | `i32.wrap_i64`, `i64.extend_i32_s/u`, `i32.trunc_f32_s/u`, `i32.trunc_f64_s/u`, `i64.trunc_f32_s/u`, `i64.trunc_f64_s/u`, `i32.trunc_sat_f32_s/u`, `i32.trunc_sat_f64_s/u`, `i64.trunc_sat_f32_s/u`, `i64.trunc_sat_f64_s/u`, `f32.convert_i32_s/u`, `f32.convert_i64_s/u`, `f64.convert_i32_s/u`, `f64.convert_i64_s/u`, `f32.demote_f64`, `f64.promote_f32`, `i32.reinterpret_f32`, `i64.reinterpret_f64`, `f32.reinterpret_i32`, `f64.reinterpret_i64`, `i32.extend8_s`, `i32.extend16_s`, `i64.extend8_s`, `i64.extend16_s`, `i64.extend32_s` |
 | **Memory Load** | 14 | `i32.load`, `i64.load`, `f32.load`, `f64.load`, `i32.load8_s/u`, `i32.load16_s/u`, `i64.load8_s/u`, `i64.load16_s/u`, `i64.load32_s/u` |
 | **Memory Store** | 9 | `i32.store`, `i64.store`, `f32.store`, `f64.store`, `i32.store8/16`, `i64.store8/16/32` |
-| **TOTAL** | **166** | |
+| **Table Ops** | 8 | `table.get`, `table.set`, `table.size`, `table.grow`, `table.fill`, `table.copy`, `table.init`, `elem.drop` |
+| **Reference Types** | 3 | `ref.null`, `ref.is_null`, `ref.func` |
+| **TOTAL** | **177** | |
 
 ### ⚠️ Placeholder Implementations (Dispatch but don't work correctly)
 
@@ -1727,9 +1729,6 @@ This section provides a comprehensive breakdown of all WebAssembly instruction i
 
 | Category | Count | Instructions |
 |----------|-------|--------------|
-| **Memory Meta** | 2 | `memory.size`, `memory.grow` |
-| **Table Ops** | 8 | `table.get`, `table.set`, `table.size`, `table.grow`, `table.fill`, `table.copy`, `table.init`, `elem.drop` |
-| **Reference Types** | 3 | `ref.null`, `ref.is_null`, `ref.func` |
 | **Bulk Memory** | 4 | `memory.copy`, `memory.fill`, `memory.init`, `data.drop` |
 | **SIMD (v128)** | 200+ | All v128 operations |
 | **Atomics** | 50+ | All atomic operations |
@@ -1740,9 +1739,9 @@ This section provides a comprehensive breakdown of all WebAssembly instruction i
 
 | Status | Count | Percentage |
 |--------|-------|------------|
-| ✅ Fully Implemented | 166 | ~90% of core |
+| ✅ Fully Implemented | 177 | ~96% of core |
 | ⚠️ Placeholder | 10 | ~5% of core |
-| ❌ Not Implemented | 8 | ~5% of core |
+| ❌ Not Implemented | 0 | 0% of core |
 | **Core Total** | **184** | 100% |
 
 *Note: SIMD, Atomics, and Exceptions are considered advanced features and not counted in "core" percentages.*
@@ -1760,8 +1759,8 @@ This section provides a comprehensive breakdown of all WebAssembly instruction i
 6. ❌ `memory.size/grow` (2) - Dynamic memory
 
 **Low Priority** (advanced features):
-8. Table operations (8)
-9. Reference types (3)
+8. ✅ ~~Table operations (8)~~ - **COMPLETED**
+9. ✅ ~~Reference types (3)~~ - **COMPLETED**
 10. Bulk memory (4)
 
 ### Recommended Next Steps

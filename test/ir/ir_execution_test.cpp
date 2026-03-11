@@ -1550,6 +1550,39 @@ TEST_F(IRExecutionTest, Global_I64) {
 }
 
 //==============================================================================
+// Reference Types Execution Tests
+//==============================================================================
+
+// Test: ref.null (funcref), ref.is_null -> 1 (null ref is null)
+TEST_F(IRExecutionTest, Ref_Null_IsNull_ReturnsOne) {
+  std::vector<AST::Instruction> Instrs;
+  Instrs.emplace_back(OpCode::Ref__null);
+  Instrs.back().setValType(ValType(TypeCode::FuncRef));
+  Instrs.emplace_back(OpCode::Ref__is_null);
+  Instrs.emplace_back(OpCode::End);
+
+  void* Func = buildCustomFunc({}, {ValType(TypeCode::I32)}, {}, Instrs);
+  ASSERT_NE(Func, nullptr) << "Failed to compile ref.null + ref.is_null";
+  EXPECT_EQ(execI32NoParams(Func), 1);
+}
+
+// Test: ref in block with result - ref.null in block, ref.is_null -> 1
+TEST_F(IRExecutionTest, Ref_BlockResult_IsNull) {
+  std::vector<AST::Instruction> Instrs;
+  Instrs.emplace_back(OpCode::Block);
+  Instrs.back().getBlockType() = BlockType(ValType(TypeCode::FuncRef));
+  Instrs.emplace_back(OpCode::Ref__null);
+  Instrs.back().setValType(ValType(TypeCode::FuncRef));
+  Instrs.emplace_back(OpCode::End);
+  Instrs.emplace_back(OpCode::Ref__is_null);
+  Instrs.emplace_back(OpCode::End);
+
+  void* Func = buildCustomFunc({}, {ValType(TypeCode::I32)}, {}, Instrs);
+  ASSERT_NE(Func, nullptr) << "Failed to compile block (ref) + ref.is_null";
+  EXPECT_EQ(execI32NoParams(Func), 1);
+}
+
+//==============================================================================
 // Memory Operations Execution Tests
 //
 // These tests verify that memory load/store operations work correctly.

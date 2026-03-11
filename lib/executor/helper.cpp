@@ -23,7 +23,6 @@
 static thread_local WasmEdge::Executor::Executor *g_jitExecutor = nullptr;
 static thread_local WasmEdge::Runtime::StackManager *g_jitStackMgr = nullptr;
 static thread_local const WasmEdge::Runtime::Instance::ModuleInstance *g_jitModInst = nullptr;
-static thread_local WasmEdge::Runtime::Instance::TableInstance *g_jitTable0 = nullptr;
 static thread_local WasmEdge::Runtime::Instance::MemoryInstance *g_jitMemory0 = nullptr;
 
 extern "C" uint64_t jit_host_call(WasmEdge::VM::JitExecEnv *env,
@@ -47,9 +46,10 @@ extern "C" uint64_t jit_host_call(WasmEdge::VM::JitExecEnv *env,
   if (funcIdx & 0x80000000u) {
     // call_indirect: bit 31 set, lower bits = table slot index
     uint32_t tableSlot = funcIdx & 0x7FFFFFFFu;
-    if (!g_jitTable0)
+    auto *tab = g_jitExecutor->getTabInstByIdx(*g_jitStackMgr, 0);
+    if (!tab)
       return 0;
-    auto refRes = g_jitTable0->getRefAddr(tableSlot);
+    auto refRes = tab->getRefAddr(tableSlot);
     if (!refRes)
       return 0;
     funcInst =
@@ -207,6 +207,158 @@ extern "C" int32_t jit_memory_size(WasmEdge::VM::JitExecEnv *env) {
   if (!g_jitMemory0)
     return 0;
   return static_cast<int32_t>(g_jitMemory0->getPageSize());
+}
+
+extern "C" void jit_ref_func(WasmEdge::VM::JitExecEnv *env, uint32_t funcIdx) {
+  if (!env || !g_jitModInst)
+    return;
+  auto funcs = g_jitModInst->getFunctionInstances();
+  if (funcIdx >= funcs.size())
+    return;
+  const auto *funcInst = funcs[funcIdx];
+  WasmEdge::RefVariant ref(funcInst);
+  uint64_t *out = env->RefResultBuf;
+  auto raw = ref.getRawData();
+  out[0] = raw[0];
+  out[1] = raw[1];
+}
+
+extern "C" void jit_table_get(WasmEdge::VM::JitExecEnv *env, uint32_t tableIdx,
+                              uint32_t idx) {
+  if (!env || !g_jitExecutor || !g_jitStackMgr)
+    return;
+  auto *tab = g_jitExecutor->getTabInstByIdx(*g_jitStackMgr, tableIdx);
+  if (!tab) {
+    spdlog::error(WasmEdge::ErrCode::Value::TableOutOfBounds);
+    WasmEdge::Fault::emitFault(WasmEdge::ErrCode::Value::TableOutOfBounds);
+  }
+  auto res = tab->getRefAddr(idx);
+  if (!res) {
+    spdlog::error(WasmEdge::ErrCode::Value::TableOutOfBounds);
+    WasmEdge::Fault::emitFault(WasmEdge::ErrCode::Value::TableOutOfBounds);
+  }
+  auto raw = (*res).getRawData();
+  env->RefResultBuf[0] = raw[0];
+  env->RefResultBuf[1] = raw[1];
+}
+
+extern "C" void jit_table_set(WasmEdge::VM::JitExecEnv *env, uint32_t tableIdx,
+                              uint32_t idx, const uint64_t *refPtr) {
+  (void)env;
+  if (!refPtr || !g_jitExecutor || !g_jitStackMgr)
+    return;
+  auto *tab = g_jitExecutor->getTabInstByIdx(*g_jitStackMgr, tableIdx);
+  if (!tab) {
+    spdlog::error(WasmEdge::ErrCode::Value::TableOutOfBounds);
+    WasmEdge::Fault::emitFault(WasmEdge::ErrCode::Value::TableOutOfBounds);
+  }
+  const WasmEdge::RefVariant *refP =
+      reinterpret_cast<const WasmEdge::RefVariant *>(refPtr);
+  if (!tab->setRefAddr(idx, *refP)) {
+    spdlog::error(WasmEdge::ErrCode::Value::TableOutOfBounds);
+    WasmEdge::Fault::emitFault(WasmEdge::ErrCode::Value::TableOutOfBounds);
+  }
+}
+
+extern "C" uint32_t jit_table_size(WasmEdge::VM::JitExecEnv *env,
+                                   uint32_t tableIdx) {
+  (void)env;
+  if (!g_jitExecutor || !g_jitStackMgr)
+    return 0;
+  auto *tab = g_jitExecutor->getTabInstByIdx(*g_jitStackMgr, tableIdx);
+  if (!tab)
+    return 0;
+  return tab->getSize();
+}
+
+extern "C" uint32_t jit_table_grow(WasmEdge::VM::JitExecEnv *env,
+                                   uint32_t tableIdx, uint32_t n,
+                                   const uint64_t *refPtr) {
+  (void)env;
+  if (!g_jitExecutor || !g_jitStackMgr)
+    return static_cast<uint32_t>(-1);
+  auto *tab = g_jitExecutor->getTabInstByIdx(*g_jitStackMgr, tableIdx);
+  if (!tab)
+    return static_cast<uint32_t>(-1);
+  WasmEdge::RefVariant ref(tab->getTableType().getRefType());
+  if (refPtr) {
+    const WasmEdge::RefVariant *refP =
+        reinterpret_cast<const WasmEdge::RefVariant *>(refPtr);
+    ref = *refP;
+  }
+  uint32_t oldSize = tab->getSize();
+  if (!tab->growTable(n, ref))
+    return static_cast<uint32_t>(-1);
+  return oldSize;
+}
+
+extern "C" void jit_table_fill(WasmEdge::VM::JitExecEnv *env, uint32_t tableIdx,
+                               uint32_t offset, uint32_t len,
+                               const uint64_t *refPtr) {
+  (void)env;
+  if (!refPtr || !g_jitExecutor || !g_jitStackMgr)
+    return;
+  auto *tab = g_jitExecutor->getTabInstByIdx(*g_jitStackMgr, tableIdx);
+  if (!tab) {
+    spdlog::error(WasmEdge::ErrCode::Value::TableOutOfBounds);
+    WasmEdge::Fault::emitFault(WasmEdge::ErrCode::Value::TableOutOfBounds);
+  }
+  const WasmEdge::RefVariant *refP =
+      reinterpret_cast<const WasmEdge::RefVariant *>(refPtr);
+  if (!tab->fillRefs(*refP, offset, len)) {
+    spdlog::error(WasmEdge::ErrCode::Value::TableOutOfBounds);
+    WasmEdge::Fault::emitFault(WasmEdge::ErrCode::Value::TableOutOfBounds);
+  }
+}
+
+extern "C" void jit_table_copy(WasmEdge::VM::JitExecEnv *env,
+                               uint32_t dstTableIdx, uint32_t srcTableIdx,
+                               uint32_t dst, uint32_t src, uint32_t len) {
+  (void)env;
+  if (!g_jitExecutor || !g_jitStackMgr)
+    return;
+  auto *tabDst = g_jitExecutor->getTabInstByIdx(*g_jitStackMgr, dstTableIdx);
+  auto *tabSrc = g_jitExecutor->getTabInstByIdx(*g_jitStackMgr, srcTableIdx);
+  if (!tabDst || !tabSrc) {
+    spdlog::error(WasmEdge::ErrCode::Value::TableOutOfBounds);
+    WasmEdge::Fault::emitFault(WasmEdge::ErrCode::Value::TableOutOfBounds);
+  }
+  auto srcRefs = tabSrc->getRefs(0, src + len);
+  if (!srcRefs) {
+    spdlog::error(WasmEdge::ErrCode::Value::TableOutOfBounds);
+    WasmEdge::Fault::emitFault(WasmEdge::ErrCode::Value::TableOutOfBounds);
+  }
+  if (!tabDst->setRefs(*srcRefs, dst, src, len)) {
+    spdlog::error(WasmEdge::ErrCode::Value::TableOutOfBounds);
+    WasmEdge::Fault::emitFault(WasmEdge::ErrCode::Value::TableOutOfBounds);
+  }
+}
+
+extern "C" void jit_table_init(WasmEdge::VM::JitExecEnv *env, uint32_t tableIdx,
+                               uint32_t elemIdx, uint32_t dst, uint32_t src,
+                               uint32_t len) {
+  (void)env;
+  if (!g_jitExecutor || !g_jitStackMgr)
+    return;
+  auto *tab = g_jitExecutor->getTabInstByIdx(*g_jitStackMgr, tableIdx);
+  auto *elem = g_jitExecutor->getElemInstByIdx(*g_jitStackMgr, elemIdx);
+  if (!tab || !elem) {
+    spdlog::error(WasmEdge::ErrCode::Value::TableOutOfBounds);
+    WasmEdge::Fault::emitFault(WasmEdge::ErrCode::Value::TableOutOfBounds);
+  }
+  if (!tab->setRefs(elem->getRefs(), dst, src, len)) {
+    spdlog::error(WasmEdge::ErrCode::Value::TableOutOfBounds);
+    WasmEdge::Fault::emitFault(WasmEdge::ErrCode::Value::TableOutOfBounds);
+  }
+}
+
+extern "C" void jit_elem_drop(WasmEdge::VM::JitExecEnv *env, uint32_t elemIdx) {
+  (void)env;
+  if (!g_jitExecutor || !g_jitStackMgr)
+    return;
+  auto *elem = g_jitExecutor->getElemInstByIdx(*g_jitStackMgr, elemIdx);
+  if (elem)
+    elem->clear();
 }
 #endif
 
@@ -560,15 +712,11 @@ Executor::enterFunction(Runtime::StackManager &StackMgr,
       std::ofstream f("/home/tommy/Desktop/wasmedge/.cursor/debug-d32b78.log", std::ios::app); if (f) f << buf; f.close();
     }
     // #endregion
-    // Modules without a table (e.g. noop) have empty TabInsts; getTabInstByIdx
-    // would UB. Use safe getTable and set null when no table.
+    // Cache memory instance for JIT helpers; table 0 is resolved via getTabInstByIdx in jit_host_call.
     if (ModInst) {
-      auto tabRes = ModInst->getTable(0);
-      g_jitTable0 = tabRes ? *tabRes : nullptr;
       auto memRes = ModInst->getMemory(0);
       g_jitMemory0 = memRes ? *memRes : nullptr;
     } else {
-      g_jitTable0 = nullptr;
       g_jitMemory0 = nullptr;
     }
 
