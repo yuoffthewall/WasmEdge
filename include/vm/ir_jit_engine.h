@@ -104,6 +104,19 @@ extern "C" void jit_table_init(JitExecEnv *env, uint32_t tableIdx, uint32_t elem
                                uint32_t dst, uint32_t src, uint32_t len);
 /// elem.drop: clears element segment elemIdx.
 extern "C" void jit_elem_drop(JitExecEnv *env, uint32_t elemIdx);
+/// memory.copy: copies len bytes from srcMem[src] to dstMem[dst]. Traps on OOB.
+extern "C" void jit_memory_copy(JitExecEnv *env, uint32_t dstMemIdx,
+                                uint32_t srcMemIdx, uint32_t dst, uint32_t src,
+                                uint32_t len);
+/// memory.fill: fills mem[off..off+len-1] with byte val. Traps on OOB.
+extern "C" void jit_memory_fill(JitExecEnv *env, uint32_t memIdx, uint32_t off,
+                                uint32_t val, uint32_t len);
+/// memory.init: copies len bytes from data[dataIdx][src] to mem[memIdx][dst]. Traps on OOB.
+extern "C" void jit_memory_init(JitExecEnv *env, uint32_t memIdx,
+                                uint32_t dataIdx, uint32_t dst, uint32_t src,
+                                uint32_t len);
+/// data.drop: clears data segment dataIdx.
+extern "C" void jit_data_drop(JitExecEnv *env, uint32_t dataIdx);
 
 /// IR JIT Engine - compiles and executes IR code
 class IRJitEngine {

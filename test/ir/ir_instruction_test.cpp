@@ -1082,6 +1082,84 @@ TEST_F(IRInstructionTest, Elem_Drop_GeneratesIR) {
 }
 
 //==============================================================================
+// Bulk Memory Operations
+//==============================================================================
+
+TEST_F(IRInstructionTest, Memory_Copy_GeneratesIR) {
+  WasmToIRBuilder Builder;
+  std::vector<ValType> ParamTypes = {ValType(TypeCode::I32), ValType(TypeCode::I32),
+                                     ValType(TypeCode::I32)};
+  AST::FunctionType FuncType(ParamTypes, {});
+  ASSERT_TRUE(Builder.initialize(FuncType, {}));
+  std::vector<AST::Instruction> Instrs;
+  Instrs.emplace_back(OpCode::Local__get);
+  Instrs.back().getTargetIndex() = 0;  // dst
+  Instrs.emplace_back(OpCode::Local__get);
+  Instrs.back().getTargetIndex() = 1;  // src
+  Instrs.emplace_back(OpCode::Local__get);
+  Instrs.back().getTargetIndex() = 2;  // len
+  Instrs.emplace_back(OpCode::Memory__copy);
+  Instrs.back().getTargetIndex() = 0;
+  Instrs.back().getSourceIndex() = 0;
+  Instrs.emplace_back(OpCode::Return);
+  EXPECT_TRUE(Builder.buildFromInstructions(Instrs));
+  ASSERT_NE(Builder.getIRContext(), nullptr);
+}
+
+TEST_F(IRInstructionTest, Memory_Fill_GeneratesIR) {
+  WasmToIRBuilder Builder;
+  std::vector<ValType> ParamTypes = {ValType(TypeCode::I32), ValType(TypeCode::I32),
+                                     ValType(TypeCode::I32)};
+  AST::FunctionType FuncType(ParamTypes, {});
+  ASSERT_TRUE(Builder.initialize(FuncType, {}));
+  std::vector<AST::Instruction> Instrs;
+  Instrs.emplace_back(OpCode::Local__get);
+  Instrs.back().getTargetIndex() = 0;  // dst
+  Instrs.emplace_back(OpCode::Local__get);
+  Instrs.back().getTargetIndex() = 1;  // val
+  Instrs.emplace_back(OpCode::Local__get);
+  Instrs.back().getTargetIndex() = 2;  // len
+  Instrs.emplace_back(OpCode::Memory__fill);
+  Instrs.back().getTargetIndex() = 0;
+  Instrs.emplace_back(OpCode::Return);
+  EXPECT_TRUE(Builder.buildFromInstructions(Instrs));
+  ASSERT_NE(Builder.getIRContext(), nullptr);
+}
+
+TEST_F(IRInstructionTest, Memory_Init_GeneratesIR) {
+  WasmToIRBuilder Builder;
+  std::vector<ValType> ParamTypes = {ValType(TypeCode::I32), ValType(TypeCode::I32),
+                                     ValType(TypeCode::I32)};
+  AST::FunctionType FuncType(ParamTypes, {});
+  ASSERT_TRUE(Builder.initialize(FuncType, {}));
+  std::vector<AST::Instruction> Instrs;
+  Instrs.emplace_back(OpCode::Local__get);
+  Instrs.back().getTargetIndex() = 0;  // dst
+  Instrs.emplace_back(OpCode::Local__get);
+  Instrs.back().getTargetIndex() = 1;  // src
+  Instrs.emplace_back(OpCode::Local__get);
+  Instrs.back().getTargetIndex() = 2;  // len
+  Instrs.emplace_back(OpCode::Memory__init);
+  Instrs.back().getTargetIndex() = 0;   // mem idx
+  Instrs.back().getSourceIndex() = 0;   // data idx
+  Instrs.emplace_back(OpCode::Return);
+  EXPECT_TRUE(Builder.buildFromInstructions(Instrs));
+  ASSERT_NE(Builder.getIRContext(), nullptr);
+}
+
+TEST_F(IRInstructionTest, Data_Drop_GeneratesIR) {
+  WasmToIRBuilder Builder;
+  AST::FunctionType FuncType({}, {});
+  ASSERT_TRUE(Builder.initialize(FuncType, {}));
+  std::vector<AST::Instruction> Instrs;
+  Instrs.emplace_back(OpCode::Data__drop);
+  Instrs.back().getTargetIndex() = 0;
+  Instrs.emplace_back(OpCode::Return);
+  EXPECT_TRUE(Builder.buildFromInstructions(Instrs));
+  ASSERT_NE(Builder.getIRContext(), nullptr);
+}
+
+//==============================================================================
 // JIT Compilation Tests
 //==============================================================================
 

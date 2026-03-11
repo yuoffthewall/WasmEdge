@@ -61,6 +61,13 @@ void jit_table_copy(WasmEdge::VM::JitExecEnv *, uint32_t, uint32_t,
 void jit_table_init(WasmEdge::VM::JitExecEnv *, uint32_t, uint32_t,
                     uint32_t, uint32_t, uint32_t);
 void jit_elem_drop(WasmEdge::VM::JitExecEnv *, uint32_t);
+void jit_memory_copy(WasmEdge::VM::JitExecEnv *, uint32_t, uint32_t,
+                     uint32_t, uint32_t, uint32_t);
+void jit_memory_fill(WasmEdge::VM::JitExecEnv *, uint32_t, uint32_t,
+                     uint32_t, uint32_t);
+void jit_memory_init(WasmEdge::VM::JitExecEnv *, uint32_t, uint32_t,
+                     uint32_t, uint32_t, uint32_t);
+void jit_data_drop(WasmEdge::VM::JitExecEnv *, uint32_t);
 }
 #endif
 
@@ -166,6 +173,13 @@ class Executor {
   friend void ::jit_table_init(WasmEdge::VM::JitExecEnv *, uint32_t, uint32_t,
                                uint32_t, uint32_t, uint32_t);
   friend void ::jit_elem_drop(WasmEdge::VM::JitExecEnv *, uint32_t);
+  friend void ::jit_memory_copy(WasmEdge::VM::JitExecEnv *, uint32_t, uint32_t,
+                                uint32_t, uint32_t, uint32_t);
+  friend void ::jit_memory_fill(WasmEdge::VM::JitExecEnv *, uint32_t, uint32_t,
+                                uint32_t, uint32_t);
+  friend void ::jit_memory_init(WasmEdge::VM::JitExecEnv *, uint32_t, uint32_t,
+                                uint32_t, uint32_t, uint32_t);
+  friend void ::jit_data_drop(WasmEdge::VM::JitExecEnv *, uint32_t);
 #endif
 
 public:

@@ -616,41 +616,66 @@ Expect<void> WasmToIRBuilder::visitInstruction(const AST::Instruction &Instr) {
 
   // Bulk memory operations
   case OpCode::Memory__copy: {
-    // memory.copy: dst, src, n -> copies n bytes from src to dst
+    // memory.copy: len, src, dst (stack order). Traps on OOB; supports multi-memory.
     ir_ctx *ctx = &Ctx;
-    ir_ref N = pop();      // Number of bytes
-    ir_ref Src = pop();    // Source address (i32)
-    ir_ref Dst = pop();    // Destination address (i32)
-    
-    // Convert to native addresses
-    ir_ref SrcAddr = ir_ADD_A(MemoryBase, ir_ZEXT_A(Src));
-    ir_ref DstAddr = ir_ADD_A(MemoryBase, ir_ZEXT_A(Dst));
-    ir_ref Size = ir_ZEXT_A(N);  // Size as native address type for memmove
-    
-    // Call memmove (handles overlapping regions correctly)
-    // void *memmove(void *dest, const void *src, size_t n);
-    ir_ref Proto = ir_proto_3(ctx, IR_FASTCALL_FUNC, IR_ADDR, IR_ADDR, IR_ADDR, IR_ADDR);
-    ir_ref MemmoveFunc = ir_const_func_addr(ctx, (uintptr_t)&memmove, Proto);
-    ir_CALL_3(IR_ADDR, MemmoveFunc, DstAddr, SrcAddr, Size);
+    ir_ref N = pop();
+    ir_ref Src = pop();
+    ir_ref Dst = pop();
+    ir_ref EnvPtrVal = ensureValidRef(EnvPtr, IR_ADDR);
+    uint32_t dstMemIdx = Instr.getTargetIndex();
+    uint32_t srcMemIdx = Instr.getSourceIndex();
+    uint8_t ProtoParams[6] = {IR_ADDR, IR_U32, IR_U32, IR_U32, IR_U32, IR_U32};
+    ir_ref Proto = ir_proto(ctx, IR_FASTCALL_FUNC, IR_VOID, 6, ProtoParams);
+    ir_ref Fn = ir_const_func_addr(ctx, (uintptr_t)&jit_memory_copy, Proto);
+    ir_CALL_6(IR_VOID, Fn, EnvPtrVal, ir_CONST_I32(static_cast<int32_t>(dstMemIdx)),
+              ir_CONST_I32(static_cast<int32_t>(srcMemIdx)), ir_ZEXT_U32(Dst),
+              ir_ZEXT_U32(Src), ir_ZEXT_U32(N));
     return {};
   }
 
   case OpCode::Memory__fill: {
-    // memory.fill: dst, val, n -> fills n bytes at dst with val
+    // memory.fill: len, val, off (stack order). Traps on OOB; supports multi-memory.
     ir_ctx *ctx = &Ctx;
-    ir_ref N = pop();      // Number of bytes
-    ir_ref Val = pop();    // Value to fill (i32, only low byte used)
-    ir_ref Dst = pop();    // Destination address (i32)
-    
-    // Convert to native address
-    ir_ref DstAddr = ir_ADD_A(MemoryBase, ir_ZEXT_A(Dst));
-    ir_ref Size = ir_ZEXT_A(N);
-    
-    // Call memset
-    // void *memset(void *s, int c, size_t n);
-    ir_ref Proto = ir_proto_3(ctx, IR_FASTCALL_FUNC, IR_ADDR, IR_ADDR, IR_I32, IR_ADDR);
-    ir_ref MemsetFunc = ir_const_func_addr(ctx, (uintptr_t)&memset, Proto);
-    ir_CALL_3(IR_ADDR, MemsetFunc, DstAddr, Val, Size);
+    ir_ref N = pop();
+    ir_ref Val = pop();
+    ir_ref Off = pop();
+    ir_ref EnvPtrVal = ensureValidRef(EnvPtr, IR_ADDR);
+    uint32_t memIdx = Instr.getTargetIndex();
+    uint8_t ProtoParams[5] = {IR_ADDR, IR_U32, IR_U32, IR_U32, IR_U32};
+    ir_ref Proto = ir_proto(ctx, IR_FASTCALL_FUNC, IR_VOID, 5, ProtoParams);
+    ir_ref Fn = ir_const_func_addr(ctx, (uintptr_t)&jit_memory_fill, Proto);
+    ir_CALL_5(IR_VOID, Fn, EnvPtrVal, ir_CONST_I32(static_cast<int32_t>(memIdx)),
+              ir_ZEXT_U32(Off), ir_ZEXT_U32(Val), ir_ZEXT_U32(N));
+    return {};
+  }
+
+  case OpCode::Memory__init: {
+    // memory.init: len, src (data offset), dst (mem offset). Target = memIdx, Source = dataIdx.
+    ir_ctx *ctx = &Ctx;
+    ir_ref Len = pop();
+    ir_ref Src = pop();
+    ir_ref Dst = pop();
+    ir_ref EnvPtrVal = ensureValidRef(EnvPtr, IR_ADDR);
+    uint32_t memIdx = Instr.getTargetIndex();
+    uint32_t dataIdx = Instr.getSourceIndex();
+    uint8_t ProtoParams[6] = {IR_ADDR, IR_U32, IR_U32, IR_U32, IR_U32, IR_U32};
+    ir_ref Proto = ir_proto(ctx, IR_FASTCALL_FUNC, IR_VOID, 6, ProtoParams);
+    ir_ref Fn = ir_const_func_addr(ctx, (uintptr_t)&jit_memory_init, Proto);
+    ir_CALL_6(IR_VOID, Fn, EnvPtrVal, ir_CONST_I32(static_cast<int32_t>(memIdx)),
+              ir_CONST_I32(static_cast<int32_t>(dataIdx)), ir_ZEXT_U32(Dst),
+              ir_ZEXT_U32(Src), ir_ZEXT_U32(Len));
+    return {};
+  }
+
+  case OpCode::Data__drop: {
+    ir_ctx *ctx = &Ctx;
+    ir_ref EnvPtrVal = ensureValidRef(EnvPtr, IR_ADDR);
+    uint32_t dataIdx = Instr.getTargetIndex();
+    uint8_t ProtoParams[2] = {IR_ADDR, IR_U32};
+    ir_ref Proto = ir_proto(ctx, IR_FASTCALL_FUNC, IR_VOID, 2, ProtoParams);
+    ir_ref Fn = ir_const_func_addr(ctx, (uintptr_t)&jit_data_drop, Proto);
+    ir_CALL_2(IR_VOID, Fn, EnvPtrVal,
+              ir_CONST_I32(static_cast<int32_t>(dataIdx)));
     return {};
   }
   

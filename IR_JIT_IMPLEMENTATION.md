@@ -1715,7 +1715,9 @@ This section provides a comprehensive breakdown of all WebAssembly instruction i
 | **Memory Store** | 9 | `i32.store`, `i64.store`, `f32.store`, `f64.store`, `i32.store8/16`, `i64.store8/16/32` |
 | **Table Ops** | 8 | `table.get`, `table.set`, `table.size`, `table.grow`, `table.fill`, `table.copy`, `table.init`, `elem.drop` |
 | **Reference Types** | 3 | `ref.null`, `ref.is_null`, `ref.func` |
-| **TOTAL** | **177** | |
+| **Bulk Memory** | 4 | `memory.copy`, `memory.fill`, `memory.init`, `data.drop` |
+| **Memory Size/Grow** | 2 | `memory.size`, `memory.grow` |
+| **TOTAL** | **183** | |
 
 ### ⚠️ Placeholder Implementations (Dispatch but don't work correctly)
 
@@ -1729,17 +1731,16 @@ This section provides a comprehensive breakdown of all WebAssembly instruction i
 
 | Category | Count | Instructions |
 |----------|-------|--------------|
-| **Bulk Memory** | 4 | `memory.copy`, `memory.fill`, `memory.init`, `data.drop` |
 | **SIMD (v128)** | 200+ | All v128 operations |
 | **Atomics** | 50+ | All atomic operations |
 | **Exceptions** | 6+ | `try`, `catch`, `throw`, etc. |
-| **TOTAL** | **~280+** | |
+| **TOTAL** | **~276+** | |
 
 ### Summary
 
 | Status | Count | Percentage |
 |--------|-------|------------|
-| ✅ Fully Implemented | 177 | ~96% of core |
+| ✅ Fully Implemented | 183 | ~99% of core |
 | ⚠️ Placeholder | 10 | ~5% of core |
 | ❌ Not Implemented | 0 | 0% of core |
 | **Core Total** | **184** | 100% |
@@ -1756,20 +1757,19 @@ This section provides a comprehensive breakdown of all WebAssembly instruction i
 
 **Medium Priority** (common features):
 5. ⚠️ Float math (10) - `sqrt`, `ceil`, `floor`, etc.
-6. ❌ `memory.size/grow` (2) - Dynamic memory
+6. ✅ ~~`memory.size/grow` (2)~~ - **COMPLETED**
 
 **Low Priority** (advanced features):
 8. ✅ ~~Table operations (8)~~ - **COMPLETED**
 9. ✅ ~~Reference types (3)~~ - **COMPLETED**
-10. Bulk memory (4)
+10. ✅ ~~Bulk memory (4)~~ - **COMPLETED** (`memory.copy`, `memory.fill`, `memory.init`, `data.drop`; copy/fill use bounds-checking helpers)
 
 ### Recommended Next Steps
 
 1. **Float Math Intrinsics** (10 instructions) - Quick win  
    Fix placeholders by adding `ir_CALL` to C library functions (`sqrtf`, `sqrt`, `ceilf`, `ceil`, etc.)
 
-2. **Memory Size/Grow** (2 instructions) - Requires runtime integration
-   Need to track and modify memory size at runtime
+2. ~~**Memory Size/Grow & Bulk Memory**~~ - **DONE** (memory.size, memory.grow, memory.copy, memory.fill, memory.init, data.drop via JIT helpers with bounds checking)
 
 ---
 

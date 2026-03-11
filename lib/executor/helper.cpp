@@ -209,6 +209,50 @@ extern "C" int32_t jit_memory_size(WasmEdge::VM::JitExecEnv *env) {
   return static_cast<int32_t>(g_jitMemory0->getPageSize());
 }
 
+extern "C" void jit_memory_copy(WasmEdge::VM::JitExecEnv *env,
+                                uint32_t dstMemIdx, uint32_t srcMemIdx,
+                                uint32_t dst, uint32_t src, uint32_t len) {
+  (void)env;
+  if (!g_jitExecutor || !g_jitStackMgr)
+    return;
+  auto *memDst = g_jitExecutor->getMemInstByIdx(*g_jitStackMgr, dstMemIdx);
+  auto *memSrc = g_jitExecutor->getMemInstByIdx(*g_jitStackMgr, srcMemIdx);
+  if (!memDst || !memSrc) {
+    spdlog::error(WasmEdge::ErrCode::Value::MemoryOutOfBounds);
+    WasmEdge::Fault::emitFault(WasmEdge::ErrCode::Value::MemoryOutOfBounds);
+    return;
+  }
+  auto dataRes = memSrc->getBytes(src, len);
+  if (!dataRes) {
+    spdlog::error(WasmEdge::ErrCode::Value::MemoryOutOfBounds);
+    WasmEdge::Fault::emitFault(WasmEdge::ErrCode::Value::MemoryOutOfBounds);
+    return;
+  }
+  auto setRes = memDst->setBytes(*dataRes, dst, 0, len);
+  if (!setRes) {
+    spdlog::error(WasmEdge::ErrCode::Value::MemoryOutOfBounds);
+    WasmEdge::Fault::emitFault(WasmEdge::ErrCode::Value::MemoryOutOfBounds);
+  }
+}
+
+extern "C" void jit_memory_fill(WasmEdge::VM::JitExecEnv *env, uint32_t memIdx,
+                                uint32_t off, uint32_t val, uint32_t len) {
+  (void)env;
+  if (!g_jitExecutor || !g_jitStackMgr)
+    return;
+  auto *mem = g_jitExecutor->getMemInstByIdx(*g_jitStackMgr, memIdx);
+  if (!mem) {
+    spdlog::error(WasmEdge::ErrCode::Value::MemoryOutOfBounds);
+    WasmEdge::Fault::emitFault(WasmEdge::ErrCode::Value::MemoryOutOfBounds);
+    return;
+  }
+  auto res = mem->fillBytes(static_cast<uint8_t>(val), off, len);
+  if (!res) {
+    spdlog::error(WasmEdge::ErrCode::Value::MemoryOutOfBounds);
+    WasmEdge::Fault::emitFault(WasmEdge::ErrCode::Value::MemoryOutOfBounds);
+  }
+}
+
 extern "C" void jit_ref_func(WasmEdge::VM::JitExecEnv *env, uint32_t funcIdx) {
   if (!env || !g_jitModInst)
     return;
@@ -359,6 +403,35 @@ extern "C" void jit_elem_drop(WasmEdge::VM::JitExecEnv *env, uint32_t elemIdx) {
   auto *elem = g_jitExecutor->getElemInstByIdx(*g_jitStackMgr, elemIdx);
   if (elem)
     elem->clear();
+}
+
+extern "C" void jit_memory_init(WasmEdge::VM::JitExecEnv *env, uint32_t memIdx,
+                                uint32_t dataIdx, uint32_t dst, uint32_t src,
+                                uint32_t len) {
+  (void)env;
+  if (!g_jitExecutor || !g_jitStackMgr)
+    return;
+  auto *mem = g_jitExecutor->getMemInstByIdx(*g_jitStackMgr, memIdx);
+  auto *data = g_jitExecutor->getDataInstByIdx(*g_jitStackMgr, dataIdx);
+  if (!mem || !data) {
+    spdlog::error(WasmEdge::ErrCode::Value::MemoryOutOfBounds);
+    WasmEdge::Fault::emitFault(WasmEdge::ErrCode::Value::MemoryOutOfBounds);
+    return;
+  }
+  auto res = mem->setBytes(data->getData(), dst, src, len);
+  if (!res) {
+    spdlog::error(WasmEdge::ErrCode::Value::MemoryOutOfBounds);
+    WasmEdge::Fault::emitFault(WasmEdge::ErrCode::Value::MemoryOutOfBounds);
+  }
+}
+
+extern "C" void jit_data_drop(WasmEdge::VM::JitExecEnv *env, uint32_t dataIdx) {
+  (void)env;
+  if (!g_jitExecutor || !g_jitStackMgr)
+    return;
+  auto *data = g_jitExecutor->getDataInstByIdx(*g_jitStackMgr, dataIdx);
+  if (data)
+    data->clear();
 }
 #endif
 
