@@ -1918,21 +1918,31 @@ std::map<uint32_t, ir_ref> WasmToIRBuilder::mergeLocals(
 
   std::map<uint32_t, ir_ref> Merged;
   for (uint32_t LocalIdx : AllLocalIndices) {
-    std::vector<ir_ref> Values;
-    bool AllSame = true;
+    // Resolve a default value from any path that has this local (so we can
+    // fill missing paths and never drop a local that exists on any path).
     ir_ref FirstVal = IR_UNUSED;
     for (const auto &PathLocals : EndLocals) {
       auto it = PathLocals.find(LocalIdx);
       if (it != PathLocals.end()) {
-        if (FirstVal == IR_UNUSED) {
-          FirstVal = it->second;
-        } else if (it->second != FirstVal) {
+        FirstVal = it->second;
+        break;
+      }
+    }
+    if (FirstVal == IR_UNUSED) {
+      continue;  // local not defined on any path
+    }
+    std::vector<ir_ref> Values;
+    bool AllSame = true;
+    for (const auto &PathLocals : EndLocals) {
+      auto it = PathLocals.find(LocalIdx);
+      if (it != PathLocals.end()) {
+        if (it->second != FirstVal) {
           AllSame = false;
         }
         Values.push_back(it->second);
-      } else if (FirstVal != IR_UNUSED) {
-        // Local missing on this path -- reuse the first path's value so the
-        // PHI input count matches the MERGE input count.
+      } else {
+        // Local missing on this path — use value from another path so PHI
+        // input count matches MERGE and we don't drop the local.
         Values.push_back(FirstVal);
       }
     }
