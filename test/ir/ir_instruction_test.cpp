@@ -693,10 +693,10 @@ TEST_F(IRInstructionTest, CallIndirect_WithTypeInfo) {
   
   ASSERT_TRUE(Builder.initialize(FuncType, {}));
   
-  // Set up module function types (type 0 is the signature for indirect calls)
+  // Set up module type section (type index 0 = signature for call_indirect)
   AST::FunctionType IndirectType({ValType(TypeCode::I32)}, {ValType(TypeCode::I32)});
-  std::vector<const AST::FunctionType*> ModuleFuncs = {&IndirectType};
-  Builder.setModuleFunctions(ModuleFuncs);
+  std::vector<const AST::FunctionType*> ModuleTypes = {&IndirectType};
+  Builder.setModuleTypes(ModuleTypes);
   
   // Build: local.get 0 (value), local.get 1 (index), call_indirect type 0
   std::vector<AST::Instruction> Instrs;

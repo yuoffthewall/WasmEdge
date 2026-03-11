@@ -104,64 +104,162 @@ protected:
     return CompRes->NativeFunc;
   }
 
-  // Execute binary i32 operation
-  // JIT signature: int32_t func(void** func_table, uint32_t table_size, void* global_base, void* mem_base, int32_t a, int32_t b)
+  // Execute via uniform JIT convention: ret func(JitExecEnv* env, uint64_t* args)
   int32_t execI32Binary(void* Func, int32_t a, int32_t b) {
-    using FnType = int32_t (*)(void**, uint32_t, void*, void*, int32_t, int32_t);
-    return reinterpret_cast<FnType>(Func)(nullptr, 0, nullptr, Memory.data(), a, b);
+    AST::FunctionType FuncType(
+        {ValType(TypeCode::I32), ValType(TypeCode::I32)},
+        {ValType(TypeCode::I32)});
+    std::vector<ValVariant> Args = {ValVariant(static_cast<uint32_t>(a)),
+                                    ValVariant(static_cast<uint32_t>(b))};
+    std::vector<ValVariant> Rets(1);
+    if (!Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0, nullptr,
+                       Memory.data(), 0))
+      return 0;
+    return static_cast<int32_t>(Rets[0].get<uint32_t>());
   }
 
-  // Execute binary i32 operation (unsigned interpretation for display)
   uint32_t execU32Binary(void* Func, uint32_t a, uint32_t b) {
-    using FnType = uint32_t (*)(void**, uint32_t, void*, void*, uint32_t, uint32_t);
-    return reinterpret_cast<FnType>(Func)(nullptr, 0, nullptr, Memory.data(), a, b);
+    AST::FunctionType FuncType(
+        {ValType(TypeCode::I32), ValType(TypeCode::I32)},
+        {ValType(TypeCode::I32)});
+    std::vector<ValVariant> Args = {ValVariant(a), ValVariant(b)};
+    std::vector<ValVariant> Rets(1);
+    if (!Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0, nullptr,
+                       Memory.data(), 0))
+      return 0;
+    return Rets[0].get<uint32_t>();
   }
 
-  // Execute binary i64 operation
   int64_t execI64Binary(void* Func, int64_t a, int64_t b) {
-    using FnType = int64_t (*)(void**, uint32_t, void*, void*, int64_t, int64_t);
-    return reinterpret_cast<FnType>(Func)(nullptr, 0, nullptr, Memory.data(), a, b);
+    AST::FunctionType FuncType(
+        {ValType(TypeCode::I64), ValType(TypeCode::I64)},
+        {ValType(TypeCode::I64)});
+    std::vector<ValVariant> Args = {ValVariant(static_cast<uint64_t>(a)),
+                                    ValVariant(static_cast<uint64_t>(b))};
+    std::vector<ValVariant> Rets(1);
+    if (!Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0, nullptr,
+                       Memory.data(), 0))
+      return 0;
+    return static_cast<int64_t>(Rets[0].get<uint64_t>());
   }
 
-  // Execute binary i64 operation (unsigned)
   uint64_t execU64Binary(void* Func, uint64_t a, uint64_t b) {
-    using FnType = uint64_t (*)(void**, uint32_t, void*, void*, uint64_t, uint64_t);
-    return reinterpret_cast<FnType>(Func)(nullptr, 0, nullptr, Memory.data(), a, b);
+    AST::FunctionType FuncType(
+        {ValType(TypeCode::I64), ValType(TypeCode::I64)},
+        {ValType(TypeCode::I64)});
+    std::vector<ValVariant> Args = {ValVariant(a), ValVariant(b)};
+    std::vector<ValVariant> Rets(1);
+    if (!Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0, nullptr,
+                       Memory.data(), 0))
+      return 0;
+    return Rets[0].get<uint64_t>();
   }
 
-  // Execute unary i32 operation
   int32_t execI32Unary(void* Func, int32_t a) {
-    using FnType = int32_t (*)(void**, uint32_t, void*, void*, int32_t);
-    return reinterpret_cast<FnType>(Func)(nullptr, 0, nullptr, Memory.data(), a);
+    AST::FunctionType FuncType({ValType(TypeCode::I32)},
+                               {ValType(TypeCode::I32)});
+    std::vector<ValVariant> Args = {ValVariant(static_cast<uint32_t>(a))};
+    std::vector<ValVariant> Rets(1);
+    if (!Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0, nullptr,
+                       Memory.data(), 0))
+      return 0;
+    return static_cast<int32_t>(Rets[0].get<uint32_t>());
   }
 
-  // Execute unary i64 operation
   int64_t execI64Unary(void* Func, int64_t a) {
-    using FnType = int64_t (*)(void**, uint32_t, void*, void*, int64_t);
-    return reinterpret_cast<FnType>(Func)(nullptr, 0, nullptr, Memory.data(), a);
+    AST::FunctionType FuncType({ValType(TypeCode::I64)},
+                               {ValType(TypeCode::I64)});
+    std::vector<ValVariant> Args = {ValVariant(static_cast<uint64_t>(a))};
+    std::vector<ValVariant> Rets(1);
+    if (!Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0, nullptr,
+                       Memory.data(), 0))
+      return 0;
+    return static_cast<int64_t>(Rets[0].get<uint64_t>());
   }
 
-  // Execute comparison (returns i32 0 or 1)
   int32_t execI32Compare(void* Func, int32_t a, int32_t b) {
-    using FnType = int32_t (*)(void**, uint32_t, void*, void*, int32_t, int32_t);
-    return reinterpret_cast<FnType>(Func)(nullptr, 0, nullptr, Memory.data(), a, b);
+    AST::FunctionType FuncType(
+        {ValType(TypeCode::I32), ValType(TypeCode::I32)},
+        {ValType(TypeCode::I32)});
+    std::vector<ValVariant> Args = {ValVariant(static_cast<uint32_t>(a)),
+                                    ValVariant(static_cast<uint32_t>(b))};
+    std::vector<ValVariant> Rets(1);
+    if (!Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0, nullptr,
+                       Memory.data(), 0))
+      return 0;
+    return static_cast<int32_t>(Rets[0].get<uint32_t>());
   }
 
   int32_t execI64Compare(void* Func, int64_t a, int64_t b) {
-    using FnType = int32_t (*)(void**, uint32_t, void*, void*, int64_t, int64_t);
-    return reinterpret_cast<FnType>(Func)(nullptr, 0, nullptr, Memory.data(), a, b);
+    AST::FunctionType FuncType(
+        {ValType(TypeCode::I64), ValType(TypeCode::I64)},
+        {ValType(TypeCode::I32)});
+    std::vector<ValVariant> Args = {ValVariant(static_cast<uint64_t>(a)),
+                                    ValVariant(static_cast<uint64_t>(b))};
+    std::vector<ValVariant> Rets(1);
+    if (!Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0, nullptr,
+                       Memory.data(), 0))
+      return 0;
+    return static_cast<int32_t>(Rets[0].get<uint32_t>());
   }
 
-  // Execute function with no params, returns i32
   int32_t execI32NoParams(void* Func) {
-    using FnType = int32_t (*)(void**, uint32_t, void*, void*);
-    return reinterpret_cast<FnType>(Func)(nullptr, 0, nullptr, Memory.data());
+    AST::FunctionType FuncType({}, {ValType(TypeCode::I32)});
+    std::vector<ValVariant> Args;
+    std::vector<ValVariant> Rets(1);
+    if (!Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0, nullptr,
+                       Memory.data(), 0))
+      return 0;
+    return static_cast<int32_t>(Rets[0].get<uint32_t>());
   }
 
-  // Execute function with one i32 param, returns i32
   int32_t execI32OneParam(void* Func, int32_t a) {
-    using FnType = int32_t (*)(void**, uint32_t, void*, void*, int32_t);
-    return reinterpret_cast<FnType>(Func)(nullptr, 0, nullptr, Memory.data(), a);
+    AST::FunctionType FuncType({ValType(TypeCode::I32)},
+                               {ValType(TypeCode::I32)});
+    std::vector<ValVariant> Args = {ValVariant(static_cast<uint32_t>(a))};
+    std::vector<ValVariant> Rets(1);
+    if (!Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0, nullptr,
+                       Memory.data(), 0))
+      return 0;
+    return static_cast<int32_t>(Rets[0].get<uint32_t>());
+  }
+
+  // (i64) -> i32 (e.g. i64.eqz)
+  int32_t execI64UnaryReturnI32(void* Func, int64_t a) {
+    AST::FunctionType FuncType({ValType(TypeCode::I64)},
+                               {ValType(TypeCode::I32)});
+    std::vector<ValVariant> Args = {ValVariant(static_cast<uint64_t>(a))};
+    std::vector<ValVariant> Rets(1);
+    if (!Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0, nullptr,
+                       Memory.data(), 0))
+      return 0;
+    return static_cast<int32_t>(Rets[0].get<uint32_t>());
+  }
+
+  // Generic invoke: (Func, FuncType, Args) -> single i32 return
+  int32_t invokeI32(void* Func, const AST::FunctionType& FuncType,
+                    std::vector<ValVariant> Args) {
+    std::vector<ValVariant> Rets(1);
+    if (!Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0, nullptr,
+                       Memory.data(), 0))
+      return 0;
+    return static_cast<int32_t>(Rets[0].get<uint32_t>());
+  }
+
+  int64_t invokeI64(void* Func, const AST::FunctionType& FuncType,
+                    std::vector<ValVariant> Args) {
+    std::vector<ValVariant> Rets(1);
+    if (!Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0, nullptr,
+                       Memory.data(), 0))
+      return 0;
+    return static_cast<int64_t>(Rets[0].get<uint64_t>());
+  }
+
+  void invokeVoid(void* Func, const AST::FunctionType& FuncType,
+                  std::vector<ValVariant> Args) {
+    std::vector<ValVariant> Rets;
+    Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0, nullptr,
+                  Memory.data(), 0);
   }
 
   // Build a custom function with given instructions
@@ -597,13 +695,9 @@ TEST_F(IRExecutionTest, I64_Eqz) {
   void* Func = buildUnaryOp(OpCode::I64__eqz, TypeCode::I64, TypeCode::I32);
   ASSERT_NE(Func, nullptr);
 
-  // Note: eqz returns i32
-  using FnType = int32_t (*)(void**, uint32_t, void*, void*, int64_t);
-  auto fn = reinterpret_cast<FnType>(Func);
-  
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 0), 1);
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 1), 0);
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 0x100000000LL), 0);
+  EXPECT_EQ(execI64UnaryReturnI32(Func, 0), 1);
+  EXPECT_EQ(execI64UnaryReturnI32(Func, 1), 0);
+  EXPECT_EQ(execI64UnaryReturnI32(Func, 0x100000000LL), 0);
 }
 
 TEST_F(IRExecutionTest, I64_Clz) {
@@ -678,17 +772,15 @@ TEST_F(IRExecutionTest, ControlFlow_IfElse_Basic) {
   );
   
   ASSERT_NE(Func, nullptr);
-  
-  using FnType = int32_t (*)(void**, uint32_t, void*, void*, int32_t);
-  auto fn = reinterpret_cast<FnType>(Func);
-  
+
+  AST::FunctionType FuncType({ValType(TypeCode::I32)},
+                             {ValType(TypeCode::I32)});
   // Test with true condition (non-zero)
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 1), 1);
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 42), 1);
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), -1), 1);
-  
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(1u)}), 1);
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(42u)}), 1);
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(static_cast<uint32_t>(-1))}), 1);
   // Test with false condition (zero)
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 0), 0);
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(0u)}), 0);
 }
 
 // Test: if (a > b) return a else return b (max function)
@@ -725,16 +817,15 @@ TEST_F(IRExecutionTest, ControlFlow_IfElse_Max) {
   );
   
   ASSERT_NE(Func, nullptr);
-  
-  using FnType = int32_t (*)(void**, uint32_t, void*, void*, int32_t, int32_t);
-  auto fn = reinterpret_cast<FnType>(Func);
-  
-  // max(a, b) tests
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 10, 5), 10);
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 5, 10), 10);
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 7, 7), 7);
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), -5, -10), -5);
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), -10, 5), 5);
+
+  AST::FunctionType FuncType(
+      {ValType(TypeCode::I32), ValType(TypeCode::I32)},
+      {ValType(TypeCode::I32)});
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(10u), ValVariant(5u)}), 10);
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(5u), ValVariant(10u)}), 10);
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(7u), ValVariant(7u)}), 7);
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(static_cast<uint32_t>(-5)), ValVariant(static_cast<uint32_t>(-10))}), -5);
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(static_cast<uint32_t>(-10)), ValVariant(5u)}), 5);
 }
 
 // Test: Nested if/else - sign function: returns -1, 0, or 1
@@ -788,16 +879,15 @@ TEST_F(IRExecutionTest, ControlFlow_NestedIfElse_Sign) {
   );
   
   ASSERT_NE(Func, nullptr);
-  
-  using FnType = int32_t (*)(void**, uint32_t, void*, void*, int32_t);
-  auto fn = reinterpret_cast<FnType>(Func);
-  
+
+  AST::FunctionType FuncType({ValType(TypeCode::I32)},
+                             {ValType(TypeCode::I32)});
   // sign(x) tests
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), -100), -1);
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), -1), -1);
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 0), 0);
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 1), 1);
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 100), 1);
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(static_cast<uint32_t>(-100))}), -1);
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(static_cast<uint32_t>(-1))}), -1);
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(0u)}), 0);
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(1u)}), 1);
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(100u)}), 1);
 }
 
 // Test: Early return - clamp function
@@ -846,20 +936,18 @@ TEST_F(IRExecutionTest, ControlFlow_EarlyReturn_Clamp) {
   );
   
   ASSERT_NE(Func, nullptr);
-  
-  using FnType = int32_t (*)(void**, uint32_t, void*, void*, int32_t);
-  auto fn = reinterpret_cast<FnType>(Func);
-  
-  // clamp(x, 0, 100) tests
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), -50), 0);
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), -1), 0);
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 0), 0);
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 1), 1);
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 50), 50);
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 99), 99);
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 100), 100);
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 101), 100);
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 200), 100);
+
+  AST::FunctionType FuncType({ValType(TypeCode::I32)},
+                             {ValType(TypeCode::I32)});
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(static_cast<uint32_t>(-50))}), 0);
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(static_cast<uint32_t>(-1))}), 0);
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(0u)}), 0);
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(1u)}), 1);
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(50u)}), 50);
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(99u)}), 99);
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(100u)}), 100);
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(101u)}), 100);
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(200u)}), 100);
 }
 
 // Test: Absolute value using if/else
@@ -899,17 +987,15 @@ TEST_F(IRExecutionTest, ControlFlow_IfElse_Abs) {
   );
   
   ASSERT_NE(Func, nullptr);
-  
-  using FnType = int32_t (*)(void**, uint32_t, void*, void*, int32_t);
-  auto fn = reinterpret_cast<FnType>(Func);
-  
-  // abs(x) tests
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 0), 0);
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 1), 1);
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), -1), 1);
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 100), 100);
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), -100), 100);
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), INT32_MAX), INT32_MAX);
+
+  AST::FunctionType FuncType({ValType(TypeCode::I32)},
+                             {ValType(TypeCode::I32)});
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(0u)}), 0);
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(1u)}), 1);
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(static_cast<uint32_t>(-1))}), 1);
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(100u)}), 100);
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(static_cast<uint32_t>(-100))}), 100);
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(static_cast<uint32_t>(INT32_MAX))}), INT32_MAX);
 }
 
 // Test: br_table - switch statement (minimal: default only)
@@ -951,14 +1037,12 @@ TEST_F(IRExecutionTest, ControlFlow_BrTable_DefaultOnly) {
   );
   
   ASSERT_NE(Func, nullptr);
-  
-  using FnType = int32_t (*)(void**, uint32_t, void*, void*, int32_t);
-  auto fn = reinterpret_cast<FnType>(Func);
-  
-  // All inputs should go to default and return 42
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 0), 42);
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 1), 42);
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 100), 42);
+
+  AST::FunctionType FuncType({ValType(TypeCode::I32)},
+                             {ValType(TypeCode::I32)});
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(0u)}), 42);
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(1u)}), 42);
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(100u)}), 42);
 }
 
 // Test: br_table - switch statement
@@ -1030,17 +1114,15 @@ TEST_F(IRExecutionTest, ControlFlow_BrTable_Switch) {
   );
   
   ASSERT_NE(Func, nullptr);
-  
-  using FnType = int32_t (*)(void**, uint32_t, void*, void*, int32_t);
-  auto fn = reinterpret_cast<FnType>(Func);
-  
-  // Test all cases
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 0), 100);   // case 0
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 1), 200);   // case 1
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 2), 300);   // case 2
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 3), 0);     // default (out of bounds)
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 100), 0);   // default (way out of bounds)
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), -1), 0);    // default (negative = large unsigned)
+
+  AST::FunctionType FuncType({ValType(TypeCode::I32)},
+                             {ValType(TypeCode::I32)});
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(0u)}), 100);
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(1u)}), 200);
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(2u)}), 300);
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(3u)}), 0);
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(100u)}), 0);
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(static_cast<uint32_t>(-1))}), 0);
 }
 
 // Test: br_table with single case (edge case)
@@ -1086,13 +1168,12 @@ TEST_F(IRExecutionTest, ControlFlow_BrTable_SingleCase) {
   );
   
   ASSERT_NE(Func, nullptr);
-  
-  using FnType = int32_t (*)(void**, uint32_t, void*, void*, int32_t);
-  auto fn = reinterpret_cast<FnType>(Func);
-  
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 0), 42);  // case 0
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 1), 0);   // default
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 99), 0);  // default
+
+  AST::FunctionType FuncType({ValType(TypeCode::I32)},
+                             {ValType(TypeCode::I32)});
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(0u)}), 42);
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(1u)}), 0);
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(99u)}), 0);
 }
 
 //==============================================================================
@@ -1149,16 +1230,27 @@ TEST_F(IRExecutionTest, Call_DirectToNative) {
   
   // Set up function table with the native callee
   void* FuncTable[1] = { reinterpret_cast<void*>(&native_double) };
-  
-  // Call the JIT-compiled caller, which should call native_double
-  using FnType = int32_t (*)(void**, uint32_t, void*, void*, int32_t);
-  auto caller_fn = reinterpret_cast<FnType>(Caller);
-  
-  // Test: caller(5) -> calls native_double(5) -> returns 10
-  EXPECT_EQ(caller_fn(FuncTable, 1, nullptr, Memory.data(), 5), 10);
-  EXPECT_EQ(caller_fn(FuncTable, 1, nullptr, Memory.data(), 0), 0);
-  EXPECT_EQ(caller_fn(FuncTable, 1, nullptr, Memory.data(), -7), -14);
-  EXPECT_EQ(caller_fn(FuncTable, 1, nullptr, Memory.data(), 100), 200);
+
+  std::vector<ValVariant> Args = {ValVariant(5u)};
+  std::vector<ValVariant> Rets(1);
+  ASSERT_TRUE(Engine.invoke(Caller, CallerType, Args, Rets, FuncTable, 1,
+                           nullptr, Memory.data(), 0));
+  EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), 10);
+
+  Args = {ValVariant(0u)};
+  ASSERT_TRUE(Engine.invoke(Caller, CallerType, Args, Rets, FuncTable, 1,
+                           nullptr, Memory.data(), 0));
+  EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), 0);
+
+  Args = {ValVariant(static_cast<uint32_t>(-7))};
+  ASSERT_TRUE(Engine.invoke(Caller, CallerType, Args, Rets, FuncTable, 1,
+                           nullptr, Memory.data(), 0));
+  EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), -14);
+
+  Args = {ValVariant(100u)};
+  ASSERT_TRUE(Engine.invoke(Caller, CallerType, Args, Rets, FuncTable, 1,
+                           nullptr, Memory.data(), 0));
+  EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), 200);
 }
 
 // Test: Call with multiple arguments
@@ -1198,17 +1290,28 @@ TEST_F(IRExecutionTest, Call_MultipleArgs) {
   void* Caller = CompRes->NativeFunc;
   ASSERT_NE(Caller, nullptr);
   
-  // Set up function table
   void* FuncTable[1] = { reinterpret_cast<void*>(&native_add) };
-  
-  using FnType = int32_t (*)(void**, uint32_t, void*, void*, int32_t, int32_t);
-  auto caller_fn = reinterpret_cast<FnType>(Caller);
-  
-  // Test: caller(3, 4) -> calls native_add(3, 4) -> returns 7
-  EXPECT_EQ(caller_fn(FuncTable, 1, nullptr, Memory.data(), 3, 4), 7);
-  EXPECT_EQ(caller_fn(FuncTable, 1, nullptr, Memory.data(), 0, 0), 0);
-  EXPECT_EQ(caller_fn(FuncTable, 1, nullptr, Memory.data(), -5, 10), 5);
-  EXPECT_EQ(caller_fn(FuncTable, 1, nullptr, Memory.data(), 100, 200), 300);
+
+  std::vector<ValVariant> Args = {ValVariant(3u), ValVariant(4u)};
+  std::vector<ValVariant> Rets(1);
+  ASSERT_TRUE(Engine.invoke(Caller, CallerType, Args, Rets, FuncTable, 1,
+                           nullptr, Memory.data(), 0));
+  EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), 7);
+
+  Args = {ValVariant(0u), ValVariant(0u)};
+  ASSERT_TRUE(Engine.invoke(Caller, CallerType, Args, Rets, FuncTable, 1,
+                           nullptr, Memory.data(), 0));
+  EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), 0);
+
+  Args = {ValVariant(static_cast<uint32_t>(-5)), ValVariant(10u)};
+  ASSERT_TRUE(Engine.invoke(Caller, CallerType, Args, Rets, FuncTable, 1,
+                           nullptr, Memory.data(), 0));
+  EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), 5);
+
+  Args = {ValVariant(100u), ValVariant(200u)};
+  ASSERT_TRUE(Engine.invoke(Caller, CallerType, Args, Rets, FuncTable, 1,
+                           nullptr, Memory.data(), 0));
+  EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), 300);
 }
 
 // Native callee: triples its input (for call_indirect tests)
@@ -1236,14 +1339,13 @@ TEST_F(IRExecutionTest, CallIndirect_RuntimeIndex) {
   
   // Type 0 is the signature of functions in the table: (i32) -> i32
   AST::FunctionType Type0({ValType(TypeCode::I32)}, {ValType(TypeCode::I32)});
-  std::vector<const AST::FunctionType*> ModuleFuncs = {&Type0};
-  
-  // Build caller function
+  std::vector<const AST::FunctionType*> ModuleTypes = {&Type0};
+
   Builder.reset();
-  AST::FunctionType CallerType({ValType(TypeCode::I32), ValType(TypeCode::I32)}, 
+  AST::FunctionType CallerType({ValType(TypeCode::I32), ValType(TypeCode::I32)},
                                {ValType(TypeCode::I32)});
   ASSERT_TRUE(Builder.initialize(CallerType, {}));
-  Builder.setModuleFunctions(ModuleFuncs);
+  Builder.setModuleTypes(ModuleTypes);
   ASSERT_TRUE(Builder.buildFromInstructions(Instrs));
   
   // Compile
@@ -1253,28 +1355,41 @@ TEST_F(IRExecutionTest, CallIndirect_RuntimeIndex) {
   void* Caller = CompRes->NativeFunc;
   ASSERT_NE(Caller, nullptr);
   
-  // Set up function table with two functions
   void* FuncTable[2] = {
-    reinterpret_cast<void*>(&native_double),  // Index 0: doubles
-    reinterpret_cast<void*>(&native_triple)   // Index 1: triples
+    reinterpret_cast<void*>(&native_double),
+    reinterpret_cast<void*>(&native_triple)
   };
-  
-  using FnType = int32_t (*)(void**, uint32_t, void*, void*, int32_t, int32_t);
-  auto caller_fn = reinterpret_cast<FnType>(Caller);
-  
-  // Test: caller(value=5, index=0) -> calls native_double(5) -> returns 10
-  EXPECT_EQ(caller_fn(FuncTable, 2, nullptr, Memory.data(), 5, 0), 10);
-  
-  // Test: caller(value=5, index=1) -> calls native_triple(5) -> returns 15
-  EXPECT_EQ(caller_fn(FuncTable, 2, nullptr, Memory.data(), 5, 1), 15);
-  
-  // Test with different values
-  EXPECT_EQ(caller_fn(FuncTable, 2, nullptr, Memory.data(), 7, 0), 14);  // 7*2 = 14
-  EXPECT_EQ(caller_fn(FuncTable, 2, nullptr, Memory.data(), 7, 1), 21);  // 7*3 = 21
-  
-  // Test with negative values
-  EXPECT_EQ(caller_fn(FuncTable, 2, nullptr, Memory.data(), -4, 0), -8);   // -4*2 = -8
-  EXPECT_EQ(caller_fn(FuncTable, 2, nullptr, Memory.data(), -4, 1), -12);  // -4*3 = -12
+
+  std::vector<ValVariant> Args = {ValVariant(5u), ValVariant(0u)};
+  std::vector<ValVariant> Rets(1);
+  ASSERT_TRUE(Engine.invoke(Caller, CallerType, Args, Rets, FuncTable, 2,
+                            nullptr, Memory.data(), 0));
+  EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), 10);
+
+  Args = {ValVariant(5u), ValVariant(1u)};
+  ASSERT_TRUE(Engine.invoke(Caller, CallerType, Args, Rets, FuncTable, 2,
+                            nullptr, Memory.data(), 0));
+  EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), 15);
+
+  Args = {ValVariant(7u), ValVariant(0u)};
+  ASSERT_TRUE(Engine.invoke(Caller, CallerType, Args, Rets, FuncTable, 2,
+                            nullptr, Memory.data(), 0));
+  EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), 14);
+
+  Args = {ValVariant(7u), ValVariant(1u)};
+  ASSERT_TRUE(Engine.invoke(Caller, CallerType, Args, Rets, FuncTable, 2,
+                            nullptr, Memory.data(), 0));
+  EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), 21);
+
+  Args = {ValVariant(static_cast<uint32_t>(-4)), ValVariant(0u)};
+  ASSERT_TRUE(Engine.invoke(Caller, CallerType, Args, Rets, FuncTable, 2,
+                            nullptr, Memory.data(), 0));
+  EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), -8);
+
+  Args = {ValVariant(static_cast<uint32_t>(-4)), ValVariant(1u)};
+  ASSERT_TRUE(Engine.invoke(Caller, CallerType, Args, Rets, FuncTable, 2,
+                            nullptr, Memory.data(), 0));
+  EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), -12);
 }
 
 // Test: call_indirect with constant index (known at compile time)
@@ -1294,32 +1409,40 @@ TEST_F(IRExecutionTest, CallIndirect_ConstantIndex) {
   Instrs.emplace_back(OpCode::End);
   
   AST::FunctionType Type0({ValType(TypeCode::I32)}, {ValType(TypeCode::I32)});
-  std::vector<const AST::FunctionType*> ModuleFuncs = {&Type0};
-  
+  std::vector<const AST::FunctionType*> ModuleTypes = {&Type0};
+
   Builder.reset();
   AST::FunctionType CallerType({ValType(TypeCode::I32)}, {ValType(TypeCode::I32)});
   ASSERT_TRUE(Builder.initialize(CallerType, {}));
-  Builder.setModuleFunctions(ModuleFuncs);
+  Builder.setModuleTypes(ModuleTypes);
   ASSERT_TRUE(Builder.buildFromInstructions(Instrs));
-  
+
   IRJitEngine Engine;
   auto CompRes = Engine.compile(Builder.getIRContext());
   ASSERT_TRUE(CompRes.has_value()) << "Failed to compile";
   void* Caller = CompRes->NativeFunc;
   ASSERT_NE(Caller, nullptr);
-  
+
   void* FuncTable[2] = {
     reinterpret_cast<void*>(&native_double),
     reinterpret_cast<void*>(&native_triple)
   };
-  
-  using FnType = int32_t (*)(void**, uint32_t, void*, void*, int32_t);
-  auto caller_fn = reinterpret_cast<FnType>(Caller);
-  
-  // Always calls index 1 (native_triple)
-  EXPECT_EQ(caller_fn(FuncTable, 2, nullptr, Memory.data(), 5), 15);   // 5*3 = 15
-  EXPECT_EQ(caller_fn(FuncTable, 2, nullptr, Memory.data(), 10), 30);  // 10*3 = 30
-  EXPECT_EQ(caller_fn(FuncTable, 2, nullptr, Memory.data(), -3), -9);  // -3*3 = -9
+
+  std::vector<ValVariant> Args = {ValVariant(5u)};
+  std::vector<ValVariant> Rets(1);
+  ASSERT_TRUE(Engine.invoke(Caller, CallerType, Args, Rets, FuncTable, 2,
+                            nullptr, Memory.data(), 0));
+  EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), 15);
+
+  Args = {ValVariant(10u)};
+  ASSERT_TRUE(Engine.invoke(Caller, CallerType, Args, Rets, FuncTable, 2,
+                            nullptr, Memory.data(), 0));
+  EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), 30);
+
+  Args = {ValVariant(static_cast<uint32_t>(-3))};
+  ASSERT_TRUE(Engine.invoke(Caller, CallerType, Args, Rets, FuncTable, 2,
+                            nullptr, Memory.data(), 0));
+  EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), -9);
 }
 
 //==============================================================================
@@ -1353,23 +1476,26 @@ TEST_F(IRExecutionTest, Global_GetI32) {
   void* Func = CompRes->NativeFunc;
   ASSERT_NE(Func, nullptr);
   
-  // Set up globals - GlobalBase is ValVariant** (array of pointers to ValVariant)
-  // Each ValVariant is 16 bytes, but for i32 we store at offset 0
   ValVariant GlobalVal;
   ValVariant* GlobalPtrs[1] = {&GlobalVal};
-  
-  using FnType = int32_t (*)(void**, uint32_t, void*, void*);
-  auto fn = reinterpret_cast<FnType>(Func);
-  
-  // Test with different values
+
+  std::vector<ValVariant> Args;
+  std::vector<ValVariant> Rets(1);
+
   GlobalVal = ValVariant(static_cast<uint32_t>(42));
-  EXPECT_EQ(fn(nullptr, 0, GlobalPtrs, Memory.data()), 42);
-  
+  ASSERT_TRUE(Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0,
+                            GlobalPtrs, Memory.data(), 0));
+  EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), 42);
+
   GlobalVal = ValVariant(static_cast<uint32_t>(-1));
-  EXPECT_EQ(fn(nullptr, 0, GlobalPtrs, Memory.data()), -1);
-  
-  GlobalVal = ValVariant(static_cast<uint32_t>(0x7FFFFFFF));  // INT32_MAX
-  EXPECT_EQ(fn(nullptr, 0, GlobalPtrs, Memory.data()), 0x7FFFFFFF);
+  ASSERT_TRUE(Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0,
+                            GlobalPtrs, Memory.data(), 0));
+  EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), -1);
+
+  GlobalVal = ValVariant(static_cast<uint32_t>(0x7FFFFFFF));
+  ASSERT_TRUE(Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0,
+                            GlobalPtrs, Memory.data(), 0));
+  EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), 0x7FFFFFFF);
 }
 
 // Test: global.set for i32 global
@@ -1397,21 +1523,23 @@ TEST_F(IRExecutionTest, Global_SetI32) {
   void* Func = CompRes->NativeFunc;
   ASSERT_NE(Func, nullptr);
   
-  // Set up globals - GlobalBase is ValVariant** (array of pointers to ValVariant)
   ValVariant GlobalVal(static_cast<uint32_t>(0));
   ValVariant* GlobalPtrs[1] = {&GlobalVal};
-  
-  using FnType = void (*)(void**, uint32_t, void*, void*, int32_t);
-  auto fn = reinterpret_cast<FnType>(Func);
-  
-  // Test setting different values
-  fn(nullptr, 0, GlobalPtrs, Memory.data(), 123);
+
+  std::vector<ValVariant> Args = {ValVariant(123u)};
+  std::vector<ValVariant> Rets;
+  ASSERT_TRUE(Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0,
+                             GlobalPtrs, Memory.data(), 0));
   EXPECT_EQ(GlobalVal.get<uint32_t>(), 123u);
-  
-  fn(nullptr, 0, GlobalPtrs, Memory.data(), -999);
+
+  Args = {ValVariant(static_cast<uint32_t>(-999))};
+  ASSERT_TRUE(Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0,
+                             GlobalPtrs, Memory.data(), 0));
   EXPECT_EQ(static_cast<int32_t>(GlobalVal.get<uint32_t>()), -999);
-  
-  fn(nullptr, 0, GlobalPtrs, Memory.data(), 0);
+
+  Args = {ValVariant(0u)};
+  ASSERT_TRUE(Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0,
+                             GlobalPtrs, Memory.data(), 0));
   EXPECT_EQ(GlobalVal.get<uint32_t>(), 0u);
 }
 
@@ -1446,22 +1574,27 @@ TEST_F(IRExecutionTest, Global_Increment) {
   void* Func = CompRes->NativeFunc;
   ASSERT_NE(Func, nullptr);
   
-  // Set up globals - GlobalBase is ValVariant** (array of pointers to ValVariant)
   ValVariant GlobalVal(static_cast<uint32_t>(0));
   ValVariant* GlobalPtrs[1] = {&GlobalVal};
-  
-  using FnType = int32_t (*)(void**, uint32_t, void*, void*);
-  auto fn = reinterpret_cast<FnType>(Func);
-  
-  // Call multiple times, each should increment
+
+  std::vector<ValVariant> Args;
+  std::vector<ValVariant> Rets(1);
+
   GlobalVal = ValVariant(static_cast<uint32_t>(0));
-  EXPECT_EQ(fn(nullptr, 0, GlobalPtrs, Memory.data()), 1);
-  EXPECT_EQ(fn(nullptr, 0, GlobalPtrs, Memory.data()), 2);
-  EXPECT_EQ(fn(nullptr, 0, GlobalPtrs, Memory.data()), 3);
-  
-  // Start from different value
+  ASSERT_TRUE(Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0,
+                            GlobalPtrs, Memory.data(), 0));
+  EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), 1);
+  ASSERT_TRUE(Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0,
+                            GlobalPtrs, Memory.data(), 0));
+  EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), 2);
+  ASSERT_TRUE(Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0,
+                            GlobalPtrs, Memory.data(), 0));
+  EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), 3);
+
   GlobalVal = ValVariant(static_cast<uint32_t>(100));
-  EXPECT_EQ(fn(nullptr, 0, GlobalPtrs, Memory.data()), 101);
+  ASSERT_TRUE(Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0,
+                            GlobalPtrs, Memory.data(), 0));
+  EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), 101);
 }
 
 // Test: multiple globals
@@ -1490,26 +1623,30 @@ TEST_F(IRExecutionTest, Global_Multiple) {
   void* Func = CompRes->NativeFunc;
   ASSERT_NE(Func, nullptr);
   
-  // Set up globals - GlobalBase is ValVariant** (array of pointers to ValVariant)
   ValVariant GlobalVal0(static_cast<uint32_t>(0));
   ValVariant GlobalVal1(static_cast<uint32_t>(0));
   ValVariant* GlobalPtrs[2] = {&GlobalVal0, &GlobalVal1};
-  
-  using FnType = int32_t (*)(void**, uint32_t, void*, void*);
-  auto fn = reinterpret_cast<FnType>(Func);
-  
-  // Test different combinations
+
+  std::vector<ValVariant> Args;
+  std::vector<ValVariant> Rets(1);
+
   GlobalVal0 = ValVariant(static_cast<uint32_t>(10));
   GlobalVal1 = ValVariant(static_cast<uint32_t>(20));
-  EXPECT_EQ(fn(nullptr, 0, GlobalPtrs, Memory.data()), 30);
-  
+  ASSERT_TRUE(Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0,
+                            GlobalPtrs, Memory.data(), 0));
+  EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), 30);
+
   GlobalVal0 = ValVariant(static_cast<uint32_t>(-5));
   GlobalVal1 = ValVariant(static_cast<uint32_t>(5));
-  EXPECT_EQ(fn(nullptr, 0, GlobalPtrs, Memory.data()), 0);
-  
+  ASSERT_TRUE(Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0,
+                            GlobalPtrs, Memory.data(), 0));
+  EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), 0);
+
   GlobalVal0 = ValVariant(static_cast<uint32_t>(100));
   GlobalVal1 = ValVariant(static_cast<uint32_t>(200));
-  EXPECT_EQ(fn(nullptr, 0, GlobalPtrs, Memory.data()), 300);
+  ASSERT_TRUE(Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0,
+                            GlobalPtrs, Memory.data(), 0));
+  EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), 300);
 }
 
 // Test: i64 global
@@ -1535,18 +1672,21 @@ TEST_F(IRExecutionTest, Global_I64) {
   void* Func = CompRes->NativeFunc;
   ASSERT_NE(Func, nullptr);
   
-  // Set up globals - GlobalBase is ValVariant** (array of pointers to ValVariant)
   ValVariant GlobalVal(static_cast<uint64_t>(0));
   ValVariant* GlobalPtrs[1] = {&GlobalVal};
-  
-  using FnType = int64_t (*)(void**, uint32_t, void*, void*);
-  auto fn = reinterpret_cast<FnType>(Func);
-  
+
+  std::vector<ValVariant> Args;
+  std::vector<ValVariant> Rets(1);
+
   GlobalVal = ValVariant(static_cast<uint64_t>(0x123456789ABCDEF0ULL));
-  EXPECT_EQ(fn(nullptr, 0, GlobalPtrs, Memory.data()), 0x123456789ABCDEF0LL);
-  
+  ASSERT_TRUE(Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0,
+                            GlobalPtrs, Memory.data(), 0));
+  EXPECT_EQ(static_cast<int64_t>(Rets[0].get<uint64_t>()), 0x123456789ABCDEF0LL);
+
   GlobalVal = ValVariant(static_cast<uint64_t>(-1LL));
-  EXPECT_EQ(fn(nullptr, 0, GlobalPtrs, Memory.data()), -1LL);
+  ASSERT_TRUE(Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0,
+                            GlobalPtrs, Memory.data(), 0));
+  EXPECT_EQ(static_cast<int64_t>(Rets[0].get<uint64_t>()), -1LL);
 }
 
 //==============================================================================
@@ -1697,80 +1837,49 @@ protected:
 TEST_F(MemoryExecutionTest, Memory_I32_Load) {
   void* Func = buildLoadFunc(OpCode::I32__load, TypeCode::I32);
   ASSERT_NE(Func, nullptr);
-  
-  using FnType = int32_t (*)(void**, uint32_t, void*, void*, int32_t);
-  auto fn = reinterpret_cast<FnType>(Func);
-  
-  // Load i32 from offset 16 (contains 0x12345678)
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 16), 0x12345678);
-  
-  // Load i32 from offset 0 (contains 0x04030201 in little-endian)
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 0), 0x04030201);
-  
-  // Load negative i32 from offset 32 (contains -1)
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 32), -1);
+
+  AST::FunctionType FuncType({ValType(TypeCode::I32)}, {ValType(TypeCode::I32)});
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(16u)}), 0x12345678);
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(0u)}), 0x04030201);
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(32u)}), -1);
 }
 
 TEST_F(MemoryExecutionTest, Memory_I32_Load8_S) {
   void* Func = buildLoadFunc(OpCode::I32__load8_s, TypeCode::I32);
   ASSERT_NE(Func, nullptr);
-  
-  using FnType = int32_t (*)(void**, uint32_t, void*, void*, int32_t);
-  auto fn = reinterpret_cast<FnType>(Func);
-  
-  // Load byte 0 (0x01) - positive, sign-extends to 1
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 0), 1);
-  
-  // Load byte at offset 48 (0xFF = -1 signed) - sign-extends to -1
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 48), -1);
-  
-  // Load byte at offset 50 (0x80 = -128 signed) - sign-extends to -128
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 50), -128);
+
+  AST::FunctionType FuncType({ValType(TypeCode::I32)}, {ValType(TypeCode::I32)});
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(0u)}), 1);
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(48u)}), -1);
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(50u)}), -128);
 }
 
 TEST_F(MemoryExecutionTest, Memory_I32_Load8_U) {
   void* Func = buildLoadFunc(OpCode::I32__load8_u, TypeCode::I32);
   ASSERT_NE(Func, nullptr);
-  
-  using FnType = int32_t (*)(void**, uint32_t, void*, void*, int32_t);
-  auto fn = reinterpret_cast<FnType>(Func);
-  
-  // Load byte 0 (0x01) - zero-extends to 1
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 0), 1);
-  
-  // Load byte at offset 48 (0xFF) - zero-extends to 255
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 48), 255);
-  
-  // Load byte at offset 50 (0x80) - zero-extends to 128
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 50), 128);
+
+  AST::FunctionType FuncType({ValType(TypeCode::I32)}, {ValType(TypeCode::I32)});
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(0u)}), 1);
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(48u)}), 255);
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(50u)}), 128);
 }
 
 TEST_F(MemoryExecutionTest, Memory_I32_Load16_S) {
   void* Func = buildLoadFunc(OpCode::I32__load16_s, TypeCode::I32);
   ASSERT_NE(Func, nullptr);
-  
-  using FnType = int32_t (*)(void**, uint32_t, void*, void*, int32_t);
-  auto fn = reinterpret_cast<FnType>(Func);
-  
-  // Load i16 from offset 0 (0x0201) - sign-extends to 513
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 0), 0x0201);
-  
-  // Load i16 from offset 40 (0xFFFF = -1) - sign-extends to -1
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 40), -1);
+
+  AST::FunctionType FuncType({ValType(TypeCode::I32)}, {ValType(TypeCode::I32)});
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(0u)}), 0x0201);
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(40u)}), -1);
 }
 
 TEST_F(MemoryExecutionTest, Memory_I32_Load16_U) {
   void* Func = buildLoadFunc(OpCode::I32__load16_u, TypeCode::I32);
   ASSERT_NE(Func, nullptr);
-  
-  using FnType = int32_t (*)(void**, uint32_t, void*, void*, int32_t);
-  auto fn = reinterpret_cast<FnType>(Func);
-  
-  // Load i16 from offset 0 (0x0201) - zero-extends to 513
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 0), 0x0201);
-  
-  // Load i16 from offset 40 (0xFFFF) - zero-extends to 65535
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 40), 65535);
+
+  AST::FunctionType FuncType({ValType(TypeCode::I32)}, {ValType(TypeCode::I32)});
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(0u)}), 0x0201);
+  EXPECT_EQ(invokeI32(Func, FuncType, {ValVariant(40u)}), 65535);
 }
 
 //------------------------------------------------------------------------------
@@ -1780,71 +1889,46 @@ TEST_F(MemoryExecutionTest, Memory_I32_Load16_U) {
 TEST_F(MemoryExecutionTest, Memory_I64_Load) {
   void* Func = buildLoadFunc(OpCode::I64__load, TypeCode::I64);
   ASSERT_NE(Func, nullptr);
-  
-  using FnType = int64_t (*)(void**, uint32_t, void*, void*, int32_t);
-  auto fn = reinterpret_cast<FnType>(Func);
-  
-  // Load i64 from offset 24 (contains 0xFEDCBA9876543210)
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 24), static_cast<int64_t>(0xFEDCBA9876543210ULL));
-  
-  // Load i64 from offset 0
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 0), static_cast<int64_t>(0x0807060504030201ULL));
+
+  AST::FunctionType FuncType({ValType(TypeCode::I32)}, {ValType(TypeCode::I64)});
+  EXPECT_EQ(invokeI64(Func, FuncType, {ValVariant(24u)}), static_cast<int64_t>(0xFEDCBA9876543210ULL));
+  EXPECT_EQ(invokeI64(Func, FuncType, {ValVariant(0u)}), static_cast<int64_t>(0x0807060504030201ULL));
 }
 
 TEST_F(MemoryExecutionTest, Memory_I64_Load8_S) {
   void* Func = buildLoadFunc(OpCode::I64__load8_s, TypeCode::I64);
   ASSERT_NE(Func, nullptr);
-  
-  using FnType = int64_t (*)(void**, uint32_t, void*, void*, int32_t);
-  auto fn = reinterpret_cast<FnType>(Func);
-  
-  // Load byte 0 (0x01) - sign-extends to 1
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 0), 1LL);
-  
-  // Load byte at offset 48 (0xFF) - sign-extends to -1
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 48), -1LL);
+
+  AST::FunctionType FuncType({ValType(TypeCode::I32)}, {ValType(TypeCode::I64)});
+  EXPECT_EQ(invokeI64(Func, FuncType, {ValVariant(0u)}), 1LL);
+  EXPECT_EQ(invokeI64(Func, FuncType, {ValVariant(48u)}), -1LL);
 }
 
 TEST_F(MemoryExecutionTest, Memory_I64_Load8_U) {
   void* Func = buildLoadFunc(OpCode::I64__load8_u, TypeCode::I64);
   ASSERT_NE(Func, nullptr);
-  
-  using FnType = int64_t (*)(void**, uint32_t, void*, void*, int32_t);
-  auto fn = reinterpret_cast<FnType>(Func);
-  
-  // Load byte 0 (0x01) - zero-extends to 1
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 0), 1LL);
-  
-  // Load byte at offset 48 (0xFF) - zero-extends to 255
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 48), 255LL);
+
+  AST::FunctionType FuncType({ValType(TypeCode::I32)}, {ValType(TypeCode::I64)});
+  EXPECT_EQ(invokeI64(Func, FuncType, {ValVariant(0u)}), 1LL);
+  EXPECT_EQ(invokeI64(Func, FuncType, {ValVariant(48u)}), 255LL);
 }
 
 TEST_F(MemoryExecutionTest, Memory_I64_Load32_S) {
   void* Func = buildLoadFunc(OpCode::I64__load32_s, TypeCode::I64);
   ASSERT_NE(Func, nullptr);
-  
-  using FnType = int64_t (*)(void**, uint32_t, void*, void*, int32_t);
-  auto fn = reinterpret_cast<FnType>(Func);
-  
-  // Load i32 from offset 16 (0x12345678) - sign-extends
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 16), 0x12345678LL);
-  
-  // Load i32 from offset 32 (0xFFFFFFFF = -1) - sign-extends to -1
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 32), -1LL);
+
+  AST::FunctionType FuncType({ValType(TypeCode::I32)}, {ValType(TypeCode::I64)});
+  EXPECT_EQ(invokeI64(Func, FuncType, {ValVariant(16u)}), 0x12345678LL);
+  EXPECT_EQ(invokeI64(Func, FuncType, {ValVariant(32u)}), -1LL);
 }
 
 TEST_F(MemoryExecutionTest, Memory_I64_Load32_U) {
   void* Func = buildLoadFunc(OpCode::I64__load32_u, TypeCode::I64);
   ASSERT_NE(Func, nullptr);
-  
-  using FnType = int64_t (*)(void**, uint32_t, void*, void*, int32_t);
-  auto fn = reinterpret_cast<FnType>(Func);
-  
-  // Load i32 from offset 16 (0x12345678) - zero-extends
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 16), 0x12345678LL);
-  
-  // Load i32 from offset 32 (0xFFFFFFFF) - zero-extends to 4294967295
-  EXPECT_EQ(fn(nullptr, 0, nullptr, Memory.data(), 32), 0xFFFFFFFFLL);
+
+  AST::FunctionType FuncType({ValType(TypeCode::I32)}, {ValType(TypeCode::I64)});
+  EXPECT_EQ(invokeI64(Func, FuncType, {ValVariant(16u)}), 0x12345678LL);
+  EXPECT_EQ(invokeI64(Func, FuncType, {ValVariant(32u)}), 0xFFFFFFFFLL);
 }
 
 //------------------------------------------------------------------------------
@@ -1854,14 +1938,9 @@ TEST_F(MemoryExecutionTest, Memory_I64_Load32_U) {
 TEST_F(MemoryExecutionTest, Memory_I32_Store) {
   void* Func = buildStoreFunc(OpCode::I32__store, TypeCode::I32);
   ASSERT_NE(Func, nullptr);
-  
-  using FnType = void (*)(void**, uint32_t, void*, void*, int32_t, int32_t);
-  auto fn = reinterpret_cast<FnType>(Func);
-  
-  // Store 0xDEADBEEF at offset 100
-  fn(nullptr, 0, nullptr, Memory.data(), 100, static_cast<int32_t>(0xDEADBEEF));
-  
-  // Verify (little-endian)
+
+  AST::FunctionType FuncType({ValType(TypeCode::I32), ValType(TypeCode::I32)}, {});
+  invokeVoid(Func, FuncType, {ValVariant(100u), ValVariant(static_cast<uint32_t>(0xDEADBEEF))});
   EXPECT_EQ(Memory[100], 0xEF);
   EXPECT_EQ(Memory[101], 0xBE);
   EXPECT_EQ(Memory[102], 0xAD);
@@ -1871,33 +1950,23 @@ TEST_F(MemoryExecutionTest, Memory_I32_Store) {
 TEST_F(MemoryExecutionTest, Memory_I32_Store8) {
   void* Func = buildStoreFunc(OpCode::I32__store8, TypeCode::I32);
   ASSERT_NE(Func, nullptr);
-  
-  using FnType = void (*)(void**, uint32_t, void*, void*, int32_t, int32_t);
-  auto fn = reinterpret_cast<FnType>(Func);
-  
-  // Store truncated byte (0x12345678 -> 0x78) at offset 110
-  fn(nullptr, 0, nullptr, Memory.data(), 110, 0x12345678);
+
+  AST::FunctionType FuncType({ValType(TypeCode::I32), ValType(TypeCode::I32)}, {});
+  invokeVoid(Func, FuncType, {ValVariant(110u), ValVariant(0x12345678u)});
   EXPECT_EQ(Memory[110], 0x78);
-  
-  // Store -1 truncated to byte (0xFF) at offset 111
-  fn(nullptr, 0, nullptr, Memory.data(), 111, -1);
+  invokeVoid(Func, FuncType, {ValVariant(111u), ValVariant(static_cast<uint32_t>(-1))});
   EXPECT_EQ(Memory[111], 0xFF);
 }
 
 TEST_F(MemoryExecutionTest, Memory_I32_Store16) {
   void* Func = buildStoreFunc(OpCode::I32__store16, TypeCode::I32);
   ASSERT_NE(Func, nullptr);
-  
-  using FnType = void (*)(void**, uint32_t, void*, void*, int32_t, int32_t);
-  auto fn = reinterpret_cast<FnType>(Func);
-  
-  // Store truncated i16 (0x12345678 -> 0x5678) at offset 120
-  fn(nullptr, 0, nullptr, Memory.data(), 120, 0x12345678);
+
+  AST::FunctionType FuncType({ValType(TypeCode::I32), ValType(TypeCode::I32)}, {});
+  invokeVoid(Func, FuncType, {ValVariant(120u), ValVariant(0x12345678u)});
   EXPECT_EQ(Memory[120], 0x78);
   EXPECT_EQ(Memory[121], 0x56);
-  
-  // Store -1 truncated to i16 (0xFFFF) at offset 122
-  fn(nullptr, 0, nullptr, Memory.data(), 122, -1);
+  invokeVoid(Func, FuncType, {ValVariant(122u), ValVariant(static_cast<uint32_t>(-1))});
   EXPECT_EQ(Memory[122], 0xFF);
   EXPECT_EQ(Memory[123], 0xFF);
 }
@@ -1909,14 +1978,9 @@ TEST_F(MemoryExecutionTest, Memory_I32_Store16) {
 TEST_F(MemoryExecutionTest, Memory_I64_Store) {
   void* Func = buildStoreFunc(OpCode::I64__store, TypeCode::I64);
   ASSERT_NE(Func, nullptr);
-  
-  using FnType = void (*)(void**, uint32_t, void*, void*, int32_t, int64_t);
-  auto fn = reinterpret_cast<FnType>(Func);
-  
-  // Store 0x123456789ABCDEF0 at offset 200
-  fn(nullptr, 0, nullptr, Memory.data(), 200, static_cast<int64_t>(0x123456789ABCDEF0ULL));
-  
-  // Verify (little-endian)
+
+  AST::FunctionType FuncType({ValType(TypeCode::I32), ValType(TypeCode::I64)}, {});
+  invokeVoid(Func, FuncType, {ValVariant(200u), ValVariant(static_cast<uint64_t>(0x123456789ABCDEF0ULL))});
   EXPECT_EQ(Memory[200], 0xF0);
   EXPECT_EQ(Memory[201], 0xDE);
   EXPECT_EQ(Memory[202], 0xBC);
@@ -1930,24 +1994,18 @@ TEST_F(MemoryExecutionTest, Memory_I64_Store) {
 TEST_F(MemoryExecutionTest, Memory_I64_Store8) {
   void* Func = buildStoreFunc(OpCode::I64__store8, TypeCode::I64);
   ASSERT_NE(Func, nullptr);
-  
-  using FnType = void (*)(void**, uint32_t, void*, void*, int32_t, int64_t);
-  auto fn = reinterpret_cast<FnType>(Func);
-  
-  // Store truncated byte at offset 210
-  fn(nullptr, 0, nullptr, Memory.data(), 210, 0x123456789ABCDEF0LL);
+
+  AST::FunctionType FuncType({ValType(TypeCode::I32), ValType(TypeCode::I64)}, {});
+  invokeVoid(Func, FuncType, {ValVariant(210u), ValVariant(static_cast<uint64_t>(0x123456789ABCDEF0ULL))});
   EXPECT_EQ(Memory[210], 0xF0);
 }
 
 TEST_F(MemoryExecutionTest, Memory_I64_Store16) {
   void* Func = buildStoreFunc(OpCode::I64__store16, TypeCode::I64);
   ASSERT_NE(Func, nullptr);
-  
-  using FnType = void (*)(void**, uint32_t, void*, void*, int32_t, int64_t);
-  auto fn = reinterpret_cast<FnType>(Func);
-  
-  // Store truncated i16 at offset 220
-  fn(nullptr, 0, nullptr, Memory.data(), 220, 0x123456789ABCDEF0LL);
+
+  AST::FunctionType FuncType({ValType(TypeCode::I32), ValType(TypeCode::I64)}, {});
+  invokeVoid(Func, FuncType, {ValVariant(220u), ValVariant(static_cast<uint64_t>(0x123456789ABCDEF0ULL))});
   EXPECT_EQ(Memory[220], 0xF0);
   EXPECT_EQ(Memory[221], 0xDE);
 }
@@ -1955,12 +2013,9 @@ TEST_F(MemoryExecutionTest, Memory_I64_Store16) {
 TEST_F(MemoryExecutionTest, Memory_I64_Store32) {
   void* Func = buildStoreFunc(OpCode::I64__store32, TypeCode::I64);
   ASSERT_NE(Func, nullptr);
-  
-  using FnType = void (*)(void**, uint32_t, void*, void*, int32_t, int64_t);
-  auto fn = reinterpret_cast<FnType>(Func);
-  
-  // Store truncated i32 at offset 230
-  fn(nullptr, 0, nullptr, Memory.data(), 230, 0x123456789ABCDEF0LL);
+
+  AST::FunctionType FuncType({ValType(TypeCode::I32), ValType(TypeCode::I64)}, {});
+  invokeVoid(Func, FuncType, {ValVariant(230u), ValVariant(static_cast<uint64_t>(0x123456789ABCDEF0ULL))});
   EXPECT_EQ(Memory[230], 0xF0);
   EXPECT_EQ(Memory[231], 0xDE);
   EXPECT_EQ(Memory[232], 0xBC);
