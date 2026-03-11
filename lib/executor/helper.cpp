@@ -24,6 +24,7 @@ static thread_local WasmEdge::Executor::Executor *g_jitExecutor = nullptr;
 static thread_local WasmEdge::Runtime::StackManager *g_jitStackMgr = nullptr;
 static thread_local const WasmEdge::Runtime::Instance::ModuleInstance *g_jitModInst = nullptr;
 static thread_local WasmEdge::Runtime::Instance::TableInstance *g_jitTable0 = nullptr;
+static thread_local WasmEdge::Runtime::Instance::MemoryInstance *g_jitMemory0 = nullptr;
 
 extern "C" uint64_t jit_host_call(WasmEdge::VM::JitExecEnv *env,
                                   uint32_t funcIdx, uint64_t *args) {
@@ -186,6 +187,26 @@ extern "C" uint64_t jit_direct_or_host(WasmEdge::VM::JitExecEnv *env,
   default:
     return 0;
   }
+}
+
+extern "C" int32_t jit_memory_grow(WasmEdge::VM::JitExecEnv *env,
+                                    uint32_t nPages) {
+  if (!g_jitMemory0)
+    return static_cast<int32_t>(-1);
+  uint32_t oldPages = g_jitMemory0->getPageSize();
+  if (!g_jitMemory0->growPage(nPages))
+    return static_cast<int32_t>(-1);
+  // Update MemoryBase in env since grow may relocate the buffer.
+  if (env)
+    env->MemoryBase = g_jitMemory0->getDataPtr();
+  return static_cast<int32_t>(oldPages);
+}
+
+extern "C" int32_t jit_memory_size(WasmEdge::VM::JitExecEnv *env) {
+  (void)env;
+  if (!g_jitMemory0)
+    return 0;
+  return static_cast<int32_t>(g_jitMemory0->getPageSize());
 }
 #endif
 
@@ -544,8 +565,11 @@ Executor::enterFunction(Runtime::StackManager &StackMgr,
     if (ModInst) {
       auto tabRes = ModInst->getTable(0);
       g_jitTable0 = tabRes ? *tabRes : nullptr;
+      auto memRes = ModInst->getMemory(0);
+      g_jitMemory0 = memRes ? *memRes : nullptr;
     } else {
       g_jitTable0 = nullptr;
+      g_jitMemory0 = nullptr;
     }
 
     auto Res = IREngine.invoke(Func.getIRJitNativeFunc(), FuncType, Args, Rets,

@@ -55,6 +55,8 @@ struct JitExecEnv {
   void *MemoryBase;
   void *HostCallFn;      // Pointer to jit_host_call trampoline (extern "C")
   void *DirectOrHostFn; // Pointer to jit_direct_or_host (null-safe direct call)
+  void *MemoryGrowFn;   // Pointer to jit_memory_grow trampoline
+  void *MemorySizeFn;   // Pointer to jit_memory_size trampoline
 };
 
 /// Host call trampoline: dispatches calls to non-JIT functions (imports)
@@ -71,6 +73,11 @@ extern "C" uint64_t jit_direct_or_host(JitExecEnv *env, void *funcPtr,
 /// JMP buf for unwinding on proc_exit (Terminated). Used by jit_host_call to
 /// longjmp back to invoke() so we do not return to JIT and run unreachable.
 extern "C" void *wasmedge_ir_jit_get_termination_buf(void);
+/// memory.grow trampoline: grows memory by N pages, returns old size or -1.
+/// Also updates env->MemoryBase to the (potentially relocated) data pointer.
+extern "C" int32_t jit_memory_grow(JitExecEnv *env, uint32_t nPages);
+/// memory.size trampoline: returns current memory size in pages.
+extern "C" int32_t jit_memory_size(JitExecEnv *env);
 
 /// IR JIT Engine - compiles and executes IR code
 class IRJitEngine {

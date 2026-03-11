@@ -128,6 +128,8 @@ Expect<void> WasmToIRBuilder::initialize(
   MemoryBase = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, MemoryBase))));
   HostCallFnPtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, HostCallFn))));
   DirectOrHostFnPtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, DirectOrHostFn))));
+  MemoryGrowFnPtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, MemoryGrowFn))));
+  MemorySizeFnPtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, MemorySizeFn))));
 
   // Load wasm parameters from the args array. Each slot is sizeof(uint64_t).
   // On little-endian (x86_64), loading a narrower type from the slot address
@@ -636,20 +638,35 @@ Expect<void> WasmToIRBuilder::visitInstruction(const AST::Instruction &Instr) {
   }
   
   case OpCode::Memory__size: {
-    // memory.size: returns the current memory size in pages
-    // For POC: return 0 (would need memory instance to get real size)
+    // memory.size: call jit_memory_size(env) -> returns page count
     ir_ctx *ctx = &Ctx;
-    ir_ref Size = ir_CONST_I32(0);  // Placeholder - need runtime access
-    push(Size);
+    ir_ref EnvPtrVal = ensureValidRef(EnvPtr, IR_ADDR);
+    ir_ref Fn = ensureValidRef(MemorySizeFnPtr, IR_ADDR);
+    uint8_t ProtoParams[1] = {IR_ADDR};
+    ir_ref Proto = ir_proto(ctx, IR_FASTCALL_FUNC, IR_I32, 1, ProtoParams);
+    ir_ref TypedFn = ir_emit2(ctx, IR_OPT(IR_PROTO, IR_ADDR), Fn, Proto);
+    ir_ref Result = ir_CALL_1(IR_I32, TypedFn, EnvPtrVal);
+    push(Result);
     return {};
   }
   
   case OpCode::Memory__grow: {
-    // memory.grow: tries to grow memory by n pages, returns old size or -1
-    // For POC: always return -1 (growth failed)
+    // memory.grow: call jit_memory_grow(env, nPages) -> returns old size or -1
+    // After grow, reload MemoryBase from env since buffer may relocate.
     ir_ctx *ctx = &Ctx;
-    (void)pop();  // Discard the growth amount
-    ir_ref Result = ir_CONST_I32(-1);  // Placeholder - always fail
+    ir_ref NPagesI32 = pop();
+    ir_ref NPages = ensureValidRef(NPagesI32, IR_I32);
+    // Cast to u32 for the trampoline
+    ir_ref NPagesU32 = ir_ZEXT_U32(NPages);
+    ir_ref EnvPtrVal = ensureValidRef(EnvPtr, IR_ADDR);
+    ir_ref Fn = ensureValidRef(MemoryGrowFnPtr, IR_ADDR);
+    uint8_t ProtoParams[2] = {IR_ADDR, IR_U32};
+    ir_ref Proto = ir_proto(ctx, IR_FASTCALL_FUNC, IR_I32, 2, ProtoParams);
+    ir_ref TypedFn = ir_emit2(ctx, IR_OPT(IR_PROTO, IR_ADDR), Fn, Proto);
+    ir_ref Result = ir_CALL_2(IR_I32, TypedFn, EnvPtrVal, NPagesU32);
+    // Reload MemoryBase from env since grow may have relocated the buffer
+    MemoryBase = ir_LOAD_A(ir_ADD_A(EnvPtrVal,
+        ir_CONST_ADDR(offsetof(JitExecEnv, MemoryBase))));
     push(Result);
     return {};
   }

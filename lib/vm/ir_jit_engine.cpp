@@ -130,6 +130,8 @@ Expect<void> IRJitEngine::invoke(void *NativeFunc,
   Env.MemoryBase = MemoryBase;
   Env.HostCallFn = reinterpret_cast<void *>(&jit_host_call);
   Env.DirectOrHostFn = reinterpret_cast<void *>(&jit_direct_or_host);
+  Env.MemoryGrowFn = reinterpret_cast<void *>(&jit_memory_grow);
+  Env.MemorySizeFn = reinterpret_cast<void *>(&jit_memory_size);
 
   // #region agent log
   {
