@@ -171,9 +171,32 @@ Expect<void> WasmToIRBuilder::initialize(
 
 Expect<void>
 WasmToIRBuilder::buildFromInstructions(Span<const AST::Instruction> Instrs) {
+  // Pre-pass: compute max callee arity so we can allocate SharedCallArgs once.
+  uint32_t maxArity = 0;
+  for (const auto &Instr : Instrs) {
+    OpCode Op = Instr.getOpCode();
+    if (Op == OpCode::Call) {
+      uint32_t idx = Instr.getTargetIndex();
+      if (idx < ModuleFuncTypes.size()) {
+        uint32_t n =
+            static_cast<uint32_t>(ModuleFuncTypes[idx]->getParamTypes().size());
+        if (n > maxArity)
+          maxArity = n;
+      }
+    } else if (Op == OpCode::Call_indirect) {
+      uint32_t typeIdx = Instr.getTargetIndex();
+      if (typeIdx < ModuleTypeSection.size()) {
+        uint32_t n = static_cast<uint32_t>(
+            ModuleTypeSection[typeIdx]->getParamTypes().size());
+        if (n > maxArity)
+          maxArity = n;
+      }
+    }
+  }
+  if (maxArity > MaxCallArgs)
+    MaxCallArgs = maxArity;
+
   // Pre-allocate a shared args buffer for all call instructions.
-  // This single ir_ALLOCA in the prologue replaces per-call dynamic allocation,
-  // preventing stack growth in functions with many calls (e.g. 887 in ed25519).
   if (MaxCallArgs > 0) {
     ir_ctx *ctx = &Ctx;
     SharedCallArgs = ir_ALLOCA(ir_CONST_I32(MaxCallArgs * sizeof(uint64_t)));
@@ -1170,9 +1193,21 @@ Expect<void> WasmToIRBuilder::visitUnary(OpCode Op) {
       Result = ir_COND(IR_I32, IsZero, BitWidth, CtzVal);
     }
     break;
-  case OpCode::I32__popcnt:
-    Result = ir_CTPOP_I32(Operand);
+  case OpCode::I32__popcnt: {
+    // Lower to software popcnt (parallel bit count) to avoid x86 backend bug where
+    // ir_emit_bit_count does not load the operand when op1_reg is NONE.
+    ir_ref x = Operand;
+    x = ir_SUB_I32(x, ir_AND_I32(ir_SHR_I32(x, ir_CONST_I32(1)),
+                                  ir_CONST_I32(0x55555555)));
+    x = ir_ADD_I32(ir_AND_I32(x, ir_CONST_I32(0x33333333)),
+                   ir_AND_I32(ir_SHR_I32(x, ir_CONST_I32(2)),
+                              ir_CONST_I32(0x33333333)));
+    x = ir_AND_I32(ir_ADD_I32(x, ir_SHR_I32(x, ir_CONST_I32(4))),
+                   ir_CONST_I32(0x0F0F0F0F));
+    Result = ir_SHR_I32(ir_MUL_I32(x, ir_CONST_I32(0x01010101)),
+                       ir_CONST_I32(24));
     break;
+  }
 
   // I64 unary
   case OpCode::I64__eqz:
@@ -1202,9 +1237,24 @@ Expect<void> WasmToIRBuilder::visitUnary(OpCode Op) {
       Result = ir_COND(IR_I64, IsZero, BitWidth, CtzVal);
     }
     break;
-  case OpCode::I64__popcnt:
-    Result = ir_CTPOP_I64(Operand);
+  case OpCode::I64__popcnt: {
+    // Lower to software popcnt to avoid x86 backend bug (see I32__popcnt).
+    ir_ref x = Operand;
+    const int64_t m1 = 0x5555555555555555LL;
+    const int64_t m2 = 0x3333333333333333LL;
+    const int64_t m4 = 0x0F0F0F0F0F0F0F0FLL;
+    const int64_t m8 = 0x0101010101010101LL;
+    x = ir_SUB_I64(x, ir_AND_I64(ir_SHR_I64(x, ir_CONST_I64(1)),
+                                  ir_CONST_I64(m1)));
+    x = ir_ADD_I64(ir_AND_I64(x, ir_CONST_I64(m2)),
+                   ir_AND_I64(ir_SHR_I64(x, ir_CONST_I64(2)),
+                              ir_CONST_I64(m2)));
+    x = ir_AND_I64(ir_ADD_I64(x, ir_SHR_I64(x, ir_CONST_I64(4))),
+                   ir_CONST_I64(m4));
+    Result = ir_SHR_I64(ir_MUL_I64(x, ir_CONST_I64(m8)),
+                       ir_CONST_I64(56));
     break;
+  }
 
   // F32 unary
   case OpCode::F32__abs:
@@ -2657,8 +2707,11 @@ Expect<void> WasmToIRBuilder::visitCall(const AST::Instruction &Instr) {
 
   ir_ref EnvPtrVal = ensureValidRef(EnvPtr, IR_ADDR);
 
-  bool IsHostCall = (Op == OpCode::Call_indirect) ||
-                    (Op == OpCode::Call && ResolvedFuncIdx < ImportFuncNum);
+  // Use host path only for direct Call to an import (funcIdx < ImportFuncNum).
+  // call_indirect uses the direct path (load from table, jit_direct_or_host) so
+  // standalone invoke works without g_jitExecutor; null table entries fall back
+  // to jit_host_call via the trampoline.
+  bool IsHostCall = (Op == OpCode::Call && ResolvedFuncIdx < ImportFuncNum);
 
   if (IsHostCall) {
     // Route through jit_host_call trampoline.
@@ -2671,13 +2724,7 @@ Expect<void> WasmToIRBuilder::visitCall(const AST::Instruction &Instr) {
     ir_ref TypedHC =
         ir_emit2(ctx, IR_OPT(IR_PROTO, IR_ADDR), HCFn, HCProto);
 
-    // For call_indirect, encode the table-slot with bit 31 set so
-    // jit_host_call can distinguish it from a direct import call.
-    ir_ref FuncIdxArg;
-    if (Op == OpCode::Call_indirect)
-      FuncIdxArg = ir_OR_I32(TableIndex, ir_CONST_I32(0x80000000u));
-    else
-      FuncIdxArg = ir_CONST_I32(ResolvedFuncIdx);
+    ir_ref FuncIdxArg = ir_CONST_I32(ResolvedFuncIdx);
     ir_ref HCArgs[3] = {EnvPtrVal, FuncIdxArg, CalleeArgs};
     ir_ref HCResult = ir_CALL_N(IR_I64, TypedHC, 3, HCArgs);
 
@@ -2699,14 +2746,22 @@ Expect<void> WasmToIRBuilder::visitCall(const AST::Instruction &Instr) {
       }
     }
   } else {
-    // Direct JIT-to-JIT call via null-safe trampoline (handles null table
-    // entries when ImportFuncNum is wrong or target is not JIT-compiled).
+    // Direct path: load callee from table (Call: constant index; call_indirect: runtime index).
+    // jit_direct_or_host(env, funcPtr, funcIdx, args, retTypeCode) calls funcPtr when non-null,
+    // else jit_host_call(env, funcIdx, args). For call_indirect, funcIdx has bit 31 set.
     ir_ref ValidFT = ensureValidRef(FuncTablePtr, IR_ADDR);
-    ir_ref Off = ir_MUL_A(ir_CONST_ADDR(static_cast<uintptr_t>(ResolvedFuncIdx)),
-                          ir_CONST_ADDR(sizeof(void *)));
+    ir_ref Off;
+    ir_ref FuncIdxArg;
+    if (Op == OpCode::Call_indirect) {
+      Off = ir_MUL_A(ir_ZEXT_A(TableIndex), ir_CONST_ADDR(sizeof(void *)));
+      FuncIdxArg = ir_OR_I32(TableIndex, ir_CONST_I32(0x80000000u));
+    } else {
+      Off = ir_MUL_A(ir_CONST_ADDR(static_cast<uintptr_t>(ResolvedFuncIdx)),
+                    ir_CONST_ADDR(sizeof(void *)));
+      FuncIdxArg = ir_CONST_I32(static_cast<int32_t>(ResolvedFuncIdx));
+    }
     ir_ref FuncPtr = ir_LOAD_A(ir_ADD_A(ValidFT, Off));
 
-    // retTypeCode for jit_direct_or_host: 0=void, 1=i32, 2=i64, 3=f32, 4=f64
     uint32_t retTypeCode = 0;
     if (!RetTypes.empty()) {
       switch (RetType) {
@@ -2723,8 +2778,8 @@ Expect<void> WasmToIRBuilder::visitCall(const AST::Instruction &Instr) {
         ir_proto(ctx, IR_FASTCALL_FUNC, IR_I64, 5, DOHProtoParams);
     ir_ref TypedDOH =
         ir_emit2(ctx, IR_OPT(IR_PROTO, IR_ADDR), DOHFn, DOHProto);
-    ir_ref DOHArgs[5] = {EnvPtrVal, FuncPtr, ir_CONST_I32(static_cast<int32_t>(ResolvedFuncIdx)),
-                        CalleeArgs, ir_CONST_I32(static_cast<int32_t>(retTypeCode))};
+    ir_ref DOHArgs[5] = {EnvPtrVal, FuncPtr, FuncIdxArg, CalleeArgs,
+                        ir_CONST_I32(static_cast<int32_t>(retTypeCode))};
     ir_ref CallResult = ir_CALL_N(IR_I64, TypedDOH, 5, DOHArgs);
 
     if (!RetTypes.empty()) {

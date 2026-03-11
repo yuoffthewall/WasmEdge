@@ -1185,14 +1185,15 @@ TEST_F(IRExecutionTest, ControlFlow_BrTable_SingleCase) {
 //==============================================================================
 
 // Native callee function: doubles its input
-// Signature matches JIT convention: int32_t callee(void** func_table, uint32_t table_size, void* global_base, void* mem, int32_t x)
-static int32_t native_double(void** /*func_table*/, uint32_t /*table_size*/, void* /*global_base*/, void* /*mem*/, int32_t x) {
-  return x * 2;
+// JIT direct-call ABI: callee(env, args) with args[] = wasm args as uint64_t. Used in FuncTable.
+extern "C" uint64_t native_double_jit(void* /*env*/, uint64_t* args) {
+  int32_t x = static_cast<int32_t>(args[0] & 0xFFFFFFFFu);
+  return static_cast<uint64_t>(static_cast<uint32_t>(x * 2));
 }
-
-// Native callee: adds two numbers
-static int32_t native_add(void** /*func_table*/, uint32_t /*table_size*/, void* /*global_base*/, void* /*mem*/, int32_t a, int32_t b) {
-  return a + b;
+extern "C" uint64_t native_add_jit(void* /*env*/, uint64_t* args) {
+  int32_t a = static_cast<int32_t>(args[0] & 0xFFFFFFFFu);
+  int32_t b = static_cast<int32_t>(args[1] & 0xFFFFFFFFu);
+  return static_cast<uint64_t>(static_cast<uint32_t>(a + b));
 }
 
 // Test: Direct call to a native function
@@ -1228,8 +1229,8 @@ TEST_F(IRExecutionTest, Call_DirectToNative) {
   void* Caller = CompRes->NativeFunc;
   ASSERT_NE(Caller, nullptr);
   
-  // Set up function table with the native callee
-  void* FuncTable[1] = { reinterpret_cast<void*>(&native_double) };
+  // Set up function table with the JIT-ABI callee (env, uint64_t* args)
+  void* FuncTable[1] = { reinterpret_cast<void*>(&native_double_jit) };
 
   std::vector<ValVariant> Args = {ValVariant(5u)};
   std::vector<ValVariant> Rets(1);
@@ -1290,7 +1291,7 @@ TEST_F(IRExecutionTest, Call_MultipleArgs) {
   void* Caller = CompRes->NativeFunc;
   ASSERT_NE(Caller, nullptr);
   
-  void* FuncTable[1] = { reinterpret_cast<void*>(&native_add) };
+  void* FuncTable[1] = { reinterpret_cast<void*>(&native_add_jit) };
 
   std::vector<ValVariant> Args = {ValVariant(3u), ValVariant(4u)};
   std::vector<ValVariant> Rets(1);
@@ -1314,9 +1315,9 @@ TEST_F(IRExecutionTest, Call_MultipleArgs) {
   EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), 300);
 }
 
-// Native callee: triples its input (for call_indirect tests)
-static int32_t native_triple(void** /*func_table*/, uint32_t /*table_size*/, void* /*global_base*/, void* /*mem*/, int32_t x) {
-  return x * 3;
+extern "C" uint64_t native_triple_jit(void* /*env*/, uint64_t* args) {
+  int32_t x = static_cast<int32_t>(args[0] & 0xFFFFFFFFu);
+  return static_cast<uint64_t>(static_cast<uint32_t>(x * 3));
 }
 
 // Test: call_indirect - indirect call with runtime index
@@ -1356,8 +1357,8 @@ TEST_F(IRExecutionTest, CallIndirect_RuntimeIndex) {
   ASSERT_NE(Caller, nullptr);
   
   void* FuncTable[2] = {
-    reinterpret_cast<void*>(&native_double),
-    reinterpret_cast<void*>(&native_triple)
+    reinterpret_cast<void*>(&native_double_jit),
+    reinterpret_cast<void*>(&native_triple_jit)
   };
 
   std::vector<ValVariant> Args = {ValVariant(5u), ValVariant(0u)};
@@ -1424,8 +1425,8 @@ TEST_F(IRExecutionTest, CallIndirect_ConstantIndex) {
   ASSERT_NE(Caller, nullptr);
 
   void* FuncTable[2] = {
-    reinterpret_cast<void*>(&native_double),
-    reinterpret_cast<void*>(&native_triple)
+    reinterpret_cast<void*>(&native_double_jit),
+    reinterpret_cast<void*>(&native_triple_jit)
   };
 
   std::vector<ValVariant> Args = {ValVariant(5u)};
@@ -2031,17 +2032,13 @@ TEST_F(MemoryExecutionTest, Memory_I32_RoundTrip) {
   void* LoadFunc = buildLoadFunc(OpCode::I32__load, TypeCode::I32);
   ASSERT_NE(StoreFunc, nullptr);
   ASSERT_NE(LoadFunc, nullptr);
-  
-  using StoreFn = void (*)(void**, uint32_t, void*, void*, int32_t, int32_t);
-  using LoadFn = int32_t (*)(void**, uint32_t, void*, void*, int32_t);
-  auto store = reinterpret_cast<StoreFn>(StoreFunc);
-  auto load = reinterpret_cast<LoadFn>(LoadFunc);
-  
-  // Store various values and load them back
+
+  AST::FunctionType StoreType({ValType(TypeCode::I32), ValType(TypeCode::I32)}, {});
+  AST::FunctionType LoadType({ValType(TypeCode::I32)}, {ValType(TypeCode::I32)});
   int32_t testValues[] = {0, 1, -1, INT32_MAX, INT32_MIN, 0x12345678};
   for (int32_t val : testValues) {
-    store(nullptr, 0, nullptr, Memory.data(), 300, val);
-    EXPECT_EQ(load(nullptr, 0, nullptr, Memory.data(), 300), val) << "Round-trip failed for " << val;
+    invokeVoid(StoreFunc, StoreType, {ValVariant(300u), ValVariant(static_cast<uint32_t>(val))});
+    EXPECT_EQ(invokeI32(LoadFunc, LoadType, {ValVariant(300u)}), val) << "Round-trip failed for " << val;
   }
 }
 
@@ -2050,17 +2047,13 @@ TEST_F(MemoryExecutionTest, Memory_I64_RoundTrip) {
   void* LoadFunc = buildLoadFunc(OpCode::I64__load, TypeCode::I64);
   ASSERT_NE(StoreFunc, nullptr);
   ASSERT_NE(LoadFunc, nullptr);
-  
-  using StoreFn = void (*)(void**, uint32_t, void*, void*, int32_t, int64_t);
-  using LoadFn = int64_t (*)(void**, uint32_t, void*, void*, int32_t);
-  auto store = reinterpret_cast<StoreFn>(StoreFunc);
-  auto load = reinterpret_cast<LoadFn>(LoadFunc);
-  
-  // Store various values and load them back
+
+  AST::FunctionType StoreType({ValType(TypeCode::I32), ValType(TypeCode::I64)}, {});
+  AST::FunctionType LoadType({ValType(TypeCode::I32)}, {ValType(TypeCode::I64)});
   int64_t testValues[] = {0LL, 1LL, -1LL, INT64_MAX, INT64_MIN, 0x123456789ABCDEF0LL};
   for (int64_t val : testValues) {
-    store(nullptr, 0, nullptr, Memory.data(), 400, val);
-    EXPECT_EQ(load(nullptr, 0, nullptr, Memory.data(), 400), val) << "Round-trip failed for " << val;
+    invokeVoid(StoreFunc, StoreType, {ValVariant(400u), ValVariant(static_cast<uint64_t>(val))});
+    EXPECT_EQ(invokeI64(LoadFunc, LoadType, {ValVariant(400u)}), val) << "Round-trip failed for " << val;
   }
 }
 
