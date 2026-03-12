@@ -133,7 +133,7 @@ target_link_libraries(wasmedgeIRBenchmarkTests
   wasmedgeVM
   wasmedgeIR
   wasmedgeCommon
-  GTest::gtest_main
+  GTest::gtest
 )
 
 if(WASMEDGE_USE_LLVM)

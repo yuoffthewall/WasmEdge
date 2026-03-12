@@ -11,6 +11,7 @@
 
 #include "common/configure.h"
 #include "common/defines.h"
+#include "common/spdlog.h"
 #include "executor/executor.h"
 #include "loader/loader.h"
 #include "runtime/hostfunc.h"
@@ -1472,6 +1473,7 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
 
     // Correctness: JIT output must match AOT when both ran successfully
     if (irJitOk && jitOk) {
+      /*
       std::cout << "\n--- " << kernelName << " captured output ---\n";
       
       std::cout << "IR_JIT stdout (" << irJitCap.stdout_.size() << " bytes): ";
@@ -1498,6 +1500,7 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
 
       std::cout << "---\n";
 
+      */
       EXPECT_EQ(irJitCap.stdout_, jitCap.stdout_)
           << "Kernel " << kernelName << ": IR JIT stdout must match LLVM JIT";
       EXPECT_EQ(irJitCap.stderr_, jitCap.stderr_)
@@ -1571,3 +1574,24 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
 }
 
 } // namespace
+
+int main(int argc, char **argv) {
+  int n = 0;
+  bool quiet = false;
+  if (std::getenv("WASMEDGE_QUIET") != nullptr) {
+    quiet = true;
+  }
+  for (int i = 0; i < argc; ++i) {
+    if (std::strcmp(argv[i], "--quiet") == 0 || std::strcmp(argv[i], "-q") == 0) {
+      quiet = true;
+    } else {
+      argv[n++] = argv[i];
+    }
+  }
+  argc = n;
+  if (quiet) {
+    WasmEdge::Log::setErrorLoggingLevel();
+  }
+  ::testing::InitGoogleTest(&argc, argv);
+  return RUN_ALL_TESTS();
+}
