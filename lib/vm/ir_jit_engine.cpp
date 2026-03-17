@@ -16,15 +16,59 @@ extern "C" {
 }
 
 #include <csetjmp>
+#include <csignal>
 #include <cstdlib>
 #include <cstring>
 #include <sys/mman.h>
-#include <chrono>
-#include <fstream>
 
 namespace {
 static thread_local jmp_buf g_termination_buf;
+
+/// SIGSEGV guard for ir_jit_compile: the IR library can segfault on certain
+/// complex IR patterns (e.g. nested loops with many PHIs). We install a
+/// temporary signal handler to catch the crash and longjmp back to the caller,
+/// allowing graceful fallback to the interpreter for that function.
+static thread_local sigjmp_buf g_compile_guard_buf;
+static thread_local volatile bool g_compile_guard_active = false;
+
+static void compileGuardHandler(int sig) {
+  if (g_compile_guard_active) {
+    g_compile_guard_active = false;
+    siglongjmp(g_compile_guard_buf, 1);
+  }
+  // Not our guard — re-raise with default handler.
+  signal(sig, SIG_DFL);
+  raise(sig);
 }
+
+/// Compile with SIGSEGV protection. Returns native code or nullptr on crash.
+static void *safeIrJitCompile(ir_ctx *ctx, int opt_level, size_t *size) {
+  struct sigaction sa_new{}, sa_old{};
+  sa_new.sa_handler = compileGuardHandler;
+  sigemptyset(&sa_new.sa_mask);
+  sa_new.sa_flags = 0; // No SA_RESTART — we want longjmp
+
+  if (sigaction(SIGSEGV, &sa_new, &sa_old) != 0) {
+    // Can't install handler — compile without guard.
+    return ir_jit_compile(ctx, opt_level, size);
+  }
+
+  void *result = nullptr;
+  g_compile_guard_active = true;
+  if (sigsetjmp(g_compile_guard_buf, 1) == 0) {
+    result = ir_jit_compile(ctx, opt_level, size);
+  } else {
+    // Caught SIGSEGV during compilation.
+    result = nullptr;
+  }
+  g_compile_guard_active = false;
+
+  // Restore previous handler.
+  sigaction(SIGSEGV, &sa_old, nullptr);
+  return result;
+}
+
+} // anonymous namespace
 
 extern "C" void *wasmedge_ir_jit_get_termination_buf(void) {
   return &g_termination_buf;
@@ -74,10 +118,10 @@ IRJitEngine::compile(ir_ctx *Ctx) {
   }
 
   size_t CodeSize = 0;
-  void *NativeCode = ir_jit_compile(Ctx, opt_level, &CodeSize);
-  
+  void *NativeCode = safeIrJitCompile(Ctx, opt_level, &CodeSize);
+
   if (!NativeCode) {
-    spdlog::info("IR JIT: ir_jit_compile failed");
+    spdlog::info("IR JIT: ir_jit_compile failed (func {})", _dbg_cur_id);
     return Unexpect(ErrCode::Value::RuntimeError);
   }
 
@@ -134,17 +178,6 @@ Expect<void> IRJitEngine::invoke(void *NativeFunc,
   Env.MemorySizeFn = reinterpret_cast<void *>(&jit_memory_size);
   Env.CallIndirectFn = reinterpret_cast<void *>(&jit_call_indirect);
 
-  // #region agent log
-  {
-    auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-    char buf[384];
-    std::snprintf(buf, sizeof(buf),
-      "{\"sessionId\":\"d32b78\",\"location\":\"ir_jit_engine.cpp:invoke\",\"message\":\"pre_call\",\"data\":{\"Env\":\"%p\",\"HostCallFn\":\"%p\",\"DirectOrHostFn\":\"%p\",\"FuncTable\":\"%p\",\"NativeFunc\":\"%p\"},\"runId\":\"run1\",\"hypothesisId\":\"H2,H3\",\"timestamp\":%lld}\n",
-      (void*)&Env, (void*)Env.HostCallFn, (void*)Env.DirectOrHostFn, (void*)FuncTable, (void*)NativeFunc, (long long)ts);
-    std::ofstream f("/home/tommy/Desktop/wasmedge/.cursor/debug-d32b78.log", std::ios::app); if (f) f << buf; f.close();
-  }
-  // #endregion
-
   ArgsBuffer_.resize(ParamTypes.size());
   for (size_t i = 0; i < ParamTypes.size(); ++i)
     ArgsBuffer_[i] = valVariantToRaw(Args[i], ParamTypes[i]);
@@ -178,17 +211,6 @@ Expect<void> IRJitEngine::invoke(void *NativeFunc,
     using Fn = uint64_t (*)(JitExecEnv *, uint64_t *);
     reinterpret_cast<Fn>(NativeFunc)(&Env, ArgsData);
   }
-
-  // #region agent log
-  {
-    auto ts = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
-    char buf[192];
-    std::snprintf(buf, sizeof(buf),
-      "{\"sessionId\":\"d32b78\",\"location\":\"ir_jit_engine.cpp:invoke\",\"message\":\"post_call\",\"data\":{},\"runId\":\"run1\",\"hypothesisId\":\"H6\",\"timestamp\":%lld}\n",
-      (long long)ts);
-    std::ofstream f("/home/tommy/Desktop/wasmedge/.cursor/debug-d32b78.log", std::ios::app); if (f) f << buf; f.close();
-  }
-  // #endregion
 
   return {};
 }
