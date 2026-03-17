@@ -43,7 +43,7 @@ uint64_t wasm_i64_rem_u(uint64_t a, uint64_t b) {
 }  // namespace
 
 WasmToIRBuilder::WasmToIRBuilder() noexcept
-    : Initialized(false), CurrentPathTerminated(false), EnvPtr(0), FuncTablePtr(0), FuncTableSize(0), GlobalBasePtr(0), MemoryBase(0), HostCallFnPtr(0), DirectOrHostFnPtr(0), ArgsPtr(0), MemorySize(0), LocalCount(0), SharedCallArgs(0) {}
+    : Initialized(false), CurrentPathTerminated(false), EnvPtr(0), FuncTablePtr(0), FuncTableSize(0), GlobalBasePtr(0), MemoryBase(0), HostCallFnPtr(0), DirectOrHostFnPtr(0), CallIndirectFnPtr(0), ArgsPtr(0), MemorySize(0), LocalCount(0), SharedCallArgs(0) {}
 
 WasmToIRBuilder::~WasmToIRBuilder() noexcept { reset(); }
 
@@ -64,6 +64,7 @@ void WasmToIRBuilder::reset() noexcept {
   MemoryBase = 0;
   HostCallFnPtr = 0;
   DirectOrHostFnPtr = 0;
+  CallIndirectFnPtr = 0;
   ArgsPtr = 0;
   MemorySize = 0;
   LocalCount = 0;
@@ -130,6 +131,7 @@ Expect<void> WasmToIRBuilder::initialize(
   DirectOrHostFnPtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, DirectOrHostFn))));
   MemoryGrowFnPtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, MemoryGrowFn))));
   MemorySizeFnPtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, MemorySizeFn))));
+  CallIndirectFnPtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, CallIndirectFn))));
 
   // Load wasm parameters from the args array. Each slot is sizeof(uint64_t).
   // On little-endian (x86_64), loading a narrower type from the slot address
@@ -2755,21 +2757,66 @@ Expect<void> WasmToIRBuilder::visitCall(const AST::Instruction &Instr) {
         push(HCResult);
       }
     }
-  } else {
-    // Direct path: load callee from table (Call: constant index; call_indirect: runtime index).
-    // jit_direct_or_host(env, funcPtr, funcIdx, args, retTypeCode) calls funcPtr when non-null,
-    // else jit_host_call(env, funcIdx, args). For call_indirect, funcIdx has bit 31 set.
-    ir_ref ValidFT = ensureValidRef(FuncTablePtr, IR_ADDR);
-    ir_ref Off;
-    ir_ref FuncIdxArg;
-    if (Op == OpCode::Call_indirect) {
-      Off = ir_MUL_A(ir_ZEXT_A(TableIndex), ir_CONST_ADDR(sizeof(void *)));
-      FuncIdxArg = ir_OR_I32(TableIndex, ir_CONST_I32(0x80000000u));
-    } else {
-      Off = ir_MUL_A(ir_CONST_ADDR(static_cast<uintptr_t>(ResolvedFuncIdx)),
-                    ir_CONST_ADDR(sizeof(void *)));
-      FuncIdxArg = ir_CONST_I32(static_cast<int32_t>(ResolvedFuncIdx));
+  } else if (Op == OpCode::Call_indirect) {
+    // call_indirect: dispatch through jit_call_indirect trampoline which
+    // resolves table[tableIdx][elemIdx], type-checks against typeIdx, then
+    // calls the target (JIT native or interpreter fallback).
+    // Prototype: uint64_t jit_call_indirect(JitExecEnv *env, uint32_t tableIdx,
+    //                uint32_t elemIdx, uint32_t typeIdx, uint64_t *args,
+    //                uint32_t retTypeCode)
+    uint32_t TableIdx = Instr.getSourceIndex();
+    uint32_t TypeIdx = Instr.getTargetIndex();
+
+    uint32_t retTypeCode = 0;
+    if (!RetTypes.empty()) {
+      switch (RetType) {
+      case IR_I32: retTypeCode = 1; break;
+      case IR_I64: retTypeCode = 2; break;
+      case IR_FLOAT: retTypeCode = 3; break;
+      case IR_DOUBLE: retTypeCode = 4; break;
+      default: break;
+      }
     }
+
+    ir_ref CIFn = ensureValidRef(CallIndirectFnPtr, IR_ADDR);
+    uint8_t CIProtoParams[6] = {IR_ADDR, IR_I32, IR_I32, IR_I32, IR_ADDR, IR_I32};
+    ir_ref CIProto =
+        ir_proto(ctx, IR_FASTCALL_FUNC, IR_I64, 6, CIProtoParams);
+    ir_ref TypedCI =
+        ir_emit2(ctx, IR_OPT(IR_PROTO, IR_ADDR), CIFn, CIProto);
+    ir_ref CIArgs[6] = {EnvPtrVal,
+                        ir_CONST_I32(static_cast<int32_t>(TableIdx)),
+                        TableIndex,
+                        ir_CONST_I32(static_cast<int32_t>(TypeIdx)),
+                        CalleeArgs,
+                        ir_CONST_I32(static_cast<int32_t>(retTypeCode))};
+    ir_ref CallResult = ir_CALL_N(IR_I64, TypedCI, 6, CIArgs);
+
+    if (!RetTypes.empty()) {
+      if (RetType == IR_I32)
+        push(ir_TRUNC_I32(CallResult));
+      else if (RetType == IR_I64)
+        push(CallResult);
+      else if (RetType == IR_FLOAT) {
+        ir_ref tmp = ir_ALLOCA(ir_CONST_I32(8));
+        ir_STORE(tmp, CallResult);
+        push(ir_LOAD_F(tmp));
+      } else if (RetType == IR_DOUBLE) {
+        ir_ref tmp = ir_ALLOCA(ir_CONST_I32(8));
+        ir_STORE(tmp, CallResult);
+        push(ir_LOAD_D(tmp));
+      } else {
+        push(CallResult);
+      }
+    }
+  } else {
+    // Direct call: load callee from FuncTable by constant function index.
+    // jit_direct_or_host(env, funcPtr, funcIdx, args, retTypeCode) calls
+    // funcPtr when non-null, else falls back to jit_host_call.
+    ir_ref ValidFT = ensureValidRef(FuncTablePtr, IR_ADDR);
+    ir_ref Off = ir_MUL_A(ir_CONST_ADDR(static_cast<uintptr_t>(ResolvedFuncIdx)),
+                          ir_CONST_ADDR(sizeof(void *)));
+    ir_ref FuncIdxArg = ir_CONST_I32(static_cast<int32_t>(ResolvedFuncIdx));
     ir_ref FuncPtr = ir_LOAD_A(ir_ADD_A(ValidFT, Off));
 
     uint32_t retTypeCode = 0;

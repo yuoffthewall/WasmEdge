@@ -220,6 +220,7 @@ private:
   ir_ref DirectOrHostFnPtr;                 // jit_direct_or_host (null-safe call) from EnvPtr
   ir_ref MemoryGrowFnPtr;                   // jit_memory_grow from EnvPtr
   ir_ref MemorySizeFnPtr;                   // jit_memory_size from EnvPtr
+  ir_ref CallIndirectFnPtr;                 // jit_call_indirect from EnvPtr
   ir_ref ArgsPtr;                           // uint64_t* args (param 2)
   ir_ref MemorySize;                        // Current memory size (in bytes)
   uint32_t LocalCount;                      // Total number of locals

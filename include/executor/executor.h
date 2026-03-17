@@ -269,6 +269,14 @@ public:
                                Span<const ValVariant> Params,
                                const Runtime::Instance::ModuleInstance *CallerMod);
 
+  /// Perform call_indirect from JIT code: resolve table element, type-check,
+  /// and dispatch to native JIT or interpreter. Returns the raw uint64_t result.
+  Expect<uint64_t> jitCallIndirect(Runtime::StackManager &StackMgr,
+                                   uint32_t TableIdx, uint32_t ElemIdx,
+                                   uint32_t TypeIdx, uint64_t *Args,
+                                   uint32_t RetTypeCode,
+                                   VM::JitExecEnv *Env);
+
   /// Lazy access to the single IR JIT engine (used by instantiate and enterFunction).
   VM::IRJitEngine &getIRJitEngine() const {
     if (!IRJitEngine_) {

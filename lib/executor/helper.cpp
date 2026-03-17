@@ -189,6 +189,32 @@ extern "C" uint64_t jit_direct_or_host(WasmEdge::VM::JitExecEnv *env,
   }
 }
 
+/// call_indirect trampoline: delegates to Executor::jitCallIndirect which has
+/// access to protected ModuleInstance members for proper type checking.
+extern "C" uint64_t jit_call_indirect(WasmEdge::VM::JitExecEnv *env,
+                                       uint32_t tableIdx, uint32_t elemIdx,
+                                       uint32_t typeIdx, uint64_t *args,
+                                       uint32_t retTypeCode) {
+  if (!g_jitExecutor || !g_jitStackMgr)
+    return 0;
+  auto res = g_jitExecutor->jitCallIndirect(*g_jitStackMgr, tableIdx, elemIdx,
+                                            typeIdx, args, retTypeCode, env);
+  if (!res) {
+    if (res.error() == WasmEdge::ErrCode::Value::Terminated) {
+      void *buf = WasmEdge::VM::wasmedge_ir_jit_get_termination_buf();
+      if (buf)
+        longjmp(*static_cast<jmp_buf *>(buf), 1);
+    }
+    // For traps (UndefinedElement, UninitializedElement, IndirectCallTypeMismatch),
+    // longjmp to terminate the JIT frame.
+    void *buf = WasmEdge::VM::wasmedge_ir_jit_get_termination_buf();
+    if (buf)
+      longjmp(*static_cast<jmp_buf *>(buf), 1);
+    return 0;
+  }
+  return *res;
+}
+
 extern "C" int32_t jit_memory_grow(WasmEdge::VM::JitExecEnv *env,
                                     uint32_t nPages) {
   if (!g_jitMemory0)
@@ -514,6 +540,132 @@ Expect<void> Executor::jitCallFunction(
   }
 
   return Res;
+}
+
+Expect<uint64_t> Executor::jitCallIndirect(
+    Runtime::StackManager &StackMgr, uint32_t TableIdx, uint32_t ElemIdx,
+    uint32_t TypeIdx, uint64_t *Args, uint32_t RetTypeCode,
+    VM::JitExecEnv *Env) {
+  // 1. Get the table instance.
+  const auto *TabInst = getTabInstByIdx(StackMgr, TableIdx);
+  if (!TabInst || ElemIdx >= TabInst->getSize()) {
+    spdlog::error(ErrCode::Value::UndefinedElement);
+    return Unexpect(ErrCode::Value::UndefinedElement);
+  }
+
+  // 2. Load the funcref at ElemIdx.
+  RefVariant Ref = *TabInst->getRefAddr(ElemIdx);
+  if (Ref.isNull()) {
+    spdlog::error(ErrCode::Value::UninitializedElement);
+    return Unexpect(ErrCode::Value::UninitializedElement);
+  }
+
+  // 3. Resolve funcref to FunctionInstance.
+  const auto *FuncInst = retrieveFuncRef(Ref);
+  if (!FuncInst) {
+    spdlog::error(ErrCode::Value::UninitializedElement);
+    return Unexpect(ErrCode::Value::UninitializedElement);
+  }
+
+  // 4. Type-check against the expected type from the call_indirect instruction.
+  const auto *ModInst = StackMgr.getModule();
+  const auto &ExpDefType = **ModInst->getType(TypeIdx);
+  bool IsMatch = false;
+  if (FuncInst->getModule()) {
+    IsMatch = AST::TypeMatcher::matchType(
+        ModInst->getTypeList(), *ExpDefType.getTypeIndex(),
+        FuncInst->getModule()->getTypeList(), FuncInst->getTypeIndex());
+  } else {
+    IsMatch = AST::TypeMatcher::matchType(
+        ModInst->getTypeList(), ExpDefType.getCompositeType(),
+        FuncInst->getHostFunc().getDefinedType().getCompositeType());
+  }
+  if (!IsMatch) {
+    spdlog::error(ErrCode::Value::IndirectCallTypeMismatch);
+    return Unexpect(ErrCode::Value::IndirectCallTypeMismatch);
+  }
+
+  // 5. Fast path: if the target is JIT-compiled, call native code directly.
+  if (FuncInst->isIRJitFunction()) {
+    void *NativeFunc = FuncInst->getIRJitNativeFunc();
+    if (NativeFunc) {
+      switch (RetTypeCode) {
+      case 0: {
+        using Fn = void (*)(VM::JitExecEnv *, uint64_t *);
+        reinterpret_cast<Fn>(NativeFunc)(Env, Args);
+        return static_cast<uint64_t>(0);
+      }
+      case 1: {
+        using Fn = uint64_t (*)(VM::JitExecEnv *, uint64_t *);
+        return reinterpret_cast<Fn>(NativeFunc)(Env, Args) & 0xFFFFFFFFu;
+      }
+      case 2: {
+        using Fn = uint64_t (*)(VM::JitExecEnv *, uint64_t *);
+        return reinterpret_cast<Fn>(NativeFunc)(Env, Args);
+      }
+      case 3: {
+        using Fn = float (*)(VM::JitExecEnv *, uint64_t *);
+        float F = reinterpret_cast<Fn>(NativeFunc)(Env, Args);
+        uint64_t U = 0;
+        std::memcpy(&U, &F, sizeof(F));
+        return U;
+      }
+      case 4: {
+        using Fn = double (*)(VM::JitExecEnv *, uint64_t *);
+        double D = reinterpret_cast<Fn>(NativeFunc)(Env, Args);
+        uint64_t U = 0;
+        std::memcpy(&U, &D, sizeof(D));
+        return U;
+      }
+      default:
+        break;
+      }
+    }
+  }
+
+  // 6. Slow path: dispatch through the interpreter.
+  const auto &FuncType = FuncInst->getFuncType();
+  const auto &ParamTypes = FuncType.getParamTypes();
+  const auto &RetTypes = FuncType.getReturnTypes();
+
+  std::vector<ValVariant> Params(ParamTypes.size());
+  for (size_t I = 0; I < ParamTypes.size(); ++I) {
+    auto Code = ParamTypes[I].getCode();
+    if (Code == TypeCode::F32) {
+      float F;
+      std::memcpy(&F, &Args[I], sizeof(float));
+      Params[I] = ValVariant(F);
+    } else if (Code == TypeCode::F64) {
+      double D;
+      std::memcpy(&D, &Args[I], sizeof(double));
+      Params[I] = ValVariant(D);
+    } else if (Code == TypeCode::I32) {
+      Params[I] = ValVariant(static_cast<uint32_t>(Args[I]));
+    } else {
+      Params[I] = ValVariant(static_cast<uint64_t>(Args[I]));
+    }
+  }
+
+  auto Res = jitCallFunction(StackMgr, *FuncInst, Params, ModInst);
+  if (!Res) {
+    return Unexpect(Res.error());
+  }
+
+  uint64_t RetVal = 0;
+  if (!RetTypes.empty()) {
+    auto Val = StackMgr.pop();
+    auto Code = RetTypes[0].getCode();
+    if (Code == TypeCode::F32) {
+      float F = Val.get<float>();
+      std::memcpy(&RetVal, &F, sizeof(float));
+    } else if (Code == TypeCode::F64) {
+      double D = Val.get<double>();
+      std::memcpy(&RetVal, &D, sizeof(double));
+    } else {
+      RetVal = Val.get<uint64_t>();
+    }
+  }
+  return RetVal;
 }
 #endif
 

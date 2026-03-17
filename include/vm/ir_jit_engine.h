@@ -57,6 +57,7 @@ struct JitExecEnv {
   void *DirectOrHostFn; // Pointer to jit_direct_or_host (null-safe direct call)
   void *MemoryGrowFn;   // Pointer to jit_memory_grow trampoline
   void *MemorySizeFn;   // Pointer to jit_memory_size trampoline
+  void *CallIndirectFn; // Pointer to jit_call_indirect trampoline
   /// 16-byte buffer for ref-return helpers (jit_ref_func, jit_table_get).
   uint64_t RefResultBuf[2];
 };
@@ -75,6 +76,12 @@ extern "C" uint64_t jit_direct_or_host(JitExecEnv *env, void *funcPtr,
 /// JMP buf for unwinding on proc_exit (Terminated). Used by jit_host_call to
 /// longjmp back to invoke() so we do not return to JIT and run unreachable.
 extern "C" void *wasmedge_ir_jit_get_termination_buf(void);
+/// call_indirect trampoline: resolves table[tableIdx][elemIdx], type-checks
+/// against typeIdx, then dispatches to JIT native code or interpreter.
+/// retTypeCode: 0=void, 1=i32, 2=i64, 3=f32, 4=f64
+extern "C" uint64_t jit_call_indirect(JitExecEnv *env, uint32_t tableIdx,
+                                       uint32_t elemIdx, uint32_t typeIdx,
+                                       uint64_t *args, uint32_t retTypeCode);
 /// memory.grow trampoline: grows memory by N pages, returns old size or -1.
 /// Also updates env->MemoryBase to the (potentially relocated) data pointer.
 extern "C" int32_t jit_memory_grow(JitExecEnv *env, uint32_t nPages);
