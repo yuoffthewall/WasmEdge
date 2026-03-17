@@ -95,6 +95,7 @@ public:
     addHostFunc("fd_seek", std::make_unique<StubFdSeek>());
     addHostFunc("fd_write", std::make_unique<StubFdWrite>(Capture));
     addHostFunc("path_open", std::make_unique<StubPathOpen>(this));
+    addHostFunc("clock_time_get", std::make_unique<StubClockTimeGet>());
     addHostFunc("random_get", std::make_unique<StubRandomGet>());
     addHostFunc("proc_exit", std::make_unique<StubProcExit>(Capture));
   }
@@ -368,6 +369,20 @@ private:
       return SightglassWasi::WASI_ERRNO_SUCCESS;
     }
     WasiStubModule *Module;
+  };
+
+  // WASI clock_time_get(clockid, precision_low, precision_high, time_ptr) -> errno
+  // Writes a timestamp (u64) to time_ptr. Stub returns 0 and writes 0.
+  class StubClockTimeGet : public WasmEdge::Runtime::HostFunction<StubClockTimeGet> {
+  public:
+    Expect body(const WasmEdge::Runtime::CallingFrame &Frame, uint32_t /* ClockId */,
+                uint64_t /* Precision */, uint32_t TimePtr) {
+      auto *Mem = getMem(Frame);
+      if (!Mem) return WasmEdge::Unexpect(WasmEdge::ErrCode::Value::HostFuncError);
+      auto *p = Mem->getPointer<uint64_t *>(TimePtr);
+      if (p) *p = 0;
+      return SightglassWasi::WASI_ERRNO_SUCCESS;
+    }
   };
 
   class StubRandomGet : public WasmEdge::Runtime::HostFunction<StubRandomGet> {
@@ -1277,6 +1292,22 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
           }
         }
       }
+      // Map kernel-prefixed default inputs to names benchmarks expect (default.input / default.input.md)
+      auto loadAs = [&](const std::string &prefixedName, const std::string &virtualName) {
+        auto path = SightglassDir / prefixedName;
+        if (!std::filesystem::exists(path) || !std::filesystem::is_regular_file(path))
+          return;
+        std::ifstream ifs(path, std::ios::binary);
+        if (!ifs) return;
+        std::string content((std::istreambuf_iterator<char>(ifs)),
+                            std::istreambuf_iterator<char>());
+        stub.addVirtualFile(virtualName, std::move(content));
+      };
+      loadAs(kernelName + ".default.input", "default.input");
+      loadAs(kernelName + ".default.input.md", "default.input.md");
+      // Legacy: pulldown-cmark also accepts default.input.md without prefix
+      if (kernelName == "pulldown-cmark")
+        loadAs("default.input.md", "default.input.md");
     };
 
     const char *modes[] = {"Interpreter", "IR_JIT", "JIT"};

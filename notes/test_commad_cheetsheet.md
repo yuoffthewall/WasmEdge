@@ -32,3 +32,21 @@ for wasm in ../test/ir/testdata/sightglass/*.wasm; do
   stdbuf -oL timeout 30 ./test/ir/wasmedgeIRBenchmarkTests --gtest_filter='*SightglassSuite*' 2>&1
 done | tee /tmp/wasm-test.log
 ```
+
+# Debugging with GDB
+
+Run a single kernel (e.g. quicksort) under GDB from the build dir. Use a Debug build for symbols and JIT unwind.
+
+```shell
+cd ~/Desktop/wasmedge/build
+WASMEDGE_SIGHTGLASS_SKIP_INTERP=1 WASMEDGE_SIGHTGLASS_KERNEL=quicksort WASMEDGE_IR_JIT_OPT_LEVEL=0 gdb --args ./test/ir/wasmedgeIRBenchmarkTests --gtest_filter='*SightglassSuite*'
+```
+
+In GDB: `run`. When you get SIGSEGV in JIT code (e.g. `wasm_jit_002`), the backtrace may stop at one frame; use the following to get more info:
+
+| What you want | Command / approach |
+|---------------|--------------------|
+| Instruction that faulted | `x/i $pc` |
+| Context around it | `disas $pc-32,$pc+32` |
+| Bad pointer / register state | `info registers` and match the register used in the faulting instruction |
+| Which Wasm function | `wasm_jit_NNN` = (NNN+1)th JIT’d function (000, 001, 002…). Confirm by breaking before the JIT call and re-running: `break WasmEdge::Executor::enterFunction` or `break WasmEdge::VM::IRJitEngine::invoke`, then `run` and inspect which function/kernel is being invoked when you continue to the crash. |

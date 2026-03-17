@@ -18,6 +18,11 @@ DOWNLOADED=0
 # Download: output_name|url_path (one per line)
 # Standalone benchmarks use benchmark.wasm; shootout uses shootout-<name>.wasm
 KERNELS="pulldown-cmark|${BASE_URL}/pulldown-cmark/benchmark.wasm
+hashset|${BASE_URL}/hashset/benchmark.wasm
+regex|${BASE_URL}/regex/benchmark.wasm
+richards|${BASE_URL}/richards/benchmark.wasm
+rust-json|${BASE_URL}/rust-json/benchmark.wasm
+rust-protobuf|${BASE_URL}/rust-protobuf/benchmark.wasm
 quicksort|${BASE_URL}/quicksort/benchmark.wasm
 shootout-ackermann|${BASE_URL}/shootout/shootout-ackermann.wasm
 shootout-base64|${BASE_URL}/shootout/shootout-base64.wasm
@@ -68,6 +73,37 @@ while IFS='|' read -r kernel url; do
   fi
 done <<EOF
 $KERNELS
+EOF
+
+# Download kernel-prefixed input files (exposed as default.input / default.input.md in test)
+INPUT_FILES="regex.default.input|${BASE_URL}/regex/default.input
+rust-json.default.input|${BASE_URL}/rust-json/default.input
+rust-protobuf.default.input|${BASE_URL}/rust-protobuf/default.input
+pulldown-cmark.default.input.md|${BASE_URL}/pulldown-cmark/default.input.md"
+while IFS='|' read -r outname url; do
+  [ -z "$outname" ] && continue
+  dest="$OUT_DIR/$outname"
+  if [ -f "$dest" ] && [ -s "$dest" ]; then
+    echo "Skip (exists): $dest"
+    continue
+  fi
+  if command -v curl &>/dev/null; then
+    if curl -fSL -o "$dest" "$url" 2>/dev/null; then
+      echo "Downloaded: $outname"
+      DOWNLOADED=$((DOWNLOADED + 1))
+    else
+      rm -f "$dest"
+    fi
+  elif command -v wget &>/dev/null; then
+    if wget -q -O "$dest" "$url" 2>/dev/null; then
+      echo "Downloaded: $outname"
+      DOWNLOADED=$((DOWNLOADED + 1))
+    else
+      rm -f "$dest"
+    fi
+  fi
+done <<EOF
+$INPUT_FILES
 EOF
 
 # Download supporting files (.input, .stdout.expected, .stderr.expected) for shootout
@@ -136,5 +172,24 @@ for sf in $SUPPORT_FILES; do
     fi
   fi
 done
+
+# Download pulldown-cmark specific files
+PULLDOWN_DIR="$OUT_DIR"
+PULLDOWN_URL="${BASE_URL}/pulldown-cmark"
+if [ ! -f "$PULLDOWN_DIR/default.input.md" ]; then
+  curl -fSL -o "$PULLDOWN_DIR/default.input.md" "$PULLDOWN_URL/default.input.md" 2>/dev/null || wget -q -O "$PULLDOWN_DIR/default.input.md" "$PULLDOWN_URL/default.input.md" 2>/dev/null || touch "$PULLDOWN_DIR/default.input.md"
+  echo "Downloaded: default.input.md"
+  DOWNLOADED=$((DOWNLOADED + 1))
+fi
+if [ ! -f "$PULLDOWN_DIR/pulldown-cmark.stdout.expected" ]; then
+  curl -fSL -o "$PULLDOWN_DIR/pulldown-cmark.stdout.expected" "$PULLDOWN_URL/benchmark.stdout.expected" 2>/dev/null || wget -q -O "$PULLDOWN_DIR/pulldown-cmark.stdout.expected" "$PULLDOWN_URL/benchmark.stdout.expected" 2>/dev/null || touch "$PULLDOWN_DIR/pulldown-cmark.stdout.expected"
+  echo "Downloaded: pulldown-cmark.stdout.expected"
+  DOWNLOADED=$((DOWNLOADED + 1))
+fi
+if [ ! -f "$PULLDOWN_DIR/pulldown-cmark.stderr.expected" ]; then
+  curl -fSL -o "$PULLDOWN_DIR/pulldown-cmark.stderr.expected" "$PULLDOWN_URL/benchmark.stderr.expected" 2>/dev/null || wget -q -O "$PULLDOWN_DIR/pulldown-cmark.stderr.expected" "$PULLDOWN_URL/benchmark.stderr.expected" 2>/dev/null || touch "$PULLDOWN_DIR/pulldown-cmark.stderr.expected"
+  echo "Downloaded: pulldown-cmark.stderr.expected"
+  DOWNLOADED=$((DOWNLOADED + 1))
+fi
 
 echo "Done. Downloaded $DOWNLOADED file(s) to $OUT_DIR"
