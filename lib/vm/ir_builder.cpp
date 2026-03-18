@@ -653,8 +653,9 @@ Expect<void> WasmToIRBuilder::visitInstruction(const AST::Instruction &Instr) {
     ir_ref Proto = ir_proto(ctx, IR_FASTCALL_FUNC, IR_VOID, 6, ProtoParams);
     ir_ref Fn = ir_const_func_addr(ctx, (uintptr_t)&jit_memory_copy, Proto);
     ir_CALL_6(IR_VOID, Fn, EnvPtrVal, ir_CONST_I32(static_cast<int32_t>(dstMemIdx)),
-              ir_CONST_I32(static_cast<int32_t>(srcMemIdx)), ir_ZEXT_U32(Dst),
-              ir_ZEXT_U32(Src), ir_ZEXT_U32(N));
+              ir_CONST_I32(static_cast<int32_t>(srcMemIdx)),
+              coerceToType(Dst, IR_U32), coerceToType(Src, IR_U32),
+              coerceToType(N, IR_U32));
     return {};
   }
 
@@ -670,7 +671,8 @@ Expect<void> WasmToIRBuilder::visitInstruction(const AST::Instruction &Instr) {
     ir_ref Proto = ir_proto(ctx, IR_FASTCALL_FUNC, IR_VOID, 5, ProtoParams);
     ir_ref Fn = ir_const_func_addr(ctx, (uintptr_t)&jit_memory_fill, Proto);
     ir_CALL_5(IR_VOID, Fn, EnvPtrVal, ir_CONST_I32(static_cast<int32_t>(memIdx)),
-              ir_ZEXT_U32(Off), ir_ZEXT_U32(Val), ir_ZEXT_U32(N));
+              coerceToType(Off, IR_U32), coerceToType(Val, IR_U32),
+              coerceToType(N, IR_U32));
     return {};
   }
 
@@ -687,8 +689,9 @@ Expect<void> WasmToIRBuilder::visitInstruction(const AST::Instruction &Instr) {
     ir_ref Proto = ir_proto(ctx, IR_FASTCALL_FUNC, IR_VOID, 6, ProtoParams);
     ir_ref Fn = ir_const_func_addr(ctx, (uintptr_t)&jit_memory_init, Proto);
     ir_CALL_6(IR_VOID, Fn, EnvPtrVal, ir_CONST_I32(static_cast<int32_t>(memIdx)),
-              ir_CONST_I32(static_cast<int32_t>(dataIdx)), ir_ZEXT_U32(Dst),
-              ir_ZEXT_U32(Src), ir_ZEXT_U32(Len));
+              ir_CONST_I32(static_cast<int32_t>(dataIdx)),
+              coerceToType(Dst, IR_U32), coerceToType(Src, IR_U32),
+              coerceToType(Len, IR_U32));
     return {};
   }
 
@@ -724,7 +727,7 @@ Expect<void> WasmToIRBuilder::visitInstruction(const AST::Instruction &Instr) {
     ir_ref NPagesI32 = pop();
     ir_ref NPages = ensureValidRef(NPagesI32, IR_I32);
     // Cast to u32 for the trampoline
-    ir_ref NPagesU32 = ir_ZEXT_U32(NPages);
+    ir_ref NPagesU32 = coerceToType(NPages, IR_U32);
     ir_ref EnvPtrVal = ensureValidRef(EnvPtr, IR_ADDR);
     ir_ref Fn = ensureValidRef(MemoryGrowFnPtr, IR_ADDR);
     uint8_t ProtoParams[2] = {IR_ADDR, IR_U32};
@@ -1771,7 +1774,7 @@ Expect<void> WasmToIRBuilder::visitTable(const AST::Instruction &Instr) {
     ir_ref Proto = ir_proto(ctx, IR_FASTCALL_FUNC, IR_VOID, 3, ProtoParams);
     ir_ref Fn = ir_const_func_addr(ctx, (uintptr_t)&jit_table_get, Proto);
     ir_CALL_3(IR_VOID, Fn, EnvPtrVal, ir_CONST_I32(static_cast<int32_t>(tableIdx)),
-              ir_ZEXT_U32(Idx));
+              coerceToType(Idx, IR_U32));
     pushRef(ir_LOAD_I64(ResultBuf),
             ir_LOAD_I64(ir_ADD_A(ResultBuf, ir_CONST_ADDR(sizeof(uint64_t)))));
     return {};
@@ -1786,7 +1789,7 @@ Expect<void> WasmToIRBuilder::visitTable(const AST::Instruction &Instr) {
     ir_ref Proto = ir_proto(ctx, IR_FASTCALL_FUNC, IR_VOID, 4, ProtoParams);
     ir_ref Fn = ir_const_func_addr(ctx, (uintptr_t)&jit_table_set, Proto);
     ir_CALL_4(IR_VOID, Fn, EnvPtrVal,
-              ir_CONST_I32(static_cast<int32_t>(tableIdx)), ir_ZEXT_U32(Idx),
+              ir_CONST_I32(static_cast<int32_t>(tableIdx)), coerceToType(Idx, IR_U32),
               ResultBuf);
     return {};
   }
@@ -1809,7 +1812,7 @@ Expect<void> WasmToIRBuilder::visitTable(const AST::Instruction &Instr) {
     ir_ref Fn = ir_const_func_addr(ctx, (uintptr_t)&jit_table_grow, Proto);
     ir_ref Result = ir_CALL_4(IR_I32, Fn, EnvPtrVal,
                               ir_CONST_I32(static_cast<int32_t>(tableIdx)),
-                              ir_ZEXT_U32(N), ResultBuf);
+                              coerceToType(N, IR_U32), ResultBuf);
     push(Result);
     return {};
   }
@@ -1823,8 +1826,8 @@ Expect<void> WasmToIRBuilder::visitTable(const AST::Instruction &Instr) {
     ir_ref Proto = ir_proto(ctx, IR_FASTCALL_FUNC, IR_VOID, 5, ProtoParams);
     ir_ref Fn = ir_const_func_addr(ctx, (uintptr_t)&jit_table_fill, Proto);
     ir_CALL_5(IR_VOID, Fn, EnvPtrVal,
-              ir_CONST_I32(static_cast<int32_t>(tableIdx)), ir_ZEXT_U32(Off),
-              ir_ZEXT_U32(Len), ResultBuf);
+              ir_CONST_I32(static_cast<int32_t>(tableIdx)), coerceToType(Off, IR_U32),
+              coerceToType(Len, IR_U32), ResultBuf);
     return {};
   }
   case OpCode::Table__copy: {
@@ -1838,8 +1841,9 @@ Expect<void> WasmToIRBuilder::visitTable(const AST::Instruction &Instr) {
     ir_ref Fn = ir_const_func_addr(ctx, (uintptr_t)&jit_table_copy, Proto);
     ir_CALL_6(IR_VOID, Fn, EnvPtrVal,
               ir_CONST_I32(static_cast<int32_t>(dstTableIdx)),
-              ir_CONST_I32(static_cast<int32_t>(srcTableIdx)), ir_ZEXT_U32(Dst),
-              ir_ZEXT_U32(Src), ir_ZEXT_U32(Len));
+              ir_CONST_I32(static_cast<int32_t>(srcTableIdx)),
+              coerceToType(Dst, IR_U32), coerceToType(Src, IR_U32),
+              coerceToType(Len, IR_U32));
     return {};
   }
   case OpCode::Table__init: {
@@ -1851,8 +1855,9 @@ Expect<void> WasmToIRBuilder::visitTable(const AST::Instruction &Instr) {
     ir_ref Fn = ir_const_func_addr(ctx, (uintptr_t)&jit_table_init, Proto);
     ir_CALL_6(IR_VOID, Fn, EnvPtrVal,
               ir_CONST_I32(static_cast<int32_t>(tableIdx)),
-              ir_CONST_I32(static_cast<int32_t>(elemIdx)), ir_ZEXT_U32(Dst),
-              ir_ZEXT_U32(Src), ir_ZEXT_U32(Len));
+              ir_CONST_I32(static_cast<int32_t>(elemIdx)),
+              coerceToType(Dst, IR_U32), coerceToType(Src, IR_U32),
+              coerceToType(Len, IR_U32));
     return {};
   }
   case OpCode::Elem__drop: {
@@ -2002,7 +2007,12 @@ void WasmToIRBuilder::emitLoopBackEdge(LabelInfo &Target) {
   std::map<uint32_t, ir_ref> BackEdgeLocals;
   for (auto &[LocalIdx, PhiRef] : Target.LoopLocalPhis) {
     auto it = Locals.find(LocalIdx);
-    if (it != Locals.end()) {
+    if (it != Locals.end() && it->second != PhiRef) {
+      // Only include locals that were actually modified in the loop body.
+      // If Locals[idx] still equals the loop PHI ref, the local was never
+      // written — skip it to avoid creating a self-referencing PHI
+      // (d_X = PHI(merge, init, d_X)) which can trigger a bug in the IR
+      // library's register allocator.
       ir_type PhiType = IR_I32;
       auto typeIt = LocalTypes.find(LocalIdx);
       if (typeIt != LocalTypes.end()) {
@@ -2077,11 +2087,15 @@ Expect<void> WasmToIRBuilder::visitLoop(const AST::Instruction &Instr) {
   Label.TrueBranchTerminated = false;
   Label.ElseBranchTerminated = false;
 
-  // Create PHI nodes for all local variables
-  // In SSA form, loop variables need PHI nodes to merge:
-  //   - Initial value (before loop)
-  //   - Back-edge value (after loop iteration)
+  // Create PHI nodes only for locals that are modified inside this loop.
+  // Unmodified locals keep their pre-loop value, avoiding trivial PHIs
+  // (PHI(loop, init, init)) that can trigger IR library RA bugs.
+  // Create PHI nodes for all local variables.
+  // In SSA form, loop variables need PHI nodes to merge the initial value
+  // (before loop) with the back-edge value (after loop iteration).
+  // Unmodified locals will become dead PHIs, cleaned up at loop end.
   for (auto &[LocalIdx, LocalRef] : Locals) {
+    Label.PreLoopLocals[LocalIdx] = LocalRef;
     // Use tracked local type (definitive) instead of inferring from value
     ir_type LocalType = IR_I32;  // Default
     auto typeIt = LocalTypes.find(LocalIdx);
@@ -2101,9 +2115,7 @@ Expect<void> WasmToIRBuilder::visitLoop(const AST::Instruction &Instr) {
     // Create a COPY of the PHI to materialize its value at the start of each iteration.
     // This ensures we have a concrete SSA value to use when exiting the loop early.
     ir_ref PhiCopy = ir_COPY(LocalType, Phi);
-    
-    // Store mapping and original value
-    Label.PreLoopLocals[LocalIdx] = LocalRef;
+
     Label.LoopLocalPhis[LocalIdx] = Phi;
     
     // Update Locals to use the COPY (materialized PHI value) inside the loop
@@ -2322,6 +2334,11 @@ Expect<void> WasmToIRBuilder::visitEnd(const AST::Instruction &) {
           auto it = Label.LoopBackEdgeLocals[0].find(LocalIdx);
           if (it != Label.LoopBackEdgeLocals[0].end()) {
             ir_PHI_SET_OP(PhiRef, 2, it->second);
+          } else {
+            // Unmodified: wire to pre-loop value (PHI becomes dead below).
+            auto preIt = Label.PreLoopLocals.find(LocalIdx);
+            if (preIt != Label.PreLoopLocals.end())
+              ir_PHI_SET_OP(PhiRef, 2, preIt->second);
           }
         } else {
           // Multiple back-edges: create intermediate PHI at the merge
@@ -2358,6 +2375,25 @@ Expect<void> WasmToIRBuilder::visitEnd(const AST::Instruction &) {
         CurrentPathTerminated = false;
       } else {
         CurrentPathTerminated = true;
+      }
+
+      // For unmodified locals, restore Locals to pre-loop values so that
+      // code after the loop references the original value directly instead
+      // of going through the redundant PHI(merge, init, init).
+      for (auto &[LocalIdx, PhiRef] : Label.LoopLocalPhis) {
+        bool modified = false;
+        for (auto &backEdgeMap : Label.LoopBackEdgeLocals) {
+          if (backEdgeMap.find(LocalIdx) != backEdgeMap.end()) {
+            modified = true;
+            break;
+          }
+        }
+        if (!modified) {
+          auto preIt = Label.PreLoopLocals.find(LocalIdx);
+          if (preIt != Label.PreLoopLocals.end()) {
+            Locals[LocalIdx] = preIt->second;
+          }
+        }
       }
     }
     break;

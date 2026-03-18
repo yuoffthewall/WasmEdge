@@ -308,6 +308,7 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
         // Compile to native code
         auto CompRes = IREngine.compile(IRBuilder.getIRContext());
         if (!CompRes.has_value()) {
+          spdlog::info("IR JIT: func {} compile failed", FuncIdx);
           CompileFailCount++;
           CodeIdx++;
           FuncIdx++;
