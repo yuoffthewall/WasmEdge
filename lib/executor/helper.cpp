@@ -96,10 +96,6 @@ extern "C" uint64_t jit_host_call(WasmEdge::VM::JitExecEnv *env,
   auto res = g_jitExecutor->jitCallFunction(*g_jitStackMgr, *funcInst, params,
                                             g_jitModInst);
   if (!res) {
-    if (res.error() != WasmEdge::ErrCode::Value::Terminated) {
-      spdlog::error("jit_host_call: func {} failed: {}", funcIdx,
-                    WasmEdge::ErrCode(res.error()));
-    }
     if (res.error() == WasmEdge::ErrCode::Value::Terminated) {
       void *buf = WasmEdge::VM::wasmedge_ir_jit_get_termination_buf();
       if (buf)
