@@ -103,8 +103,12 @@ IRJitEngine::compile(ir_ctx *Ctx) {
   // Default O2; override with WASMEDGE_IR_JIT_OPT_LEVEL=0|1 for debug.
   int opt_level = 2;
   if (const char *e = std::getenv("WASMEDGE_IR_JIT_OPT_LEVEL")) {
-    if (e[0] == '0' && e[1] == '\0') opt_level = 0;
-    else if (e[0] == '1' && e[1] == '\0') opt_level = 1;
+    if (e[0] == '0' && e[1] == '\0')
+      opt_level = 0;
+    else if (e[0] == '1' && e[1] == '\0')
+      opt_level = 1;
+    else if (e[0] == '2' && e[1] == '\0')
+      opt_level = 2;
   }
 
   static int _dbg_func_id = 0;

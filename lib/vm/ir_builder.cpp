@@ -135,13 +135,20 @@ Expect<void> WasmToIRBuilder::initialize(
   // Initialize IR context. Default O2; override with WASMEDGE_IR_JIT_OPT_LEVEL=0|1 for debug.
   int ir_opt_level = 2;
   if (const char *e = std::getenv("WASMEDGE_IR_JIT_OPT_LEVEL")) {
-    if (e[0] == '0' && e[1] == '\0') ir_opt_level = 0;
-    else if (e[0] == '1' && e[1] == '\0') ir_opt_level = 1;
+    if (e[0] == '0' && e[1] == '\0')
+      ir_opt_level = 0;
+    else if (e[0] == '1' && e[1] == '\0')
+      ir_opt_level = 1;
+    else if (e[0] == '2' && e[1] == '\0')
+      ir_opt_level = 2;
   }
   uint32_t ir_flags = IR_FUNCTION;
   if (ir_opt_level > 0) {
     ir_flags |= IR_OPT_FOLDING | IR_OPT_CFG | IR_OPT_CODEGEN;
-    if (ir_opt_level > 1) ir_flags |= IR_OPT_MEM2SSA | IR_OPT_INLINE;
+    ir_flags |= IR_OPT_MEM2SSA;
+  }
+  if (ir_opt_level > 1) {
+    ir_flags |= IR_OPT_INLINE;
   }
   ir_init(&Ctx, ir_flags, IR_CONSTS_LIMIT_MIN, IR_INSNS_LIMIT_MIN);
   Initialized = true;
