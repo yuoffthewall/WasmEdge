@@ -193,12 +193,13 @@ so there are no DESSA moves and no register clobbering. Trivial PHIs still
 exist (1399 PHIs at O0 vs 670 at O1, since O1's CFG simplification removes
 some), but they don't cause harm without RA.
 
-### Fix
+### Fix (reverted)
 
 **File:** `thirdparty/ir/ir.h` — function `ir_jit_compile`
 
 Enable SCCP at O1 (was previously only enabled at O2):
 
+This is just an ad-hoc fix. The real fix would require indentifing the root cause of register clobbering.
 ```c
 // BEFORE:
 if (opt_level > 1) {

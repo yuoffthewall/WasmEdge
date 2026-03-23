@@ -21,6 +21,7 @@ extern "C" {
 #include <cstdlib>
 #include <cstring>
 #include <set>
+#include <unordered_set>
 
 namespace WasmEdge {
 namespace VM {
@@ -39,6 +40,55 @@ uint64_t wasm_i64_div_u(uint64_t a, uint64_t b) {
 }
 uint64_t wasm_i64_rem_u(uint64_t a, uint64_t b) {
   return b ? (a % b) : 0;
+}
+
+/// Mark locals that have local.set / local.tee in this span. Uses JumpEnd /
+/// JumpElse from the loader (offsets in the same contiguous instruction array).
+static void collectLocalWritesInSpan(Span<const AST::Instruction> InstrSpan,
+                                     std::unordered_set<uint32_t> &Out) {
+  size_t I = 0;
+  while (I < InstrSpan.size()) {
+    const AST::Instruction &Instr = InstrSpan[I];
+    OpCode Op = Instr.getOpCode();
+    switch (Op) {
+    case OpCode::Local__set:
+    case OpCode::Local__tee:
+      Out.insert(Instr.getTargetIndex());
+      ++I;
+      break;
+    case OpCode::Block:
+    case OpCode::Loop: {
+      uint32_t JE = Instr.getJumpEnd();
+      if (JE >= 1) {
+        collectLocalWritesInSpan(InstrSpan.subspan(I + 1, JE - 1), Out);
+      }
+      I += static_cast<size_t>(JE) + 1;
+      break;
+    }
+    case OpCode::If: {
+      uint32_t JE = Instr.getJumpEnd();
+      uint32_t JElse = Instr.getJumpElse();
+      if (JElse == JE) {
+        if (JE >= 1) {
+          collectLocalWritesInSpan(InstrSpan.subspan(I + 1, JE - 1), Out);
+        }
+      } else {
+        if (JElse >= 1) {
+          collectLocalWritesInSpan(InstrSpan.subspan(I + 1, JElse - 1), Out);
+        }
+        if (JE > JElse + 1) {
+          collectLocalWritesInSpan(
+              InstrSpan.subspan(I + JElse + 1, JE - JElse - 1), Out);
+        }
+      }
+      I += static_cast<size_t>(JE) + 1;
+      break;
+    }
+    default:
+      ++I;
+      break;
+    }
+  }
 }
 }  // namespace
 
@@ -73,6 +123,8 @@ void WasmToIRBuilder::reset() noexcept {
   SharedCallArgs = 0;
   ModuleFuncTypes.clear();
   ModuleGlobalTypes.clear();
+  FuncInstrs = Span<const AST::Instruction>();
+  CurInstrIdx = 0;
 }
 
 Expect<void> WasmToIRBuilder::initialize(
@@ -204,8 +256,10 @@ WasmToIRBuilder::buildFromInstructions(Span<const AST::Instruction> Instrs) {
     SharedCallArgs = ir_ALLOCA(ir_CONST_I32(MaxCallArgs * sizeof(uint64_t)));
   }
 
-  for (const auto &Instr : Instrs) {
-    auto Res = visitInstruction(Instr);
+  FuncInstrs = Instrs;
+  for (uint32_t IX = 0; IX < Instrs.size(); ++IX) {
+    CurInstrIdx = IX;
+    auto Res = visitInstruction(Instrs[IX]);
     if (!Res) {
       return Unexpect(Res);
     }
@@ -2005,21 +2059,18 @@ void WasmToIRBuilder::emitLoopBackEdge(LabelInfo &Target) {
   ir_ctx *ctx = &Ctx;
 
   std::map<uint32_t, ir_ref> BackEdgeLocals;
-  for (auto &[LocalIdx, PhiRef] : Target.LoopLocalPhis) {
+  for (const auto &P : Target.LoopLocalPhis) {
+    uint32_t LocalIdx = P.first;
     auto it = Locals.find(LocalIdx);
-    if (it != Locals.end() && it->second != PhiRef) {
-      // Only include locals that were actually modified in the loop body.
-      // If Locals[idx] still equals the loop PHI ref, the local was never
-      // written — skip it to avoid creating a self-referencing PHI
-      // (d_X = PHI(merge, init, d_X)) which can trigger a bug in the IR
-      // library's register allocator.
-      ir_type PhiType = IR_I32;
-      auto typeIt = LocalTypes.find(LocalIdx);
-      if (typeIt != LocalTypes.end()) {
-        PhiType = typeIt->second;
-      }
-      BackEdgeLocals[LocalIdx] = coerceToType(it->second, PhiType);
+    if (it == Locals.end()) {
+      continue;
     }
+    ir_type PhiType = IR_I32;
+    auto typeIt = LocalTypes.find(LocalIdx);
+    if (typeIt != LocalTypes.end()) {
+      PhiType = typeIt->second;
+    }
+    BackEdgeLocals[LocalIdx] = coerceToType(it->second, PhiType);
   }
 
   ir_ref BackEnd = ir_END();
@@ -2087,14 +2138,21 @@ Expect<void> WasmToIRBuilder::visitLoop(const AST::Instruction &Instr) {
   Label.TrueBranchTerminated = false;
   Label.ElseBranchTerminated = false;
 
-  // Create PHI nodes only for locals that are modified inside this loop.
-  // Unmodified locals keep their pre-loop value, avoiding trivial PHIs
-  // (PHI(loop, init, init)) that can trigger IR library RA bugs.
-  // Create PHI nodes for all local variables.
-  // In SSA form, loop variables need PHI nodes to merge the initial value
-  // (before loop) with the back-edge value (after loop iteration).
-  // Unmodified locals will become dead PHIs, cleaned up at loop end.
+  // PHI + COPY only for locals written (local.set / local.tee) in the loop
+  // body; others keep the pre-loop SSA value for all iterations.
+  std::unordered_set<uint32_t> WrittenLocals;
+  {
+    uint32_t JE = Instr.getJumpEnd();
+    if (JE >= 1 && CurInstrIdx + JE <= FuncInstrs.size()) {
+      collectLocalWritesInSpan(FuncInstrs.subspan(CurInstrIdx + 1, JE - 1),
+                               WrittenLocals);
+    }
+  }
+
   for (auto &[LocalIdx, LocalRef] : Locals) {
+    if (!WrittenLocals.count(LocalIdx)) {
+      continue;
+    }
     Label.PreLoopLocals[LocalIdx] = LocalRef;
     // Use tracked local type (definitive) instead of inferring from value
     ir_type LocalType = IR_I32;  // Default
@@ -2375,25 +2433,6 @@ Expect<void> WasmToIRBuilder::visitEnd(const AST::Instruction &) {
         CurrentPathTerminated = false;
       } else {
         CurrentPathTerminated = true;
-      }
-
-      // For unmodified locals, restore Locals to pre-loop values so that
-      // code after the loop references the original value directly instead
-      // of going through the redundant PHI(merge, init, init).
-      for (auto &[LocalIdx, PhiRef] : Label.LoopLocalPhis) {
-        bool modified = false;
-        for (auto &backEdgeMap : Label.LoopBackEdgeLocals) {
-          if (backEdgeMap.find(LocalIdx) != backEdgeMap.end()) {
-            modified = true;
-            break;
-          }
-        }
-        if (!modified) {
-          auto preIt = Label.PreLoopLocals.find(LocalIdx);
-          if (preIt != Label.PreLoopLocals.end()) {
-            Locals[LocalIdx] = preIt->second;
-          }
-        }
       }
     }
     break;

@@ -203,7 +203,11 @@ private:
   /// Emit a loop back-edge, merging with any previously emitted back-edge.
   void emitLoopBackEdge(LabelInfo &Target);
 
-private:
+  /// Full function instruction stream and index of the opcode being visited
+  /// (for static analysis of loop bodies; JumpEnd is relative to this array).
+  Span<const AST::Instruction> FuncInstrs;
+  uint32_t CurInstrIdx = 0;
+
   ir_ctx Ctx;                               // IR context (stack allocated)
   bool Initialized;                         // Track if context is initialized
   bool CurrentPathTerminated;               // True if current code path hit return/unreachable
