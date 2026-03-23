@@ -199,7 +199,7 @@ some), but they don't cause harm without RA.
 
 Enable SCCP at O1 (was previously only enabled at O2):
 
-This is just an ad-hoc fix. The real fix would require indentifing the root cause of register clobbering.
+This is just an ad-hoc fix. The real fix would require identifing the root cause of register clobbering.
 ```c
 // BEFORE:
 if (opt_level > 1) {

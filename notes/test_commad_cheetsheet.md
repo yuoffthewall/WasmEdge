@@ -24,7 +24,7 @@ CFLAGS=-fPIC BUILD_CFLAGS=-fPIC make BUILD=release libir.a
 Use quicksort as an example:
 
 ```shell
-cd ~/Desktop/wasmedge/build && WASMEDGE_SIGHTGLASS_MODE=IR_JIT WASMEDGE_SIGHTGLASS_KERNEL=quicksort timeout 30 ./test/ir/wasmedgeIRBenchmarkTests --gtest_filter='*SightglassSuite*'
+cd ~/Desktop/wasmedge/build && WASMEDGE_SIGHTGLASS_MODE=IR_JIT WASMEDGE_IR_JIT_OPT_LEVEL=2 WASMEDGE_SIGHTGLASS_KERNEL=quicksort timeout 30 ./test/ir/wasmedgeIRBenchmarkTests --gtest_filter='*SightglassSuite*'
 ```
 
 # Test all sightglass .wasm kernel using IR JIT
