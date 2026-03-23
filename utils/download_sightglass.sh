@@ -2,8 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2019-2024 Second State INC
 #
-# Download Sightglass benchmark .wasm kernels from bytecodealliance/sightglass
-# into test/ir/testdata/sightglass/.
+# Download Sightglass benchmark .wasm kernels (non-SIMD / scalar workloads only)
+# from bytecodealliance/sightglass into test/ir/testdata/sightglass/.
+#
+# Excludes SIMD-heavy benchmarks (see Sightglass benchmarks/simd.suite): libsodium,
+# blake3-simd, hex-simd, intgemm-simd, meshoptimizer, tract-onnx (large ONNX asset),
+# image-classification.
 
 set -e
 
@@ -15,15 +19,54 @@ OUT_DIR="${1:-$PROJECT_ROOT/test/ir/testdata/sightglass}"
 mkdir -p "$OUT_DIR"
 DOWNLOADED=0
 
-# Download: output_name|url_path (one per line)
-# Standalone benchmarks use benchmark.wasm; shootout uses shootout-<name>.wasm
-KERNELS="pulldown-cmark|${BASE_URL}/pulldown-cmark/benchmark.wasm
+download_one() {
+  local dest="$1"
+  local url="$2"
+  if [ -f "$dest" ] && [ -s "$dest" ]; then
+    echo "Skip (exists): $dest"
+    return 0
+  fi
+  if command -v curl &>/dev/null; then
+    if curl -fSL -o "$dest" "$url" 2>/dev/null; then
+      echo "Downloaded: $dest"
+      DOWNLOADED=$((DOWNLOADED + 1))
+      return 0
+    fi
+  elif command -v wget &>/dev/null; then
+    if wget -q -O "$dest" "$url" 2>/dev/null; then
+      echo "Downloaded: $dest"
+      DOWNLOADED=$((DOWNLOADED + 1))
+      return 0
+    fi
+  else
+    echo "Error: need curl or wget" >&2
+    exit 1
+  fi
+  rm -f "$dest"
+  echo "Skip (failed): $dest"
+  return 1
+}
+
+# Download: local_stem|url — local file is OUT_DIR/<stem>.wasm
+KERNELS="noop|${BASE_URL}/noop/benchmark.wasm
+bz2|${BASE_URL}/bz2/benchmark.wasm
+gcc-loops|${BASE_URL}/gcc-loops/benchmark.wasm
+blake3-scalar|${BASE_URL}/blake3-scalar/benchmark.wasm
+blind-sig|${BASE_URL}/blind-sig/benchmark.wasm
 hashset|${BASE_URL}/hashset/benchmark.wasm
+pulldown-cmark|${BASE_URL}/pulldown-cmark/benchmark.wasm
 regex|${BASE_URL}/regex/benchmark.wasm
 richards|${BASE_URL}/richards/benchmark.wasm
+rust-compression|${BASE_URL}/rust-compression/benchmark.wasm
+rust-html-rewriter|${BASE_URL}/rust-html-rewriter/benchmark.wasm
 rust-json|${BASE_URL}/rust-json/benchmark.wasm
 rust-protobuf|${BASE_URL}/rust-protobuf/benchmark.wasm
 quicksort|${BASE_URL}/quicksort/benchmark.wasm
+spidermonkey-json|${BASE_URL}/spidermonkey/spidermonkey-json.wasm
+spidermonkey-markdown|${BASE_URL}/spidermonkey/spidermonkey-markdown.wasm
+spidermonkey-regex|${BASE_URL}/spidermonkey/spidermonkey-regex.wasm
+tinygo-json|${BASE_URL}/tinygo/tinygo-json.wasm
+tinygo-regex|${BASE_URL}/tinygo/tinygo-regex.wasm
 shootout-ackermann|${BASE_URL}/shootout/shootout-ackermann.wasm
 shootout-base64|${BASE_URL}/shootout/shootout-base64.wasm
 shootout-ctype|${BASE_URL}/shootout/shootout-ctype.wasm
@@ -46,67 +89,31 @@ shootout-xchacha20|${BASE_URL}/shootout/shootout-xchacha20.wasm"
 
 while IFS='|' read -r kernel url; do
   [ -z "$kernel" ] && continue
-  dest="$OUT_DIR/${kernel}.wasm"
-  if [ -f "$dest" ] && [ -s "$dest" ]; then
-    echo "Skip (exists): $dest"
-    continue
-  fi
-  if command -v curl &>/dev/null; then
-    if curl -fSL -o "$dest" "$url" 2>/dev/null; then
-      echo "Downloaded: $kernel -> $dest"
-      DOWNLOADED=$((DOWNLOADED + 1))
-    else
-      echo "Skip (failed): $kernel"
-      rm -f "$dest"
-    fi
-  elif command -v wget &>/dev/null; then
-    if wget -q -O "$dest" "$url" 2>/dev/null; then
-      echo "Downloaded: $kernel -> $dest"
-      DOWNLOADED=$((DOWNLOADED + 1))
-    else
-      echo "Skip (failed): $kernel"
-      rm -f "$dest"
-    fi
-  else
-    echo "Error: need curl or wget" >&2
-    exit 1
-  fi
+  download_one "$OUT_DIR/${kernel}.wasm" "$url" || true
 done <<EOF
 $KERNELS
 EOF
 
-# Download kernel-prefixed input files (exposed as default.input / default.input.md in test)
-INPUT_FILES="regex.default.input|${BASE_URL}/regex/default.input
+# Kernel-prefixed inputs (mapped to default.input / default.input.md in the test harness)
+INPUT_FILES="bz2.default.input|${BASE_URL}/bz2/default.input
+blake3-scalar.default.input|${BASE_URL}/blake3-scalar/default.input
+blake3-scalar.small.input|${BASE_URL}/blake3-scalar/small.input
+blind-sig.secret.der|${BASE_URL}/blind-sig/secret.der
+regex.default.input|${BASE_URL}/regex/default.input
 rust-json.default.input|${BASE_URL}/rust-json/default.input
 rust-protobuf.default.input|${BASE_URL}/rust-protobuf/default.input
+rust-compression.default.input|${BASE_URL}/rust-compression/default.input
+rust-html-rewriter.default.input|${BASE_URL}/rust-html-rewriter/default.input
 pulldown-cmark.default.input.md|${BASE_URL}/pulldown-cmark/default.input.md"
+
 while IFS='|' read -r outname url; do
   [ -z "$outname" ] && continue
-  dest="$OUT_DIR/$outname"
-  if [ -f "$dest" ] && [ -s "$dest" ]; then
-    echo "Skip (exists): $dest"
-    continue
-  fi
-  if command -v curl &>/dev/null; then
-    if curl -fSL -o "$dest" "$url" 2>/dev/null; then
-      echo "Downloaded: $outname"
-      DOWNLOADED=$((DOWNLOADED + 1))
-    else
-      rm -f "$dest"
-    fi
-  elif command -v wget &>/dev/null; then
-    if wget -q -O "$dest" "$url" 2>/dev/null; then
-      echo "Downloaded: $outname"
-      DOWNLOADED=$((DOWNLOADED + 1))
-    else
-      rm -f "$dest"
-    fi
-  fi
+  download_one "$OUT_DIR/$outname" "$url" || true
 done <<EOF
 $INPUT_FILES
 EOF
 
-# Download supporting files (.input, .stdout.expected, .stderr.expected) for shootout
+# Shootout support files (inputs + expected stdout/stderr)
 SHOOTOUT_URL="${BASE_URL}/shootout"
 SUPPORT_FILES="shootout-ackermann.m.input
 shootout-ackermann.n.input
@@ -151,16 +158,13 @@ shootout-xchacha20.stderr.expected"
 
 for sf in $SUPPORT_FILES; do
   dest="$OUT_DIR/$sf"
-  if [ -f "$dest" ]; then
-    continue
-  fi
+  [ -f "$dest" ] && continue
   url="${SHOOTOUT_URL}/${sf}"
   if command -v curl &>/dev/null; then
     if curl -fSL -o "$dest" "$url" 2>/dev/null; then
       echo "Downloaded: $sf"
       DOWNLOADED=$((DOWNLOADED + 1))
     else
-      # Empty expected files may 404; create an empty file
       touch "$dest"
     fi
   elif command -v wget &>/dev/null; then
@@ -173,23 +177,70 @@ for sf in $SUPPORT_FILES; do
   fi
 done
 
-# Download pulldown-cmark specific files
-PULLDOWN_DIR="$OUT_DIR"
+# Expected stdout/stderr: dest basename|upstream path under benchmarks/
+EXPECTED_PAIRS="
+noop.stdout.expected|noop/benchmark.stdout.expected
+noop.stderr.expected|noop/benchmark.stderr.expected
+bz2.stdout.expected|bz2/benchmark.stdout.expected
+bz2.stderr.expected|bz2/benchmark.stderr.expected
+gcc-loops.stdout.expected|gcc-loops/default.stdout.expected
+blake3-scalar.stdout.expected|blake3-scalar/benchmark.stdout.expected
+blake3-scalar.stderr.expected|blake3-scalar/benchmark.stderr.expected
+blind-sig.stdout.expected|blind-sig/benchmark.stdout.expected
+blind-sig.stderr.expected|blind-sig/benchmark.stderr.expected
+regex.stdout.expected|regex/benchmark.stdout.expected
+regex.stderr.expected|regex/benchmark.stderr.expected
+rust-json.stdout.expected|rust-json/benchmark.stdout.expected
+rust-json.stderr.expected|rust-json/benchmark.stderr.expected
+rust-protobuf.stdout.expected|rust-protobuf/benchmark.stdout.expected
+rust-compression.stdout.expected|rust-compression/benchmark.stdout.expected
+rust-compression.stderr.expected|rust-compression/benchmark.stderr.expected
+rust-html-rewriter.stdout.expected|rust-html-rewriter/benchmark.stdout.expected
+rust-html-rewriter.stderr.expected|rust-html-rewriter/benchmark.stderr.expected
+spidermonkey-json.stdout.expected|spidermonkey/spidermonkey-json.stdout.expected
+spidermonkey-json.stderr.expected|spidermonkey/spidermonkey-json.stderr.expected
+spidermonkey-markdown.stdout.expected|spidermonkey/spidermonkey-markdown.stdout.expected
+spidermonkey-markdown.stderr.expected|spidermonkey/spidermonkey-markdown.stderr.expected
+spidermonkey-regex.stdout.expected|spidermonkey/spidermonkey-regex.stdout.expected
+spidermonkey-regex.stderr.expected|spidermonkey/spidermonkey-regex.stderr.expected
+tinygo-json.stdout.expected|tinygo/tinygo-json.stdout.expected
+tinygo-json.stderr.expected|tinygo/tinygo-json.stderr.expected
+tinygo-regex.stdout.expected|tinygo/tinygo-regex.stdout.expected
+tinygo-regex.stderr.expected|tinygo/tinygo-regex.stderr.expected"
+
+while IFS='|' read -r outname relpath; do
+  outname="$(echo "$outname" | tr -d '\r\n' | xargs)"
+  relpath="$(echo "$relpath" | tr -d '\r\n' | xargs)"
+  [ -z "$outname" ] && continue
+  download_one "$OUT_DIR/$outname" "${BASE_URL}/${relpath}" || true
+done <<EOF
+$EXPECTED_PAIRS
+EOF
+
+# pulldown-cmark: legacy filenames + duplicate default.input.md
 PULLDOWN_URL="${BASE_URL}/pulldown-cmark"
-if [ ! -f "$PULLDOWN_DIR/default.input.md" ]; then
-  curl -fSL -o "$PULLDOWN_DIR/default.input.md" "$PULLDOWN_URL/default.input.md" 2>/dev/null || wget -q -O "$PULLDOWN_DIR/default.input.md" "$PULLDOWN_URL/default.input.md" 2>/dev/null || touch "$PULLDOWN_DIR/default.input.md"
+if [ ! -f "$OUT_DIR/default.input.md" ]; then
+  curl -fSL -o "$OUT_DIR/default.input.md" "$PULLDOWN_URL/default.input.md" 2>/dev/null || wget -q -O "$OUT_DIR/default.input.md" "$PULLDOWN_URL/default.input.md" 2>/dev/null || touch "$OUT_DIR/default.input.md"
   echo "Downloaded: default.input.md"
   DOWNLOADED=$((DOWNLOADED + 1))
 fi
-if [ ! -f "$PULLDOWN_DIR/pulldown-cmark.stdout.expected" ]; then
-  curl -fSL -o "$PULLDOWN_DIR/pulldown-cmark.stdout.expected" "$PULLDOWN_URL/benchmark.stdout.expected" 2>/dev/null || wget -q -O "$PULLDOWN_DIR/pulldown-cmark.stdout.expected" "$PULLDOWN_URL/benchmark.stdout.expected" 2>/dev/null || touch "$PULLDOWN_DIR/pulldown-cmark.stdout.expected"
-  echo "Downloaded: pulldown-cmark.stdout.expected"
-  DOWNLOADED=$((DOWNLOADED + 1))
-fi
-if [ ! -f "$PULLDOWN_DIR/pulldown-cmark.stderr.expected" ]; then
-  curl -fSL -o "$PULLDOWN_DIR/pulldown-cmark.stderr.expected" "$PULLDOWN_URL/benchmark.stderr.expected" 2>/dev/null || wget -q -O "$PULLDOWN_DIR/pulldown-cmark.stderr.expected" "$PULLDOWN_URL/benchmark.stderr.expected" 2>/dev/null || touch "$PULLDOWN_DIR/pulldown-cmark.stderr.expected"
-  echo "Downloaded: pulldown-cmark.stderr.expected"
-  DOWNLOADED=$((DOWNLOADED + 1))
+download_one "$OUT_DIR/pulldown-cmark.stdout.expected" "$PULLDOWN_URL/benchmark.stdout.expected" || true
+download_one "$OUT_DIR/pulldown-cmark.stderr.expected" "$PULLDOWN_URL/benchmark.stderr.expected" || true
+
+# Optional: reject modules that require WebAssembly SIMD (v128)
+if command -v wasm2wat &>/dev/null; then
+  SIMD_FAIL=0
+  while IFS= read -r -d '' f; do
+    if ! wasm2wat --disable-simd "$f" &>/dev/null; then
+      echo "warning: SIMD or invalid wasm (wasm2wat --disable-simd failed): $f" >&2
+      SIMD_FAIL=1
+    fi
+  done < <(find "$OUT_DIR" -maxdepth 1 -name '*.wasm' -print0)
+  if [ $SIMD_FAIL -eq 0 ]; then
+    echo "All .wasm under $OUT_DIR pass non-SIMD check (wasm2wat --disable-simd)."
+  fi
+else
+  echo "wasm2wat not found; skip SIMD validation."
 fi
 
-echo "Done. Downloaded $DOWNLOADED file(s) to $OUT_DIR"
+echo "Done. Downloaded or verified files in $OUT_DIR (increment counter approx: $DOWNLOADED)"

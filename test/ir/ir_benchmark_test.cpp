@@ -44,6 +44,7 @@ namespace SightglassWasi {
 constexpr uint16_t WASI_ERRNO_SUCCESS = 0;
 constexpr uint16_t WASI_ERRNO_BADF = 8;     // EBADF: bad file descriptor
 constexpr uint16_t WASI_ERRNO_NOENT = 44;  // ENOENT: no such file or directory
+constexpr uint16_t WASI_ERRNO_NOTCAP = 58; // __WASI_ENOTCAP: capability unavailable
 // __wasi_fdstat_t: 24 bytes (filetype u8, fdflags u16, rights_base u64, rights_inheriting u64)
 struct FdStat {
   uint8_t fs_filetype;
@@ -95,8 +96,13 @@ public:
     addHostFunc("fd_seek", std::make_unique<StubFdSeek>());
     addHostFunc("fd_write", std::make_unique<StubFdWrite>(Capture));
     addHostFunc("path_open", std::make_unique<StubPathOpen>(this));
+    addHostFunc("path_filestat_get", std::make_unique<StubPathFilestatGet>(this));
     addHostFunc("clock_time_get", std::make_unique<StubClockTimeGet>());
+    addHostFunc("clock_res_get", std::make_unique<StubClockResGet>());
     addHostFunc("random_get", std::make_unique<StubRandomGet>());
+    addHostFunc("fd_fdstat_set_flags", std::make_unique<StubFdFdstatSetFlags>());
+    addHostFunc("path_remove_directory", std::make_unique<StubPathRemoveDirectory>());
+    addHostFunc("path_unlink_file", std::make_unique<StubPathUnlinkFile>());
     addHostFunc("proc_exit", std::make_unique<StubProcExit>(Capture));
   }
 
@@ -326,6 +332,48 @@ private:
     StdioCapture *Capture;
   };
 
+  // path_filestat_get(dirfd, flags, path_ptr, path_len, filestat_ptr) -> errno
+  // Fills __wasi_filestat_t so POSIX stat() (used by e.g. bz2 read_file) sees real size.
+  class StubPathFilestatGet : public WasmEdge::Runtime::HostFunction<StubPathFilestatGet> {
+  public:
+    explicit StubPathFilestatGet(WasiStubModule *Mod) : Module(Mod) {}
+    Expect body(const WasmEdge::Runtime::CallingFrame &Frame, int32_t /* DirFd */,
+                uint32_t /* Flags */, uint32_t PathPtr, uint32_t PathLen,
+                uint32_t FilestatPtr) {
+      auto *Mem = getMem(Frame);
+      if (!Mem) return WasmEdge::Unexpect(WasmEdge::ErrCode::Value::HostFuncError);
+      constexpr uint32_t kFilestatBytes = 64;
+      auto *p = Mem->getPointer<uint8_t *>(FilestatPtr);
+      if (!p) return WasmEdge::Unexpect(WasmEdge::ErrCode::Value::HostFuncError);
+      std::memset(p, 0, kFilestatBytes);
+      uint64_t fileSize = 0;
+      if (Module && PathLen > 0 && PathLen < 4096) {
+        auto *pathBytes = Mem->getPointer<const char *>(PathPtr);
+        if (pathBytes) {
+          std::string reqPath(pathBytes, PathLen);
+          std::string bareReq = reqPath;
+          if (bareReq.size() >= 2 && bareReq.substr(0, 2) == "./")
+            bareReq = bareReq.substr(2);
+          for (const auto &[fname, content] : Module->virtualFiles) {
+            std::string bareF = fname;
+            if (bareF.size() >= 2 && bareF.substr(0, 2) == "./")
+              bareF = bareF.substr(2);
+            if (bareF == bareReq) {
+              fileSize = static_cast<uint64_t>(content.size());
+              break;
+            }
+          }
+        }
+      }
+      // __wasi_filestat_t: filetype u8 at 16, size u64 at 32 (WASI preview1 layout).
+      constexpr uint8_t WASI_FILETYPE_REGULAR_FILE = 4;
+      p[16] = WASI_FILETYPE_REGULAR_FILE;
+      std::memcpy(p + 32, &fileSize, sizeof(fileSize));
+      return SightglassWasi::WASI_ERRNO_SUCCESS;
+    }
+    WasiStubModule *Module;
+  };
+
   class StubPathOpen : public WasmEdge::Runtime::HostFunction<StubPathOpen> {
   public:
     explicit StubPathOpen(WasiStubModule *Mod) : Module(Mod) {}
@@ -395,6 +443,43 @@ private:
         if (p) std::memset(p, 0, BufLen);
       }
       return SightglassWasi::WASI_ERRNO_SUCCESS;
+    }
+  };
+
+  // clock_res_get(clock_id, resolution_ptr) -> errno; writes u64 resolution (ns).
+  class StubClockResGet : public WasmEdge::Runtime::HostFunction<StubClockResGet> {
+  public:
+    Expect body(const WasmEdge::Runtime::CallingFrame &Frame, uint32_t /* ClockId */,
+                uint32_t ResPtr) {
+      auto *Mem = getMem(Frame);
+      if (!Mem) return WasmEdge::Unexpect(WasmEdge::ErrCode::Value::HostFuncError);
+      auto *p = Mem->getPointer<uint64_t *>(ResPtr);
+      if (p) *p = 1; // 1 ns resolution
+      return SightglassWasi::WASI_ERRNO_SUCCESS;
+    }
+  };
+
+  class StubFdFdstatSetFlags : public WasmEdge::Runtime::HostFunction<StubFdFdstatSetFlags> {
+  public:
+    Expect body(const WasmEdge::Runtime::CallingFrame &, int32_t /* Fd */,
+                uint32_t /* FdFlags */) {
+      return SightglassWasi::WASI_ERRNO_SUCCESS;
+    }
+  };
+
+  class StubPathRemoveDirectory : public WasmEdge::Runtime::HostFunction<StubPathRemoveDirectory> {
+  public:
+    Expect body(const WasmEdge::Runtime::CallingFrame &, int32_t /* Fd */,
+                uint32_t /* PathPtr */, uint32_t /* PathLen */) {
+      return SightglassWasi::WASI_ERRNO_NOTCAP;
+    }
+  };
+
+  class StubPathUnlinkFile : public WasmEdge::Runtime::HostFunction<StubPathUnlinkFile> {
+  public:
+    Expect body(const WasmEdge::Runtime::CallingFrame &, int32_t /* Fd */,
+                uint32_t /* PathPtr */, uint32_t /* PathLen */) {
+      return SightglassWasi::WASI_ERRNO_NOTCAP;
     }
   };
 
@@ -1228,6 +1313,21 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
   }
   std::sort(kernels.begin(), kernels.end());
 
+  // Optional: for fast CI / ctest, drop only the heaviest kernels (full list: WASMEDGE_SIGHTGLASS_QUICK=0).
+  const char *quickEnv = std::getenv("WASMEDGE_SIGHTGLASS_QUICK");
+  if (quickEnv && quickEnv[0] == '1') {
+    std::vector<std::filesystem::path> filtered;
+    for (const auto &p : kernels) {
+      const std::string stem = p.stem().string();
+      if (stem.compare(0, 13, "spidermonkey-") == 0)
+        continue;
+      if (stem.compare(0, 7, "tinygo-") == 0)
+        continue;
+      filtered.push_back(p);
+    }
+    kernels = std::move(filtered);
+  }
+
   // Optional: run only one kernel and/or one mode (for isolation when checking which pass/fail/crash)
   const char *singleEnv = std::getenv("WASMEDGE_SIGHTGLASS_KERNEL");
   if (singleEnv && singleEnv[0] != '\0') {
@@ -1305,6 +1405,8 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
       };
       loadAs(kernelName + ".default.input", "default.input");
       loadAs(kernelName + ".default.input.md", "default.input.md");
+      loadAs(kernelName + ".secret.der", "secret.der");
+      loadAs(kernelName + ".small.input", "small.input");
       // Legacy: pulldown-cmark also accepts default.input.md without prefix
       if (kernelName == "pulldown-cmark")
         loadAs("default.input.md", "default.input.md");
@@ -1502,30 +1604,32 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
     }
 #endif
 
-    // Correctness: verify output against sightglass .expected reference files
+    // Correctness: every kernel must ship kernel.stdout.expected and kernel.stderr.expected
+    // next to the .wasm; successful runs are compared for both streams (empty file => empty string).
+    const auto goldenStdout = SightglassDir / (kernelName + ".stdout.expected");
+    const auto goldenStderr = SightglassDir / (kernelName + ".stderr.expected");
+    ASSERT_TRUE(std::filesystem::exists(goldenStdout))
+        << "Missing golden " << goldenStdout << " (add or run utils/download_sightglass.sh)";
+    ASSERT_TRUE(std::filesystem::exists(goldenStderr))
+        << "Missing golden " << goldenStderr << " (add or run utils/download_sightglass.sh)";
+
     auto loadExpected = [&](const std::string &suffix) -> std::string {
       auto path = SightglassDir / (kernelName + suffix);
-      if (!std::filesystem::exists(path)) return "";
       std::ifstream ifs(path, std::ios::binary);
       if (!ifs) return "";
       return std::string((std::istreambuf_iterator<char>(ifs)),
                           std::istreambuf_iterator<char>());
     };
 
-    std::string expectedStdout = loadExpected(".stdout.expected");
-    std::string expectedStderr = loadExpected(".stderr.expected");
+    const std::string expectedStdout = loadExpected(".stdout.expected");
+    const std::string expectedStderr = loadExpected(".stderr.expected");
 
-    // Check whichever mode(s) ran successfully against expected output
     auto checkExpected = [&](const std::string &label, const StdioCapture &cap, bool ok) {
       if (!ok) return;
-      if (!expectedStdout.empty()) {
-        EXPECT_EQ(cap.stdout_, expectedStdout)
-            << "Kernel " << kernelName << " (" << label << "): stdout mismatch vs .expected";
-      }
-      if (!expectedStderr.empty()) {
-        EXPECT_EQ(cap.stderr_, expectedStderr)
-            << "Kernel " << kernelName << " (" << label << "): stderr mismatch vs .expected";
-      }
+      EXPECT_EQ(cap.stdout_, expectedStdout)
+          << "Kernel " << kernelName << " (" << label << "): stdout mismatch vs .expected";
+      EXPECT_EQ(cap.stderr_, expectedStderr)
+          << "Kernel " << kernelName << " (" << label << "): stderr mismatch vs .expected";
     };
     checkExpected("Interpreter", interpCap, interpOk);
     checkExpected("JIT", jitCap, jitOk);

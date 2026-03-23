@@ -20,8 +20,27 @@ CFLAGS=-fPIC BUILD_CFLAGS=-fPIC make BUILD=debug libir.a    # debug, PIC (shared
 CFLAGS=-fPIC BUILD_CFLAGS=-fPIC make BUILD=release libir.a
 ```
 
-# Test a single sightglass .wasm kernel using IR JIT
-Use quicksort as an example:
+# Sightglass `SightglassSuite`
+
+Use **environment variables only** (no code changes). `SightglassSuite` runs the modes in its loop; **`WASMEDGE_SIGHTGLASS_MODE=IR_JIT`** restricts execution to the IR JIT path so Interpreter and LLVM JIT are not run for that invocation.
+
+| Variable | Purpose |
+|----------|---------|
+| `WASMEDGE_SIGHTGLASS_MODE=IR_JIT` | Only run the IR JIT column (skip Interpreter / LLVM JIT). |
+| `WASMEDGE_IR_JIT_OPT_LEVEL=2` | IR JIT compiler optimization level (same knob as the rest of the IR JIT pipeline). |
+| `WASMEDGE_SIGHTGLASS_QUICK=0` | Run **every** `*.wasm` under `test/ir/testdata/sightglass/` (if `ctest` sets `QUICK=1`, override with `0`). |
+| `WASMEDGE_SIGHTGLASS_SKIP_AOT=1` | Skip the optional LLVM AOT block in `SightglassSuite` (faster; still IR JIT only). |
+| `WASMEDGE_SIGHTGLASS_KERNEL=name` | Optional: single kernel (with or without `.wasm`). |
+
+Suggested prefix for IR JIT O2 / full kernel list:
+
+```shell
+export WASMEDGE_SIGHTGLASS_MODE=IR_JIT
+export WASMEDGE_IR_JIT_OPT_LEVEL=2
+export WASMEDGE_SIGHTGLASS_QUICK=0
+```
+
+# One-shot: single kernel, IR JIT O2
 
 ```shell
 cd ~/Desktop/wasmedge/build && WASMEDGE_SIGHTGLASS_MODE=IR_JIT WASMEDGE_IR_JIT_OPT_LEVEL=2 WASMEDGE_SIGHTGLASS_KERNEL=quicksort timeout 30 ./test/ir/wasmedgeIRBenchmarkTests --gtest_filter='*SightglassSuite*'

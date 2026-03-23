@@ -142,3 +142,5 @@ if(WASMEDGE_USE_LLVM)
 endif()
 
 add_test(NAME IRBenchmarkTests COMMAND wasmedgeIRBenchmarkTests)
+# Default ctest run: small Sightglass subset (fast). Full suite: WASMEDGE_SIGHTGLASS_QUICK=0 ctest -R IRBenchmarkTests
+set_tests_properties(IRBenchmarkTests PROPERTIES ENVIRONMENT "WASMEDGE_SIGHTGLASS_QUICK=1")
