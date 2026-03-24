@@ -17,6 +17,7 @@ extern "C" {
 }
 
 #include <cassert>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -40,6 +41,14 @@ uint64_t wasm_i64_div_u(uint64_t a, uint64_t b) {
 }
 uint64_t wasm_i64_rem_u(uint64_t a, uint64_t b) {
   return b ? (a % b) : 0;
+}
+
+// Wasm f32/f64.copysign: magnitude from first stack operand, sign from second (top).
+static float wasm_f32_copysign(float mag, float sign_src) {
+  return std::copysignf(mag, sign_src);
+}
+static double wasm_f64_copysign(double mag, double sign_src) {
+  return std::copysign(mag, sign_src);
 }
 
 /// Mark locals that have local.set / local.tee in this span. Uses JumpEnd /
@@ -522,12 +531,14 @@ Expect<void> WasmToIRBuilder::visitInstruction(const AST::Instruction &Instr) {
   case OpCode::F32__div:
   case OpCode::F32__min:
   case OpCode::F32__max:
+  case OpCode::F32__copysign:
   case OpCode::F64__add:
   case OpCode::F64__sub:
   case OpCode::F64__mul:
   case OpCode::F64__div:
   case OpCode::F64__min:
   case OpCode::F64__max:
+  case OpCode::F64__copysign:
     return visitBinary(Op);
 
   // Comparison operations
@@ -1066,6 +1077,12 @@ Expect<void> WasmToIRBuilder::visitBinary(OpCode Op) {
   case OpCode::F32__max:
     Result = ir_MAX_F(Left, Right);
     break;
+  case OpCode::F32__copysign: {
+    ir_ref Proto = ir_proto_2(ctx, IR_FASTCALL_FUNC, IR_FLOAT, IR_FLOAT, IR_FLOAT);
+    ir_ref Func = ir_const_func_addr(ctx, (uintptr_t)&wasm_f32_copysign, Proto);
+    Result = ir_CALL_2(IR_FLOAT, Func, Left, Right);
+    break;
+  }
 
   // F64 arithmetic
   case OpCode::F64__add:
@@ -1086,6 +1103,12 @@ Expect<void> WasmToIRBuilder::visitBinary(OpCode Op) {
   case OpCode::F64__max:
     Result = ir_MAX_D(Left, Right);
     break;
+  case OpCode::F64__copysign: {
+    ir_ref Proto = ir_proto_2(ctx, IR_FASTCALL_FUNC, IR_DOUBLE, IR_DOUBLE, IR_DOUBLE);
+    ir_ref Func = ir_const_func_addr(ctx, (uintptr_t)&wasm_f64_copysign, Proto);
+    Result = ir_CALL_2(IR_DOUBLE, Func, Left, Right);
+    break;
+  }
 
   default:
     return Unexpect(ErrCode::Value::RuntimeError);
