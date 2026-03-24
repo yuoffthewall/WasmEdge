@@ -22,7 +22,8 @@ DOWNLOADED=0
 download_one() {
   local dest="$1"
   local url="$2"
-  if [ -f "$dest" ] && [ -s "$dest" ]; then
+  # Skip if present (including empty files — avoids re-fetching and "Downloaded" noise).
+  if [ -f "$dest" ]; then
     echo "Skip (exists): $dest"
     return 0
   fi
@@ -94,7 +95,7 @@ done <<EOF
 $KERNELS
 EOF
 
-# Kernel-prefixed inputs (mapped to default.input / default.input.md in the test harness)
+# Extra inputs (prefixed names + legacy aliases mapped in the test harness)
 INPUT_FILES="bz2.default.input|${BASE_URL}/bz2/default.input
 blake3-scalar.default.input|${BASE_URL}/blake3-scalar/default.input
 blake3-scalar.small.input|${BASE_URL}/blake3-scalar/small.input
@@ -104,7 +105,8 @@ rust-json.default.input|${BASE_URL}/rust-json/default.input
 rust-protobuf.default.input|${BASE_URL}/rust-protobuf/default.input
 rust-compression.default.input|${BASE_URL}/rust-compression/default.input
 rust-html-rewriter.default.input|${BASE_URL}/rust-html-rewriter/default.input
-pulldown-cmark.default.input.md|${BASE_URL}/pulldown-cmark/default.input.md"
+pulldown-cmark.default.input.md|${BASE_URL}/pulldown-cmark/default.input.md
+default.input.md|${BASE_URL}/pulldown-cmark/default.input.md"
 
 while IFS='|' read -r outname url; do
   [ -z "$outname" ] && continue
@@ -160,20 +162,23 @@ for sf in $SUPPORT_FILES; do
   dest="$OUT_DIR/$sf"
   [ -f "$dest" ] && continue
   url="${SHOOTOUT_URL}/${sf}"
+  ok=0
   if command -v curl &>/dev/null; then
     if curl -fSL -o "$dest" "$url" 2>/dev/null; then
-      echo "Downloaded: $sf"
-      DOWNLOADED=$((DOWNLOADED + 1))
+      ok=1
     else
-      touch "$dest"
+      rm -f "$dest"
     fi
   elif command -v wget &>/dev/null; then
     if wget -q -O "$dest" "$url" 2>/dev/null; then
-      echo "Downloaded: $sf"
-      DOWNLOADED=$((DOWNLOADED + 1))
+      ok=1
     else
-      touch "$dest"
+      rm -f "$dest"
     fi
+  fi
+  if [ "$ok" -eq 1 ]; then
+    echo "Downloaded: $sf"
+    DOWNLOADED=$((DOWNLOADED + 1))
   fi
 done
 
@@ -199,6 +204,8 @@ rust-compression.stdout.expected|rust-compression/benchmark.stdout.expected
 rust-compression.stderr.expected|rust-compression/benchmark.stderr.expected
 rust-html-rewriter.stdout.expected|rust-html-rewriter/benchmark.stdout.expected
 rust-html-rewriter.stderr.expected|rust-html-rewriter/benchmark.stderr.expected
+pulldown-cmark.stdout.expected|pulldown-cmark/benchmark.stdout.expected
+pulldown-cmark.stderr.expected|pulldown-cmark/benchmark.stderr.expected
 spidermonkey-json.stdout.expected|spidermonkey/spidermonkey-json.stdout.expected
 spidermonkey-json.stderr.expected|spidermonkey/spidermonkey-json.stderr.expected
 spidermonkey-markdown.stdout.expected|spidermonkey/spidermonkey-markdown.stdout.expected
@@ -218,16 +225,6 @@ while IFS='|' read -r outname relpath; do
 done <<EOF
 $EXPECTED_PAIRS
 EOF
-
-# pulldown-cmark: legacy filenames + duplicate default.input.md
-PULLDOWN_URL="${BASE_URL}/pulldown-cmark"
-if [ ! -f "$OUT_DIR/default.input.md" ]; then
-  curl -fSL -o "$OUT_DIR/default.input.md" "$PULLDOWN_URL/default.input.md" 2>/dev/null || wget -q -O "$OUT_DIR/default.input.md" "$PULLDOWN_URL/default.input.md" 2>/dev/null || touch "$OUT_DIR/default.input.md"
-  echo "Downloaded: default.input.md"
-  DOWNLOADED=$((DOWNLOADED + 1))
-fi
-download_one "$OUT_DIR/pulldown-cmark.stdout.expected" "$PULLDOWN_URL/benchmark.stdout.expected" || true
-download_one "$OUT_DIR/pulldown-cmark.stderr.expected" "$PULLDOWN_URL/benchmark.stderr.expected" || true
 
 # Optional: reject modules that require WebAssembly SIMD (v128)
 if command -v wasm2wat &>/dev/null; then
