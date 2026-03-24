@@ -184,6 +184,7 @@ noop.stderr.expected|noop/benchmark.stderr.expected
 bz2.stdout.expected|bz2/benchmark.stdout.expected
 bz2.stderr.expected|bz2/benchmark.stderr.expected
 gcc-loops.stdout.expected|gcc-loops/default.stdout.expected
+gcc-loops.stderr.expected|gcc-loops/default.stderr.expected
 blake3-scalar.stdout.expected|blake3-scalar/benchmark.stdout.expected
 blake3-scalar.stderr.expected|blake3-scalar/benchmark.stderr.expected
 blind-sig.stdout.expected|blind-sig/benchmark.stdout.expected
@@ -193,6 +194,7 @@ regex.stderr.expected|regex/benchmark.stderr.expected
 rust-json.stdout.expected|rust-json/benchmark.stdout.expected
 rust-json.stderr.expected|rust-json/benchmark.stderr.expected
 rust-protobuf.stdout.expected|rust-protobuf/benchmark.stdout.expected
+rust-protobuf.stderr.expected|rust-protobuf/benchmark.stderr.expected
 rust-compression.stdout.expected|rust-compression/benchmark.stdout.expected
 rust-compression.stderr.expected|rust-compression/benchmark.stderr.expected
 rust-html-rewriter.stdout.expected|rust-html-rewriter/benchmark.stdout.expected

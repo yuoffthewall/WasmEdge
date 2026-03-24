@@ -56,6 +56,7 @@ for wasm in ../test/ir/testdata/sightglass/*.wasm; do
   WASMEDGE_SIGHTGLASS_SKIP_INTERP=1 \
   WASMEDGE_SIGHTGLASS_KERNEL="$kernel" \
   WASMEDGE_SIGHTGLASS_MODE=IR_JIT \
+  WASMEDGE_SIGHTGLASS_QUICK=1 \
   WASMEDGE_IR_JIT_OPT_LEVEL=2 \
   stdbuf -oL timeout 30 ./test/ir/wasmedgeIRBenchmarkTests --gtest_filter='*SightglassSuite*' 2>&1
 done | tee /tmp/wasm-test.log
