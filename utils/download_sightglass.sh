@@ -106,7 +106,9 @@ rust-protobuf.default.input|${BASE_URL}/rust-protobuf/default.input
 rust-compression.default.input|${BASE_URL}/rust-compression/default.input
 rust-html-rewriter.default.input|${BASE_URL}/rust-html-rewriter/default.input
 pulldown-cmark.default.input.md|${BASE_URL}/pulldown-cmark/default.input.md
-default.input.md|${BASE_URL}/pulldown-cmark/default.input.md"
+default.input.md|${BASE_URL}/pulldown-cmark/default.input.md
+tinygo-json.input|${BASE_URL}/tinygo/tinygo-json.input
+tinygo-regex.input|${BASE_URL}/tinygo/tinygo-regex.input"
 
 while IFS='|' read -r outname url; do
   [ -z "$outname" ] && continue
