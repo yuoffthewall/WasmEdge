@@ -174,7 +174,9 @@ private:
 
   /// Memory operation helpers
   ir_ref buildMemoryAddress(ir_ref Base, uint32_t Offset);
-  ir_ref buildBoundsCheck(ir_ref Address, uint32_t AccessSize);
+  /// Emit a bounds check: traps if (uint64_t)Base + Offset + AccessSize exceeds
+  /// the current linear memory size.  Must be called before the load/store.
+  void buildBoundsCheck(ir_ref Base, uint32_t Offset, uint32_t AccessSize);
 
   /// Type conversion
   ir_type wasmTypeToIRType(ValType Type) const noexcept;

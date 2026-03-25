@@ -113,7 +113,7 @@ protected:
                                     ValVariant(static_cast<uint32_t>(b))};
     std::vector<ValVariant> Rets(1);
     if (!Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0, nullptr,
-                       Memory.data(), 0))
+                       Memory.data(), Memory.size()))
       return 0;
     return static_cast<int32_t>(Rets[0].get<uint32_t>());
   }
@@ -125,7 +125,7 @@ protected:
     std::vector<ValVariant> Args = {ValVariant(a), ValVariant(b)};
     std::vector<ValVariant> Rets(1);
     if (!Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0, nullptr,
-                       Memory.data(), 0))
+                       Memory.data(), Memory.size()))
       return 0;
     return Rets[0].get<uint32_t>();
   }
@@ -138,7 +138,7 @@ protected:
                                     ValVariant(static_cast<uint64_t>(b))};
     std::vector<ValVariant> Rets(1);
     if (!Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0, nullptr,
-                       Memory.data(), 0))
+                       Memory.data(), Memory.size()))
       return 0;
     return static_cast<int64_t>(Rets[0].get<uint64_t>());
   }
@@ -150,7 +150,7 @@ protected:
     std::vector<ValVariant> Args = {ValVariant(a), ValVariant(b)};
     std::vector<ValVariant> Rets(1);
     if (!Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0, nullptr,
-                       Memory.data(), 0))
+                       Memory.data(), Memory.size()))
       return 0;
     return Rets[0].get<uint64_t>();
   }
@@ -161,7 +161,7 @@ protected:
     std::vector<ValVariant> Args = {ValVariant(static_cast<uint32_t>(a))};
     std::vector<ValVariant> Rets(1);
     if (!Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0, nullptr,
-                       Memory.data(), 0))
+                       Memory.data(), Memory.size()))
       return 0;
     return static_cast<int32_t>(Rets[0].get<uint32_t>());
   }
@@ -172,7 +172,7 @@ protected:
     std::vector<ValVariant> Args = {ValVariant(static_cast<uint64_t>(a))};
     std::vector<ValVariant> Rets(1);
     if (!Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0, nullptr,
-                       Memory.data(), 0))
+                       Memory.data(), Memory.size()))
       return 0;
     return static_cast<int64_t>(Rets[0].get<uint64_t>());
   }
@@ -185,7 +185,7 @@ protected:
                                     ValVariant(static_cast<uint32_t>(b))};
     std::vector<ValVariant> Rets(1);
     if (!Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0, nullptr,
-                       Memory.data(), 0))
+                       Memory.data(), Memory.size()))
       return 0;
     return static_cast<int32_t>(Rets[0].get<uint32_t>());
   }
@@ -198,7 +198,7 @@ protected:
                                     ValVariant(static_cast<uint64_t>(b))};
     std::vector<ValVariant> Rets(1);
     if (!Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0, nullptr,
-                       Memory.data(), 0))
+                       Memory.data(), Memory.size()))
       return 0;
     return static_cast<int32_t>(Rets[0].get<uint32_t>());
   }
@@ -208,7 +208,7 @@ protected:
     std::vector<ValVariant> Args;
     std::vector<ValVariant> Rets(1);
     if (!Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0, nullptr,
-                       Memory.data(), 0))
+                       Memory.data(), Memory.size()))
       return 0;
     return static_cast<int32_t>(Rets[0].get<uint32_t>());
   }
@@ -219,7 +219,7 @@ protected:
     std::vector<ValVariant> Args = {ValVariant(static_cast<uint32_t>(a))};
     std::vector<ValVariant> Rets(1);
     if (!Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0, nullptr,
-                       Memory.data(), 0))
+                       Memory.data(), Memory.size()))
       return 0;
     return static_cast<int32_t>(Rets[0].get<uint32_t>());
   }
@@ -231,7 +231,7 @@ protected:
     std::vector<ValVariant> Args = {ValVariant(static_cast<uint64_t>(a))};
     std::vector<ValVariant> Rets(1);
     if (!Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0, nullptr,
-                       Memory.data(), 0))
+                       Memory.data(), Memory.size()))
       return 0;
     return static_cast<int32_t>(Rets[0].get<uint32_t>());
   }
@@ -241,7 +241,7 @@ protected:
                     std::vector<ValVariant> Args) {
     std::vector<ValVariant> Rets(1);
     if (!Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0, nullptr,
-                       Memory.data(), 0))
+                       Memory.data(), Memory.size()))
       return 0;
     return static_cast<int32_t>(Rets[0].get<uint32_t>());
   }
@@ -250,7 +250,7 @@ protected:
                     std::vector<ValVariant> Args) {
     std::vector<ValVariant> Rets(1);
     if (!Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0, nullptr,
-                       Memory.data(), 0))
+                       Memory.data(), Memory.size()))
       return 0;
     return static_cast<int64_t>(Rets[0].get<uint64_t>());
   }
@@ -259,7 +259,7 @@ protected:
                   std::vector<ValVariant> Args) {
     std::vector<ValVariant> Rets;
     Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0, nullptr,
-                  Memory.data(), 0);
+                  Memory.data(), Memory.size());
   }
 
   // Build a custom function with given instructions
@@ -1235,22 +1235,22 @@ TEST_F(IRExecutionTest, Call_DirectToNative) {
   std::vector<ValVariant> Args = {ValVariant(5u)};
   std::vector<ValVariant> Rets(1);
   ASSERT_TRUE(Engine.invoke(Caller, CallerType, Args, Rets, FuncTable, 1,
-                           nullptr, Memory.data(), 0));
+                           nullptr, Memory.data(), Memory.size()));
   EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), 10);
 
   Args = {ValVariant(0u)};
   ASSERT_TRUE(Engine.invoke(Caller, CallerType, Args, Rets, FuncTable, 1,
-                           nullptr, Memory.data(), 0));
+                           nullptr, Memory.data(), Memory.size()));
   EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), 0);
 
   Args = {ValVariant(static_cast<uint32_t>(-7))};
   ASSERT_TRUE(Engine.invoke(Caller, CallerType, Args, Rets, FuncTable, 1,
-                           nullptr, Memory.data(), 0));
+                           nullptr, Memory.data(), Memory.size()));
   EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), -14);
 
   Args = {ValVariant(100u)};
   ASSERT_TRUE(Engine.invoke(Caller, CallerType, Args, Rets, FuncTable, 1,
-                           nullptr, Memory.data(), 0));
+                           nullptr, Memory.data(), Memory.size()));
   EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), 200);
 }
 
@@ -1296,22 +1296,22 @@ TEST_F(IRExecutionTest, Call_MultipleArgs) {
   std::vector<ValVariant> Args = {ValVariant(3u), ValVariant(4u)};
   std::vector<ValVariant> Rets(1);
   ASSERT_TRUE(Engine.invoke(Caller, CallerType, Args, Rets, FuncTable, 1,
-                           nullptr, Memory.data(), 0));
+                           nullptr, Memory.data(), Memory.size()));
   EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), 7);
 
   Args = {ValVariant(0u), ValVariant(0u)};
   ASSERT_TRUE(Engine.invoke(Caller, CallerType, Args, Rets, FuncTable, 1,
-                           nullptr, Memory.data(), 0));
+                           nullptr, Memory.data(), Memory.size()));
   EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), 0);
 
   Args = {ValVariant(static_cast<uint32_t>(-5)), ValVariant(10u)};
   ASSERT_TRUE(Engine.invoke(Caller, CallerType, Args, Rets, FuncTable, 1,
-                           nullptr, Memory.data(), 0));
+                           nullptr, Memory.data(), Memory.size()));
   EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), 5);
 
   Args = {ValVariant(100u), ValVariant(200u)};
   ASSERT_TRUE(Engine.invoke(Caller, CallerType, Args, Rets, FuncTable, 1,
-                           nullptr, Memory.data(), 0));
+                           nullptr, Memory.data(), Memory.size()));
   EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), 300);
 }
 
@@ -1364,32 +1364,32 @@ TEST_F(IRExecutionTest, CallIndirect_RuntimeIndex) {
   std::vector<ValVariant> Args = {ValVariant(5u), ValVariant(0u)};
   std::vector<ValVariant> Rets(1);
   ASSERT_TRUE(Engine.invoke(Caller, CallerType, Args, Rets, FuncTable, 2,
-                            nullptr, Memory.data(), 0));
+                            nullptr, Memory.data(), Memory.size()));
   EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), 10);
 
   Args = {ValVariant(5u), ValVariant(1u)};
   ASSERT_TRUE(Engine.invoke(Caller, CallerType, Args, Rets, FuncTable, 2,
-                            nullptr, Memory.data(), 0));
+                            nullptr, Memory.data(), Memory.size()));
   EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), 15);
 
   Args = {ValVariant(7u), ValVariant(0u)};
   ASSERT_TRUE(Engine.invoke(Caller, CallerType, Args, Rets, FuncTable, 2,
-                            nullptr, Memory.data(), 0));
+                            nullptr, Memory.data(), Memory.size()));
   EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), 14);
 
   Args = {ValVariant(7u), ValVariant(1u)};
   ASSERT_TRUE(Engine.invoke(Caller, CallerType, Args, Rets, FuncTable, 2,
-                            nullptr, Memory.data(), 0));
+                            nullptr, Memory.data(), Memory.size()));
   EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), 21);
 
   Args = {ValVariant(static_cast<uint32_t>(-4)), ValVariant(0u)};
   ASSERT_TRUE(Engine.invoke(Caller, CallerType, Args, Rets, FuncTable, 2,
-                            nullptr, Memory.data(), 0));
+                            nullptr, Memory.data(), Memory.size()));
   EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), -8);
 
   Args = {ValVariant(static_cast<uint32_t>(-4)), ValVariant(1u)};
   ASSERT_TRUE(Engine.invoke(Caller, CallerType, Args, Rets, FuncTable, 2,
-                            nullptr, Memory.data(), 0));
+                            nullptr, Memory.data(), Memory.size()));
   EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), -12);
 }
 
@@ -1432,17 +1432,17 @@ TEST_F(IRExecutionTest, CallIndirect_ConstantIndex) {
   std::vector<ValVariant> Args = {ValVariant(5u)};
   std::vector<ValVariant> Rets(1);
   ASSERT_TRUE(Engine.invoke(Caller, CallerType, Args, Rets, FuncTable, 2,
-                            nullptr, Memory.data(), 0));
+                            nullptr, Memory.data(), Memory.size()));
   EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), 15);
 
   Args = {ValVariant(10u)};
   ASSERT_TRUE(Engine.invoke(Caller, CallerType, Args, Rets, FuncTable, 2,
-                            nullptr, Memory.data(), 0));
+                            nullptr, Memory.data(), Memory.size()));
   EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), 30);
 
   Args = {ValVariant(static_cast<uint32_t>(-3))};
   ASSERT_TRUE(Engine.invoke(Caller, CallerType, Args, Rets, FuncTable, 2,
-                            nullptr, Memory.data(), 0));
+                            nullptr, Memory.data(), Memory.size()));
   EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), -9);
 }
 
@@ -1485,17 +1485,17 @@ TEST_F(IRExecutionTest, Global_GetI32) {
 
   GlobalVal = ValVariant(static_cast<uint32_t>(42));
   ASSERT_TRUE(Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0,
-                            GlobalPtrs, Memory.data(), 0));
+                            GlobalPtrs, Memory.data(), Memory.size()));
   EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), 42);
 
   GlobalVal = ValVariant(static_cast<uint32_t>(-1));
   ASSERT_TRUE(Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0,
-                            GlobalPtrs, Memory.data(), 0));
+                            GlobalPtrs, Memory.data(), Memory.size()));
   EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), -1);
 
   GlobalVal = ValVariant(static_cast<uint32_t>(0x7FFFFFFF));
   ASSERT_TRUE(Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0,
-                            GlobalPtrs, Memory.data(), 0));
+                            GlobalPtrs, Memory.data(), Memory.size()));
   EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), 0x7FFFFFFF);
 }
 
@@ -1530,17 +1530,17 @@ TEST_F(IRExecutionTest, Global_SetI32) {
   std::vector<ValVariant> Args = {ValVariant(123u)};
   std::vector<ValVariant> Rets;
   ASSERT_TRUE(Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0,
-                             GlobalPtrs, Memory.data(), 0));
+                             GlobalPtrs, Memory.data(), Memory.size()));
   EXPECT_EQ(GlobalVal.get<uint32_t>(), 123u);
 
   Args = {ValVariant(static_cast<uint32_t>(-999))};
   ASSERT_TRUE(Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0,
-                             GlobalPtrs, Memory.data(), 0));
+                             GlobalPtrs, Memory.data(), Memory.size()));
   EXPECT_EQ(static_cast<int32_t>(GlobalVal.get<uint32_t>()), -999);
 
   Args = {ValVariant(0u)};
   ASSERT_TRUE(Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0,
-                             GlobalPtrs, Memory.data(), 0));
+                             GlobalPtrs, Memory.data(), Memory.size()));
   EXPECT_EQ(GlobalVal.get<uint32_t>(), 0u);
 }
 
@@ -1583,18 +1583,18 @@ TEST_F(IRExecutionTest, Global_Increment) {
 
   GlobalVal = ValVariant(static_cast<uint32_t>(0));
   ASSERT_TRUE(Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0,
-                            GlobalPtrs, Memory.data(), 0));
+                            GlobalPtrs, Memory.data(), Memory.size()));
   EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), 1);
   ASSERT_TRUE(Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0,
-                            GlobalPtrs, Memory.data(), 0));
+                            GlobalPtrs, Memory.data(), Memory.size()));
   EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), 2);
   ASSERT_TRUE(Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0,
-                            GlobalPtrs, Memory.data(), 0));
+                            GlobalPtrs, Memory.data(), Memory.size()));
   EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), 3);
 
   GlobalVal = ValVariant(static_cast<uint32_t>(100));
   ASSERT_TRUE(Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0,
-                            GlobalPtrs, Memory.data(), 0));
+                            GlobalPtrs, Memory.data(), Memory.size()));
   EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), 101);
 }
 
@@ -1634,19 +1634,19 @@ TEST_F(IRExecutionTest, Global_Multiple) {
   GlobalVal0 = ValVariant(static_cast<uint32_t>(10));
   GlobalVal1 = ValVariant(static_cast<uint32_t>(20));
   ASSERT_TRUE(Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0,
-                            GlobalPtrs, Memory.data(), 0));
+                            GlobalPtrs, Memory.data(), Memory.size()));
   EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), 30);
 
   GlobalVal0 = ValVariant(static_cast<uint32_t>(-5));
   GlobalVal1 = ValVariant(static_cast<uint32_t>(5));
   ASSERT_TRUE(Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0,
-                            GlobalPtrs, Memory.data(), 0));
+                            GlobalPtrs, Memory.data(), Memory.size()));
   EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), 0);
 
   GlobalVal0 = ValVariant(static_cast<uint32_t>(100));
   GlobalVal1 = ValVariant(static_cast<uint32_t>(200));
   ASSERT_TRUE(Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0,
-                            GlobalPtrs, Memory.data(), 0));
+                            GlobalPtrs, Memory.data(), Memory.size()));
   EXPECT_EQ(static_cast<int32_t>(Rets[0].get<uint32_t>()), 300);
 }
 
@@ -1681,12 +1681,12 @@ TEST_F(IRExecutionTest, Global_I64) {
 
   GlobalVal = ValVariant(static_cast<uint64_t>(0x123456789ABCDEF0ULL));
   ASSERT_TRUE(Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0,
-                            GlobalPtrs, Memory.data(), 0));
+                            GlobalPtrs, Memory.data(), Memory.size()));
   EXPECT_EQ(static_cast<int64_t>(Rets[0].get<uint64_t>()), 0x123456789ABCDEF0LL);
 
   GlobalVal = ValVariant(static_cast<uint64_t>(-1LL));
   ASSERT_TRUE(Engine.invoke(Func, FuncType, Args, Rets, nullptr, 0,
-                            GlobalPtrs, Memory.data(), 0));
+                            GlobalPtrs, Memory.data(), Memory.size()));
   EXPECT_EQ(static_cast<int64_t>(Rets[0].get<uint64_t>()), -1LL);
 }
 

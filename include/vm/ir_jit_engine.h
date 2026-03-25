@@ -58,6 +58,7 @@ struct JitExecEnv {
   void *MemoryGrowFn;   // Pointer to jit_memory_grow trampoline
   void *MemorySizeFn;   // Pointer to jit_memory_size trampoline
   void *CallIndirectFn; // Pointer to jit_call_indirect trampoline
+  uint64_t MemorySizeBytes; // Current linear memory size in bytes (for bounds checking)
   /// 16-byte buffer for ref-return helpers (jit_ref_func, jit_table_get).
   uint64_t RefResultBuf[2];
 };
@@ -76,6 +77,8 @@ extern "C" uint64_t jit_direct_or_host(JitExecEnv *env, void *funcPtr,
 /// JMP buf for unwinding on proc_exit (Terminated). Used by jit_host_call to
 /// longjmp back to invoke() so we do not return to JIT and run unreachable.
 extern "C" void *wasmedge_ir_jit_get_termination_buf(void);
+/// OOB trap handler: longjmps back to invoke() with value 2 (→ MemoryOutOfBounds).
+extern "C" void jit_oob_trap(void);
 /// call_indirect trampoline: resolves table[tableIdx][elemIdx], type-checks
 /// against typeIdx, then dispatches to JIT native code or interpreter.
 /// retTypeCode: 0=void, 1=i32, 2=i64, 3=f32, 4=f64
@@ -151,7 +154,7 @@ public:
                       Span<const ValVariant> Args, Span<ValVariant> Rets,
                       void **FuncTable = nullptr, uint32_t FuncTableSize = 0,
                       void *GlobalBase = nullptr,
-                      void *MemoryBase = nullptr, uint32_t MemorySize = 0);
+                      void *MemoryBase = nullptr, uint64_t MemorySize = 0);
 
   /// Release compiled code
   void release(void *NativeFunc, size_t CodeSize) noexcept;

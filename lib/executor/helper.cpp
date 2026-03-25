@@ -196,9 +196,13 @@ extern "C" int32_t jit_memory_grow(WasmEdge::VM::JitExecEnv *env,
   uint32_t oldPages = g_jitMemory0->getPageSize();
   if (!g_jitMemory0->growPage(nPages))
     return static_cast<int32_t>(-1);
-  // Update MemoryBase in env since grow may relocate the buffer.
-  if (env)
+  // Update MemoryBase and MemorySizeBytes in env since grow may relocate the
+  // buffer and changes the size.
+  if (env) {
     env->MemoryBase = g_jitMemory0->getDataPtr();
+    env->MemorySizeBytes =
+        static_cast<uint64_t>(g_jitMemory0->getPageSize()) * UINT64_C(65536);
+  }
   return static_cast<int32_t>(oldPages);
 }
 
@@ -876,9 +880,13 @@ Executor::enterFunction(Runtime::StackManager &StackMgr,
       g_jitMemory0 = nullptr;
     }
 
+    uint64_t MemSizeBytes =
+        g_jitMemory0
+            ? static_cast<uint64_t>(g_jitMemory0->getPageSize()) * UINT64_C(65536)
+            : 0;
     auto Res = IREngine.invoke(Func.getIRJitNativeFunc(), FuncType, Args, Rets,
                                FuncTable, FuncTableSize, GlobalBase,
-                               MemoryBase);
+                               MemoryBase, MemSizeBytes);
 
     if (!Res) {
       if (Res.error() != ErrCode::Value::Terminated) {

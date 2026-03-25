@@ -28,6 +28,8 @@ static thread_local jmp_buf g_termination_buf;
 /// complex IR patterns (e.g. nested loops with many PHIs). We install a
 /// temporary signal handler to catch the crash and longjmp back to the caller,
 /// allowing graceful fallback to the interpreter for that function.
+/// Not using this for now to expose the failure.
+/*
 static thread_local sigjmp_buf g_compile_guard_buf;
 static thread_local volatile bool g_compile_guard_active = false;
 
@@ -41,15 +43,20 @@ static void compileGuardHandler(int sig) {
   raise(sig);
 }
 
-/// Compile with SIGSEGV protection. Returns native code or nullptr on crash.
+/// Compile with SIGSEGV/SIGABRT protection. Returns native code or nullptr on
+/// crash.  SIGABRT is caught because the IR optimizer (SCCP, GCM) uses assert()
+/// which calls abort() on invalid IR patterns the optimizer cannot handle.
 static void *safeIrJitCompile(ir_ctx *ctx, int opt_level, size_t *size) {
-  struct sigaction sa_new{}, sa_old{};
+  struct sigaction sa_new{}, sa_old_segv{}, sa_old_abrt{};
   sa_new.sa_handler = compileGuardHandler;
   sigemptyset(&sa_new.sa_mask);
   sa_new.sa_flags = 0; // No SA_RESTART — we want longjmp
 
-  if (sigaction(SIGSEGV, &sa_new, &sa_old) != 0) {
-    // Can't install handler — compile without guard.
+  bool have_segv = sigaction(SIGSEGV, &sa_new, &sa_old_segv) == 0;
+  bool have_abrt = sigaction(SIGABRT, &sa_new, &sa_old_abrt) == 0;
+
+  if (!have_segv && !have_abrt) {
+    // Can't install any handler — compile without guard.
     return ir_jit_compile(ctx, opt_level, size);
   }
 
@@ -58,20 +65,31 @@ static void *safeIrJitCompile(ir_ctx *ctx, int opt_level, size_t *size) {
   if (sigsetjmp(g_compile_guard_buf, 1) == 0) {
     result = ir_jit_compile(ctx, opt_level, size);
   } else {
-    // Caught SIGSEGV during compilation.
+    // Caught SIGSEGV or SIGABRT during compilation.
     result = nullptr;
   }
   g_compile_guard_active = false;
 
-  // Restore previous handler.
-  sigaction(SIGSEGV, &sa_old, nullptr);
+  // Restore previous handlers.
+  if (have_segv) sigaction(SIGSEGV, &sa_old_segv, nullptr);
+  if (have_abrt) sigaction(SIGABRT, &sa_old_abrt, nullptr);
   return result;
 }
+*/
 
 } // anonymous namespace
 
 extern "C" void *wasmedge_ir_jit_get_termination_buf(void) {
   return &g_termination_buf;
+}
+
+/// OOB trap handler: longjmps back to invoke() with value 2 (MemoryOutOfBounds).
+extern "C" void jit_oob_trap(void) {
+  void *buf = wasmedge_ir_jit_get_termination_buf();
+  if (buf) {
+    longjmp(*static_cast<jmp_buf *>(buf), 2);
+  }
+  std::abort();
 }
 
 namespace WasmEdge {
@@ -122,7 +140,9 @@ IRJitEngine::compile(ir_ctx *Ctx) {
   }
 
   size_t CodeSize = 0;
-  void *NativeCode = safeIrJitCompile(Ctx, opt_level, &CodeSize);
+  // void *NativeCode = safeIrJitCompile(Ctx, opt_level, &CodeSize);
+  // Not using Signal Handler for now to expose the failure.
+  void *NativeCode = ir_jit_compile(Ctx, opt_level, &CodeSize);
 
   if (!NativeCode) {
     spdlog::info("IR JIT: ir_jit_compile failed (func {})", _dbg_cur_id);
@@ -160,12 +180,10 @@ Expect<void> IRJitEngine::invoke(void *NativeFunc,
                                   Span<ValVariant> Rets,
                                   void **FuncTable, uint32_t FuncTableSize,
                                   void *GlobalBase,
-                                  void *MemoryBase, uint32_t MemorySize) {
+                                  void *MemoryBase, uint64_t MemorySize) {
   if (!NativeFunc) {
     return Unexpect(ErrCode::Value::RuntimeError);
   }
-
-  (void)MemorySize;
 
   const auto &ParamTypes = FuncType.getParamTypes();
   const auto &RetTypes = FuncType.getReturnTypes();
@@ -181,6 +199,7 @@ Expect<void> IRJitEngine::invoke(void *NativeFunc,
   Env.MemoryGrowFn = reinterpret_cast<void *>(&jit_memory_grow);
   Env.MemorySizeFn = reinterpret_cast<void *>(&jit_memory_size);
   Env.CallIndirectFn = reinterpret_cast<void *>(&jit_call_indirect);
+  Env.MemorySizeBytes = static_cast<uint64_t>(MemorySize);
 
   ArgsBuffer_.resize(ParamTypes.size());
   for (size_t i = 0; i < ParamTypes.size(); ++i)
@@ -188,8 +207,16 @@ Expect<void> IRJitEngine::invoke(void *NativeFunc,
   uint64_t *ArgsData = ArgsBuffer_.empty() ? nullptr : ArgsBuffer_.data();
 
   void *termBuf = wasmedge_ir_jit_get_termination_buf();
-  if (termBuf && setjmp(*static_cast<jmp_buf *>(termBuf)) != 0) {
-    return Unexpect(ErrCode::Value::Terminated);
+  if (termBuf) {
+    int jmpVal = setjmp(*static_cast<jmp_buf *>(termBuf));
+    if (jmpVal == 2) {
+      // OOB trap from jit_oob_trap (inline bounds check)
+      return Unexpect(ErrCode::Value::MemoryOutOfBounds);
+    }
+    if (jmpVal != 0) {
+      // Termination (e.g. proc_exit via jit_host_call)
+      return Unexpect(ErrCode::Value::Terminated);
+    }
   }
 
   // Uniform JIT signature: ret func(JitExecEnv* env, uint64_t* args)
