@@ -213,6 +213,14 @@ extern "C" int32_t jit_memory_size(WasmEdge::VM::JitExecEnv *env) {
   return static_cast<int32_t>(g_jitMemory0->getPageSize());
 }
 
+extern "C" void jit_bounds_check(WasmEdge::VM::JitExecEnv *env, uint32_t base,
+                                 uint32_t offset, uint32_t access_size) {
+  uint32_t ea = base + offset;
+  uint64_t end = static_cast<uint64_t>(ea) + static_cast<uint64_t>(access_size);
+  if (end > env->MemorySizeBytes)
+    WasmEdge::VM::jit_oob_trap();
+}
+
 extern "C" void jit_memory_copy(WasmEdge::VM::JitExecEnv *env,
                                 uint32_t dstMemIdx, uint32_t srcMemIdx,
                                 uint32_t dst, uint32_t src, uint32_t len) {

@@ -31,6 +31,7 @@ Use **environment variables only** (no code changes). `SightglassSuite` runs the
 | `WASMEDGE_SIGHTGLASS_QUICK=0` | Run **every** `*.wasm` under `test/ir/testdata/sightglass/` (if `ctest` sets `QUICK=1`, override with `0`). |
 | `WASMEDGE_SIGHTGLASS_SKIP_AOT=1` | Skip the optional LLVM AOT block in `SightglassSuite` (faster; still IR JIT only). |
 | `WASMEDGE_SIGHTGLASS_KERNEL=name` | Optional: single kernel (with or without `.wasm`). |
+| `WASMEDGE_IR_JIT_BOUND_CHECK=1` | Optional: enable memory bound checking. |
 
 Suggested prefix for IR JIT O2 / full kernel list:
 

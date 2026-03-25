@@ -99,6 +99,13 @@ static void collectLocalWritesInSpan(Span<const AST::Instruction> InstrSpan,
     }
   }
 }
+
+// WASMEDGE_IR_JIT_BOUND_CHECK=1 enables IR JIT linear-memory bounds checks before
+// each load/store; unset or any other value leaves them disabled (default).
+static bool irJitBoundCheckEnabled() {
+  const char *E = std::getenv("WASMEDGE_IR_JIT_BOUND_CHECK");
+  return E && E[0] == '1' && E[1] == '\0';
+}
 }  // namespace
 
 WasmToIRBuilder::WasmToIRBuilder() noexcept
@@ -187,7 +194,6 @@ Expect<void> WasmToIRBuilder::initialize(
   }
 
   // Uniform JIT signature: ret func(JitExecEnv* env, uint64_t* args)
-  // O2 emitter required; O0 fuses LOAD(addr)->ADDR with ADD incorrectly.
   EnvPtr = ir_PARAM(IR_ADDR, "exec_env", 1);
   ArgsPtr = ir_PARAM(IR_ADDR, "args", 2);
 
@@ -1627,35 +1633,28 @@ ir_ref WasmToIRBuilder::buildMemoryAddress(ir_ref Base, uint32_t Offset) {
 
 void WasmToIRBuilder::buildBoundsCheck(ir_ref Base, uint32_t Offset,
                                        uint32_t AccessSize) {
+  if (!irJitBoundCheckEnabled())
+    return;
+
   ir_ctx *ctx = &Ctx;
 
   // Effective address ea must match buildMemoryAddress: i32 base + offset with
   // 32-bit wrap, then end = zext_u64(ea) + access_size (Wasm spec).
-  // Trap if end > MemorySizeBytes (loaded from env each time — correct after
-  // memory.grow). OOB path calls jit_oob_trap() (longjmp); in-bounds path falls
-  // through to the load/store.
-  ir_ref WasmAddr = Base;
-  if (Offset != 0) {
-    WasmAddr = ir_ADD_I32(Base, ir_CONST_I32(static_cast<int32_t>(Offset)));
-  }
-  ir_ref End =
-      ir_ADD_U64(ir_ZEXT_U64(WasmAddr), ir_CONST_U64(static_cast<uint64_t>(AccessSize)));
-
+  // Trap if end > MemorySizeBytes (jit_bounds_check loads size from env — correct
+  // after memory.grow).
+  //
+  // Use a single outlined call instead of IF + LOAD + UGT + jit_oob_trap +
+  // UNREACHABLE: the extra control flow and unreachable block tickles a
+  // non-terminating linear scan in thirdparty ir_reg_alloc at O1/O2.
   ir_ref EnvPtrVal = ensureValidRef(EnvPtr, IR_ADDR);
-  ir_ref MemSize = ir_LOAD_U64(
-      ir_ADD_A(EnvPtrVal,
-               ir_CONST_ADDR(offsetof(JitExecEnv, MemorySizeBytes))));
-  ir_ref Oob = ir_UGT(End, MemSize);
-  ir_ref IfRef = ir_IF(Oob);
-  ir_IF_TRUE_cold(IfRef);
-
-  ir_ref TrapAddr = ir_CONST_ADDR(reinterpret_cast<uintptr_t>(&jit_oob_trap));
-  ir_ref Proto = ir_proto_0(ctx, IR_FASTCALL_FUNC, IR_VOID);
-  ir_ref TypedTrap = ir_emit2(ctx, IR_OPT(IR_PROTO, IR_ADDR), TrapAddr, Proto);
-  ir_CALL(IR_VOID, TypedTrap);
-  ir_UNREACHABLE();
-
-  ir_IF_FALSE(IfRef);
+  ir_ref BaseU32 = coerceToType(Base, IR_U32);
+  uint8_t ProtoParams[4] = {IR_ADDR, IR_U32, IR_U32, IR_U32};
+  ir_ref Proto =
+      ir_proto(ctx, IR_FASTCALL_FUNC, IR_VOID, 4, ProtoParams);
+  ir_ref Fn = ir_const_func_addr(ctx, (uintptr_t)&jit_bounds_check, Proto);
+  ir_CALL_4(IR_VOID, Fn, EnvPtrVal, BaseU32,
+            ir_CONST_I32(static_cast<int32_t>(Offset)),
+            ir_CONST_I32(static_cast<int32_t>(AccessSize)));
 }
 
 /// Return the number of bytes accessed by a memory load/store opcode.
