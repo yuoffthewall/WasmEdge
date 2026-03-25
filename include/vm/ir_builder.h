@@ -191,6 +191,12 @@ private:
   /// Returns the original value if types are compatible, or a converted value.
   ir_ref coerceToType(ir_ref Value, ir_type TargetType) noexcept;
 
+  /// Look up a local's IR type. Asserts the local exists in LocalTypes.
+  ir_type getLocalType(uint32_t LocalIdx) const noexcept;
+
+  /// Emit a PHI node for 2+ values. Uses ir_PHI_2 for 2, ir_PHI_N for >2.
+  ir_ref emitPhi(ir_type Type, std::vector<ir_ref> &Vals);
+
   /// Merge locals from multiple control flow paths, creating PHI nodes where
   /// values differ. Returns the merged locals map.
   std::map<uint32_t, ir_ref> mergeLocals(
@@ -199,6 +205,13 @@ private:
   /// Merge result values from multiple branches, creating a PHI and pushing it.
   void mergeResults(const std::vector<ir_ref> &BranchResults,
                     ir_type ResultType);
+
+  /// Merge ref-typed result values (type, ptr pairs), creating two PHIs and pushing.
+  void mergeRefResults(
+      const std::vector<std::pair<ir_ref, ir_ref>> &RefBranchResults);
+
+  /// Finalize a Block/If merge: emit MERGE, merge locals, merge results.
+  void finalizeMerge(LabelInfo &Label);
 
   /// Emit a loop back-edge, merging with any previously emitted back-edge.
   void emitLoopBackEdge(LabelInfo &Target);
