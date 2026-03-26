@@ -1426,7 +1426,7 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
 
       WasmEdge::Configure Conf;
       Conf.getCompilerConfigure().setOptimizationLevel(
-          WasmEdge::CompilerConfigure::OptimizationLevel::O0);
+          WasmEdge::CompilerConfigure::OptimizationLevel::O3);
       // Interpreter: ForceInterpreter=true,  EnableJIT=false
       // JIT (LLVM):  ForceInterpreter=false, EnableJIT=true
       // IR_JIT:      ForceInterpreter=false, EnableJIT=false (IR JIT runs in Executor::instantiate)
@@ -1502,7 +1502,7 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
       const char *modeName = "AOT";
       WasmEdge::Configure compileConf;
       compileConf.getCompilerConfigure().setOptimizationLevel(
-          WasmEdge::CompilerConfigure::OptimizationLevel::O0);
+          WasmEdge::CompilerConfigure::OptimizationLevel::O3);
       compileConf.getCompilerConfigure().setOutputFormat(
           WasmEdge::CompilerConfigure::OutputFormat::Native);
       compileConf.getRuntimeConfigure().setForceInterpreter(true);

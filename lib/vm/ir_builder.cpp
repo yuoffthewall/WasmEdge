@@ -2650,87 +2650,64 @@ Expect<void> WasmToIRBuilder::visitBrIf(const AST::Instruction &Instr) {
 
 Expect<void> WasmToIRBuilder::visitBrTable(const AST::Instruction &Instr) {
   ir_ctx *ctx = &Ctx;
-  
+
   // Pop the index value from the stack
   ir_ref IndexVal = pop();
-  
+
   // Get the label list - last entry is the default
   auto Labels = Instr.getLabelList();
   if (Labels.empty()) {
     return Unexpect(ErrCode::Value::RuntimeError);
   }
-  
+
   uint32_t NumCases = static_cast<uint32_t>(Labels.size()) - 1;
   uint32_t DefaultLabelIdx = Labels.back().TargetIndex;
-  
+
   // Validate default label index
   if (DefaultLabelIdx >= LabelStack.size()) {
     return Unexpect(ErrCode::Value::RuntimeError);
   }
-  
-  // Implementation using chained if-else (simpler than ir_SWITCH for Wasm semantics)
-  // This generates: if (idx == 0) br label0; else if (idx == 1) br label1; ... else br default;
-  
-  for (uint32_t i = 0; i < NumCases; i++) {
-    uint32_t LabelIdx = Labels[i].TargetIndex;
-    
-    if (LabelIdx >= LabelStack.size()) {
-      return Unexpect(ErrCode::Value::RuntimeError);
-    }
-    
-    LabelInfo &Target = LabelStack[LabelStack.size() - 1 - LabelIdx];
-    
-    // Compare: idx == i
-    ir_ref CaseVal = ir_CONST_I32(static_cast<int32_t>(i));
-    ir_ref Cmp = ir_EQ(IndexVal, CaseVal);
-    
-    // if (idx == i)
-    ir_ref IfRef = ir_IF(Cmp);
-    
-    // True branch: branch to target
-    ir_IF_TRUE(IfRef);
-    
+
+  // Lower br_table to IR switch/case constructs so the backend can emit
+  // jump-table style code instead of a long chain of conditional branches.
+  ir_ref SwitchRef = ir_SWITCH(IndexVal);
+
+  auto emitBrTableTarget = [this, ctx](LabelInfo &Target) {
     if (Target.Kind == ControlKind::Loop) {
       emitLoopBackEdge(Target);
-    } else {
-      if (Target.Arity > 0) {
-        if (Target.ResultIsRef) {
-          auto [ptrRef, typeRef] = popRef();
-          Target.RefBranchResults.push_back({typeRef, ptrRef});
-        } else {
-          Target.BranchResults.push_back(pop());
-        }
-      }
-      ir_ref BrEnd = ir_END();
-      Target.EndList.push_back(BrEnd);
-      Target.EndLocals.push_back(Locals);
+      return;
     }
-    
-    ir_IF_FALSE(IfRef);
-  }
-  
-  // Default case (all comparisons failed, or out of bounds)
-  LabelInfo &DefaultTarget = LabelStack[LabelStack.size() - 1 - DefaultLabelIdx];
-  
-  if (DefaultTarget.Kind == ControlKind::Loop) {
-    emitLoopBackEdge(DefaultTarget);
-  } else {
-    if (DefaultTarget.Arity > 0) {
-      if (DefaultTarget.ResultIsRef) {
+    if (Target.Arity > 0) {
+      if (Target.ResultIsRef) {
         auto [ptrRef, typeRef] = popRef();
-        DefaultTarget.RefBranchResults.push_back({typeRef, ptrRef});
+        Target.RefBranchResults.push_back({typeRef, ptrRef});
       } else {
-        DefaultTarget.BranchResults.push_back(pop());
+        Target.BranchResults.push_back(pop());
       }
     }
     ir_ref BrEnd = ir_END();
-    DefaultTarget.EndList.push_back(BrEnd);
-    DefaultTarget.EndLocals.push_back(Locals);
+    Target.EndList.push_back(BrEnd);
+    Target.EndLocals.push_back(Locals);
+  };
+
+  for (uint32_t i = 0; i < NumCases; i++) {
+    uint32_t LabelIdx = Labels[i].TargetIndex;
+    if (LabelIdx >= LabelStack.size()) {
+      return Unexpect(ErrCode::Value::RuntimeError);
+    }
+    ir_CASE_VAL(SwitchRef, ir_CONST_I32(static_cast<int32_t>(i)));
+    LabelInfo &Target = LabelStack[LabelStack.size() - 1 - LabelIdx];
+    emitBrTableTarget(Target);
   }
-  
+
+  // Default case (all comparisons failed, or out of bounds).
+  ir_CASE_DEFAULT(SwitchRef);
+  LabelInfo &DefaultTarget = LabelStack[LabelStack.size() - 1 - DefaultLabelIdx];
+  emitBrTableTarget(DefaultTarget);
+
   // After br_table, code is unreachable (all paths branch away)
   CurrentPathTerminated = true;
-  
+
   return {};
 }
 
