@@ -2,7 +2,7 @@
 
 ```shell
 cd /home/tommy/Desktop/wasmedge/build
-cmake -DCMAKE_BUILD_TYPE=Release \
+cmake -DCMAKE_BUILD_TYPE=Debug \
       -DWASMEDGE_BUILD_IR_JIT=ON \
       -DWASMEDGE_BUILD_TESTS=ON \
       ..
@@ -29,7 +29,7 @@ Use **environment variables only** (no code changes). `SightglassSuite` runs the
 | `WASMEDGE_SIGHTGLASS_MODE=IR_JIT` | Only run the IR JIT column (skip Interpreter / LLVM JIT). |
 | `WASMEDGE_IR_JIT_OPT_LEVEL=2` | IR JIT compiler optimization level (same knob as the rest of the IR JIT pipeline). |
 | `WASMEDGE_SIGHTGLASS_QUICK=0` | Run **every** `*.wasm` under `test/ir/testdata/sightglass/` (if `ctest` sets `QUICK=1`, override with `0`). |
-| `WASMEDGE_SIGHTGLASS_SKIP_AOT=1` | Skip the optional LLVM AOT block in `SightglassSuite` (faster; still IR JIT only). |
+| `WASMEDGE_SIGHTGLASS_SKIP_INTERP=1` | Skip the WasmEdge interpreter(too slow) in `SightglassSuite`. |
 | `WASMEDGE_SIGHTGLASS_KERNEL=name` | Optional: single kernel (with or without `.wasm`). |
 | `WASMEDGE_IR_JIT_BOUND_CHECK=1` | Optional: enable memory bound checking. |
 
@@ -69,7 +69,7 @@ Run a single kernel (e.g. quicksort) under GDB from the build dir. Use a Debug b
 
 ```shell
 cd ~/Desktop/wasmedge/build
-WASMEDGE_SIGHTGLASS_SKIP_INTERP=1 WASMEDGE_SIGHTGLASS_KERNEL=quicksort WASMEDGE_IR_JIT_OPT_LEVEL=0 gdb --args ./test/ir/wasmedgeIRBenchmarkTests --gtest_filter='*SightglassSuite*'
+WASMEDGE_SIGHTGLASS_MODE=IR_JIT WASMEDGE_SIGHTGLASS_KERNEL=quicksort WASMEDGE_IR_JIT_OPT_LEVEL=2 gdb --args ./test/ir/wasmedgeIRBenchmarkTests --gtest_filter='*SightglassSuite*'
 ```
 
 In GDB: `run`. When you get SIGSEGV in JIT code (e.g. `wasm_jit_002`), the backtrace may stop at one frame; use the following to get more info:

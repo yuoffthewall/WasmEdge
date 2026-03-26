@@ -166,7 +166,12 @@ Expect<void> WasmToIRBuilder::initialize(
   if (ir_opt_level > 1) {
     ir_flags |= IR_OPT_INLINE;
   }
-  ir_init(&Ctx, ir_flags, IR_CONSTS_LIMIT_MIN, IR_INSNS_LIMIT_MIN);
+  // Use a generous initial constant-pool size (256) instead of the minimum (4).
+  // The SCCP optimization pass in the IR library has a latent bug: it holds
+  // a raw pointer into the instruction buffer while calling ir_const(), which
+  // can trigger ir_grow_bottom() → realloc, invalidating the pointer.
+  // Pre-allocating avoids the realloc during optimization.
+  ir_init(&Ctx, ir_flags, 256, IR_INSNS_LIMIT_MIN);
   Initialized = true;
 
   // Set return type
@@ -2872,51 +2877,44 @@ Expect<void> WasmToIRBuilder::visitCall(const AST::Instruction &Instr) {
       }
     }
   } else {
-    // Direct call: load callee from FuncTable by constant function index.
-    // jit_direct_or_host(env, funcPtr, funcIdx, args, retTypeCode) calls
-    // funcPtr when non-null, else falls back to jit_host_call.
+    // Direct call: load callee from FuncTable and call it directly.
+    // For local functions (funcIdx >= ImportFuncNum), the FuncTable entry is
+    // always non-null (set by the JIT engine after compilation).  Functions
+    // that failed to compile are routed through jit_host_call at a higher
+    // level, so we can safely skip the null check here.
     ir_ref ValidFT = ensureValidRef(FuncTablePtr, IR_ADDR);
-    ir_ref Off = ir_MUL_A(ir_CONST_ADDR(static_cast<uintptr_t>(ResolvedFuncIdx)),
-                          ir_CONST_ADDR(sizeof(void *)));
-    ir_ref FuncIdxArg = ir_CONST_I32(static_cast<int32_t>(ResolvedFuncIdx));
-    ir_ref FuncPtr = ir_LOAD_A(ir_ADD_A(ValidFT, Off));
+    ir_ref FuncPtr = ir_LOAD_A(ir_ADD_A(
+        ValidFT,
+        ir_CONST_ADDR(static_cast<uintptr_t>(ResolvedFuncIdx) * sizeof(void *))));
 
-    uint32_t retTypeCode = 0;
-    if (!RetTypes.empty()) {
-      switch (RetType) {
-      case IR_I32: retTypeCode = 1; break;
-      case IR_I64: retTypeCode = 2; break;
-      case IR_FLOAT: retTypeCode = 3; break;
-      case IR_DOUBLE: retTypeCode = 4; break;
-      default: break;
-      }
+    // Build prototype for direct JIT call: ret func(JitExecEnv*, uint64_t*)
+    // Always declare I64 return even for void callees: the unused rax value is
+    // harmless, and IR_VOID triggers an assertion in the IR x86 backend's
+    // address-fusion pass at O2.  Float/double callees return in xmm0 so they
+    // need their native return type in the prototype.
+    uint8_t DirectProtoParams[2] = {IR_ADDR, IR_ADDR};
+    ir_type DirectRetType;
+    if (RetType == IR_FLOAT) {
+      DirectRetType = IR_FLOAT;
+    } else if (RetType == IR_DOUBLE) {
+      DirectRetType = IR_DOUBLE;
+    } else {
+      DirectRetType = IR_I64;
     }
-    ir_ref DOHFn = ensureValidRef(DirectOrHostFnPtr, IR_ADDR);
-    uint8_t DOHProtoParams[5] = {IR_ADDR, IR_ADDR, IR_I32, IR_ADDR, IR_I32};
-    ir_ref DOHProto =
-        ir_proto(ctx, IR_FASTCALL_FUNC, IR_I64, 5, DOHProtoParams);
-    ir_ref TypedDOH =
-        ir_emit2(ctx, IR_OPT(IR_PROTO, IR_ADDR), DOHFn, DOHProto);
-    ir_ref DOHArgs[5] = {EnvPtrVal, FuncPtr, FuncIdxArg, CalleeArgs,
-                        ir_CONST_I32(static_cast<int32_t>(retTypeCode))};
-    ir_ref CallResult = ir_CALL_N(IR_I64, TypedDOH, 5, DOHArgs);
+
+    ir_ref DirectProto = ir_proto(ctx, IR_FASTCALL_FUNC, DirectRetType, 2,
+                                  DirectProtoParams);
+    ir_ref TypedFuncPtr =
+        ir_emit2(ctx, IR_OPT(IR_PROTO, IR_ADDR), FuncPtr, DirectProto);
+
+    ir_ref DirectArgs[2] = {EnvPtrVal, CalleeArgs};
+    ir_ref CallResult = ir_CALL_N(DirectRetType, TypedFuncPtr, 2, DirectArgs);
 
     if (!RetTypes.empty()) {
       if (RetType == IR_I32)
         push(ir_TRUNC_I32(CallResult));
-      else if (RetType == IR_I64)
+      else
         push(CallResult);
-      else if (RetType == IR_FLOAT) {
-        ir_ref tmp = ir_ALLOCA(ir_CONST_I32(8));
-        ir_STORE(tmp, CallResult);
-        push(ir_LOAD_F(tmp));
-      } else if (RetType == IR_DOUBLE) {
-        ir_ref tmp = ir_ALLOCA(ir_CONST_I32(8));
-        ir_STORE(tmp, CallResult);
-        push(ir_LOAD_D(tmp));
-      } else {
-        push(CallResult);
-      }
     }
   }
 
