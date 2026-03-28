@@ -1,6 +1,28 @@
-# Implementing Tiered Compilation for WasmEdge: A Sea-of-Nodes Baseline JIT Approach
+# Tiered Compilation for WasmEdge: A Sea-of-Nodes Baseline JIT Approach
 
 This project aims to solve WasmEdge's cold start problem by integrating a proven, lightweight JIT compiler. It bridges the gap between interpretation and heavy AOT compilation, making WasmEdge more competitive for modern cloud-native workloads.
+
+## Table of Contents
+
+1. [Architecture & Design](#architecture--design)
+2. [Build & Test & Debug](#build--test--debug)
+3. [Testing Strategy](#testing-strategy)
+4. [References](#references)
+5. [Implementation Status](#implementation-status)
+
+---
+
+# Introduction
+WebAssembly (Wasm) has evolved from a client-side browser technology into a high-performance, secure execution environment for cloud-native, serverless, and edge computing applications. To meet the stringent performance demands of these environments, Wasm runtimes must optimize for two often conflicting metrics: rapid startup latency (cold start) and peak execution throughput. Traditional execution models force a trade-off: interpreters offer instant startup but slow execution, while Ahead-of-Time (AOT) and optimizing Just-in-Time (JIT) compilers produce efficient native code at the cost of significant compilation delays and memory usage.
+
+To resolve this dichotomy, modern high-performance engines (such as V8 and Wasmtime) employ tiered compilation. This strategy utilizes a lightweight "baseline" compiler to generate code quickly for immediate execution, followed by a heavy "optimizing" compiler to recompile hot functions for peak performance. This thesis explores the implementation of such a tiered architecture within WasmEdge, a leading cloud-native Wasm runtime. Specifically, it proposes integrating the dstogov/ir framework—a lightweight compilation infrastructure based on Sea-of-Nodes IR—as a new Tier-1 baseline JIT compiler. By combining dstogov/ir's rapid compilation capabilities with WasmEdge's existing LLVM-based optimization pipeline, this research aims to achieve a system that offers both low-latency startup and high-performance steady-state execution.
+
+# Problem Statement
+While WasmEdge demonstrates exceptional peak performance in computational workloads, its current architecture lacks a multi-tiered compilation strategy. WasmEdge relies heavily on LLVM for both AOT and JIT compilation. Although LLVM generates highly optimized machine code, its compilation pipeline is computationally expensive and memory-intensive, which is often prohibitive for resource-constrained edge devices or short-lived serverless functions.
+
+Consequently, WasmEdge faces a significant "cold start" problem, where applications must endure long pauses while LLVM compiles the code. Currently, WasmEdge lacks a lightweight baseline JIT implementation capable of bridging the gap between slow interpretation and expensive optimization. The lack of a fast-path compiler prevents the runtime from adapting dynamically to workload behavior, limiting its efficiency in scenarios where rapid responsiveness is as critical as raw throughput. This project addresses this deficiency by integrating `dstogov/ir` to establish a baseline compilation tier, thereby enabling a complete tiered JIT infrastructure.
+
+# Background
 
 ## 1. Background: WebAssembly Compilation Evolution
 `Wasm` is designed for near-native performance.
@@ -66,215 +88,237 @@ Workflow:
 
 1. Wasm Bytecode enters WasmEdge.
 
-2. **Tier 1:** dstogov/ir compiles it immediately for execution.
+2. **Tier 1 (implemented):** At instantiation, eligible functions are lowered with dstogov/ir and executed as native code (`JitExecEnv` ABI).
 
-3. **Profiling:** The system counts how many times a function runs.
+3. **Profiling:** Not implemented — there is no hotness counter driving recompilation in this tree.
 
-4. **Tier 2:** If the count exceeds a threshold, the function is recompiled in the background using LLVM.
+4. **Tier 2 (not implemented):** LLVM recompilation of hot functions.
 
-5. **Switch:** The runtime atomically swaps the function pointer to the new, faster LLVM code.
+5. **Switch (not implemented):** Atomically replace the entry point when Tier 2 code is ready.
 
-## 10. Implementation Details
-- **Frontend:** Write a translator that converts Wasm's stack-machine instructions into the Sea-of-Nodes graph (e.g., mapping local.get to LOAD nodes, block/loop to Region nodes).
+## 10. Implementation Details (as implemented in-tree)
+- **Frontend:** `WasmToIRBuilder` walks `AST::Instruction` streams and emits dstogov/ir nodes (stack simulation, PHIs for control merge, `JitExecEnv` loads for memory/globals/tables).
 
-- **Memory:** Use mmap to allocate executable memory for the JIT code.
+- **Memory:** `IRJitEngine` uses **mmap** RW then **RX** (`mprotect`) for emitted code.
 
-- **ABI:** Implement "trampolines" to convert WasmEdge's argument format (ValVariant arrays) into standard C register calls used by the generated code.
+- **ABI:** Generated functions use **`RetType (*)(JitExecEnv *, uint64_t *)`**. `IRJitEngine::invoke` packs `ValVariant` args into `uint64_t[]`, fills `JitExecEnv`, and dispatches. Imports and complex calls use **C trampolines** (`jit_host_call`, `jit_call_indirect`, `jit_memory_grow`, table/bulk helpers, etc.) in `lib/executor/helper.cpp`.
 
 ## 11. Challenges & Future Work
 - **Challenges:** Handling Wasm exceptions, atomic operations, and ensuring thread safety during the code swap.
 
 - **Future Directions:** Adding speculative optimizations (guessing branch directions), Profile-Guided Optimization (PGO), and potentially hardware-specific acceleration.
 
+---
 
-# Introduction
-WebAssembly (Wasm) has evolved from a client-side browser technology into a high-performance, secure execution environment for cloud-native, serverless, and edge computing applications. To meet the stringent performance demands of these environments, Wasm runtimes must optimize for two often conflicting metrics: rapid startup latency (cold start) and peak execution throughput. Traditional execution models force a trade-off: interpreters offer instant startup but slow execution, while Ahead-of-Time (AOT) and optimizing Just-in-Time (JIT) compilers produce efficient native code at the cost of significant compilation delays and memory usage.
+# Architecture & Design
 
-To resolve this dichotomy, modern high-performance engines (such as V8 and Wasmtime) employ tiered compilation. This strategy utilizes a lightweight "baseline" compiler to generate code quickly for immediate execution, followed by a heavy "optimizing" compiler to recompile hot functions for peak performance. This thesis explores the implementation of such a tiered architecture within WasmEdge, a leading cloud-native Wasm runtime. Specifically, it proposes integrating the dstogov/ir framework—a lightweight compilation infrastructure based on Sea-of-Nodes IR—as a new Tier-1 baseline JIT compiler. By combining dstogov/ir's rapid compilation capabilities with WasmEdge's existing LLVM-based optimization pipeline, this research aims to achieve a system that offers both low-latency startup and high-performance steady-state execution.
+This section follows one path through the implementation: **where** IR JIT sits in WasmEdge, **which files** to open, **main types**, **runtime** behavior (including how compile-time and dispatch relate), **lowering** (visitor + macros + codegen choices), and a **short recap** table. It complements the thesis outline in [§9–§10](#9-architecture--technical-plan).
 
-# Problem Statement
-While WasmEdge demonstrates exceptional peak performance in computational workloads, its current architecture lacks a multi-tiered compilation strategy. WasmEdge relies heavily on LLVM for both AOT and JIT compilation. Although LLVM generates highly optimized machine code, its compilation pipeline is computationally expensive and memory-intensive, which is often prohibitive for resource-constrained edge devices or short-lived serverless functions.
+**Roadmap:** (1) position and unified compile/call flow → (2) source layout → (3) major components → (4) runtime and dispatch diagram → (5) instruction mapping and codegen choices → (6) recap.
 
-Consequently, WasmEdge faces a significant "cold start" problem, where applications must endure long pauses while LLVM compiles the code. Currently, WasmEdge lacks a lightweight baseline JIT implementation capable of bridging the gap between slow interpretation and expensive optimization. The lack of a fast-path compiler prevents the runtime from adapting dynamically to workload behavior, limiting its efficiency in scenarios where rapid responsiveness is as critical as raw throughput. This project addresses this deficiency by integrating `dstogov/ir` to establish a baseline compilation tier, thereby enabling a complete tiered JIT infrastructure.
+## 1. Position in WasmEdge and end-to-end flow
 
-# WasmEdge IR JIT Implementation
+The IR JIT is wired into **module instantiation** and **execution**: after load and validation, eligible defined functions are lowered and compiled; calls dispatch through the executor like other backends.
 
-**Status**: Phase 1 - Complete IR Lowering + WasmEdge Integration ✅  
-**Last Updated**: March 6, 2026  
-**Build Status**: Compiling with no errors  
-**Test Status**: All tests passing (100%) - **179 total tests across 6 test suites**
-- Basic IR Generation (33 tests)
-- Instruction Coverage (43 tests)  
-- **Execution Correctness (79 tests)** ✅ (includes 8 control flow + 19 memory + 4 function call + 5 global tests)
-- **Integration Tests (6 tests)** ✅ (includes factorial, memory access, globals, conditional logic)
-- **End-to-End Tests (5 tests)** ✅ - real .wasm file loading and execution
-- **Benchmark Tests (13 tests)** ✅ - integer algorithms, quicksort, Sightglass suite (Interpreter/JIT/AOT)
+**Where IR JIT runs in the engine**
 
-**WasmEdge Integration**: ✅ IR JIT compiles functions during module instantiation  
-**Instruction Coverage**: ~167 WebAssembly instructions mapped to IR  
-**Memory Operations**: ✅ Fully implemented with execution correctness verified (19 tests)  
-**Function Calls**: ✅ `call` and `call_indirect` implemented with execution correctness verified (4 tests)  
-**Global Operations**: ✅ `global.get` and `global.set` implemented with execution correctness verified (5 tests)  
-**Execution Verified**: ✅ I32/I64 arithmetic, bitwise, comparison, unary, memory ops, function calls, globals produce correct results  
-**Control Flow Execution**: ✅ Fixed - if blocks with result types now generate proper PHI nodes  
-**Loop Variables**: ✅ Fixed - PHI nodes properly merge local variable values across loop iterations  
-**If Block Locals**: ✅ Fixed - Local variables modified in if branches correctly merged with PHI nodes
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ 1. Module Loading (Loader::parseModule)                         │
+│    └── Parse .wasm binary into AST::Module                      │
+├─────────────────────────────────────────────────────────────────┤
+│ 2. Validation (Validator::validate)                             │
+│    └── Type checking and semantic validation                    │
+├─────────────────────────────────────────────────────────────────┤
+│ 3. Instantiation (Executor::registerModule)                     │
+│    └── Instantiate functions, memories, globals, tables         │
+│    └── **IR JIT compilation** (after memory/tables/data init)   │
+│        ├── Skip: `ForceInterpreter`, LLVM AOT module, or body   │
+│        │   starting with `unreachable`                          │
+│        ├── Per defined function: set module func types, types   │
+│        │   section, globals, import count                      │
+│        └── `IRJitEngine::compile` → `upgradeToIRJit`           │
+│            (`IRGraph` argument currently `nullptr`)               │
+├─────────────────────────────────────────────────────────────────┤
+│ 4. Execution (`enterFunction` / `invoke`)                        │
+│    └── If `isIRJitFunction()`: `IRJitEngine::invoke` + trampolines │
+│    └── Else: interpreter or LLVM AOT path as usual               │
+└─────────────────────────────────────────────────────────────────┘
+```
 
-### Build defaults and debugging
-- **Default build**: `CMAKE_BUILD_TYPE=Release` and IR JIT optimization level **O2** for best performance.
-- **When you hit bugs**: Use a **Debug** build and **lower the IR JIT opt level** so the O0 emitter and unoptimized IR are easier to debug:
-  1. Configure with Debug: `cmake -DCMAKE_BUILD_TYPE=Debug -B build`
-  2. At run time, force IR JIT to O0: `WASMEDGE_IR_JIT_OPT_LEVEL=0 ./test/ir/wasmedgeIRBenchmarkTests ...`
-  3. Optional O1: `WASMEDGE_IR_JIT_OPT_LEVEL=1` for light optimization.
-- **Env summary**: `WASMEDGE_IR_JIT_OPT_LEVEL=0|1|2` (default 2).
+**Unified compile-time vs run-time flow** (single view; details in §3–§4):
 
-## Table of Contents
+```
+Instantiation (per eligible defined function):
+  AST::Instruction[] → WasmToIRBuilder → ir_ctx → IRJitEngine (ir_check → ir_jit_compile)
+        → native code (mmap, W^X via `mprotect`)
+        → upgradeToIRJit(native, CodeSize, IRGraph) on FunctionInstance
 
-1. [Overview](#overview)
-2. [Architecture](#architecture)
-3. [How Instruction Mappings Work](#how-instruction-mappings-work)
-4. [Build Instructions](#build-instructions)
-5. [Key Components](#key-components)
-6. [WasmEdge Integration](#wasmedge-integration)
-7. [Testing Strategy](#testing-strategy)
-8. [Implementation Status](#implementation-status)
-9. [References](#references)
+Execution (each call to a JIT function):
+  Executor → IRJitEngine::invoke(native, FuncType, Args, Rets, FuncTable, GlobalBase, MemoryBase, …)
+        → generated: RetType (*)(JitExecEnv *, uint64_t *)
+```
+
+**Key integration points**
+
+**Function upgrade** (`include/runtime/instance/function.h`)
+
+```cpp
+// After JIT compilation succeeds, upgrade function variant
+bool upgradeToIRJit(void *NativeFunc, size_t CodeSize, ir_ctx *IRGraph);
+```
+
+**Compilation hook** (`lib/executor/instantiate/module.cpp`)
+
+```cpp
+// Compile functions after all module sections are instantiated
+#ifdef WASMEDGE_BUILD_IR_JIT
+  VM::IRJitEngine IREngine;
+  VM::WasmToIRBuilder IRBuilder;
+  // ... compile each function
+  FuncInst->upgradeToIRJit(CompRes->NativeFunc, CompRes->CodeSize, nullptr);
+#endif
+```
+
+(`IRGraph` is not retained after compile today.)
+
+Caches, trampolines, and **`IRJitEnvCache`** are described once in **§4** (not repeated here). Enable the feature with CMake: [Build & Test & Debug](#build--test--debug) (e.g. `-DWASMEDGE_BUILD_IR_JIT=ON`). Loader-level coverage of this path is in [End-to-end loader tests](#end-to-end-loader-tests) under [Testing Strategy](#testing-strategy).
 
 ---
 
-## Overview
+## 2. Source layout and code scale
 
-This document tracks the implementation of tiered compilation for WasmEdge using the `dstogov/ir` framework as a baseline JIT compiler. The goal is to achieve fast startup times with a lightweight JIT while maintaining the option to tier-up to LLVM for peak performance.
+### File structure
 
-### Objectives
-
-- ✅ Integrate `dstogov/ir` framework into WasmEdge build system
-- ✅ Create Wasm→IR translation layer
-- ✅ Implement basic JIT compilation engine
-- ✅ Enable end-to-end execution of simple Wasm functions (79 execution tests passing)
-- ✅ Integrate with WasmEdge executor dispatch (functions compiled at module instantiation)
-- ✅ End-to-end testing with real `.wasm` files (5 E2E tests)
-- ⏳ Add tier-up mechanism to LLVM (future)
-
-### Current Achievement
-
-The IR JIT framework is successfully integrated into WasmEdge and compiles cleanly. All core infrastructure is in place for translating WebAssembly to IR and JIT compiling to native code.
-
-**Build Success**:
-```bash
-✅ [100%] Built target wasmedgeIR       (IR library)
-✅ [100%] Built target wasmedgeVM       (VM with IR JIT)
-✅ [100%] Built target wasmedgeExecutor (Executor integration)
 ```
+WasmEdge/
+├── CMakeLists.txt                          [modified]
+├── include/
+│   ├── runtime/instance/
+│   │   └── function.h                      [modified - upgradeToIRJit]
+│   └── vm/
+│       ├── ir_builder.h                    [new]
+│       └── ir_jit_engine.h                 [new]
+├── lib/
+│   ├── executor/
+│   │   ├── CMakeLists.txt                  [modified - IR JIT linkage]
+│   │   ├── helper.cpp                      [modified - func_table, global/memory base]
+│   │   └── instantiate/
+│   │       └── module.cpp                  [modified - IR JIT compilation hook]
+│   └── vm/
+│       ├── CMakeLists.txt                  [modified]
+│       ├── ir_builder.cpp                  [new]
+│       └── ir_jit_engine.cpp               [new]
+├── thirdparty/
+│   ├── CMakeLists.txt                      [modified]
+│   └── ir/
+│       └── CMakeLists.txt                  [new]
+├── test/ir/
+│   ├── testdata/
+│   │   ├── factorial.wat                   [new - E2E test module]
+│   │   ├── factorial.wasm                  [new - compiled E2E test]
+│   │   ├── fibonacci.wat                   [new - benchmark algorithms]
+│   │   ├── fibonacci.wasm                  [new - compiled benchmarks]
+│   │   └── sightglass/                     [Sightglass .wasm kernels]
+│   ├── ir_e2e_test.cpp                     [new - E2E integration tests]
+│   ├── ir_benchmark_test.cpp               [new - algorithm + Sightglass benchmarks]
+│   └── run_sightglass_all.sh               [run Sightglass kernels: Interpreter/JIT/AOT]
+└── thirdparty/ir/                           [dstogov/ir submodule]
+    ├── ir.h
+    ├── ir_builder.h
+    └── examples/                           [studied for patterns]
+```
+
+### Code statistics (approximate; from current tree)
+
+Core IR JIT (line counts drift over time):
+
+| Component | ~Lines | Description |
+|-----------|--------|-------------|
+| `include/vm/ir_builder.h` | ~278 | Builder API, `LabelInfo`, env/ref helpers |
+| `lib/vm/ir_builder.cpp` | ~2940 | Wasm→IR lowering |
+| `include/vm/ir_jit_engine.h` | ~200 | `JitExecEnv`, trampolines, `IRJitEngine` |
+| `lib/vm/ir_jit_engine.cpp` | ~337 | `compile`, `invoke`, mmap, `ir_check` |
+| `ir_basic_test.cpp` | ~915 | 33 tests |
+| `ir_instruction_test.cpp` | ~1237 | 58 tests |
+| `ir_execution_test.cpp` | ~2093 | 81 tests |
+| `ir_integration_test.cpp` | ~402 | 6 tests |
+| `ir_e2e_test.cpp` | ~324 | 5 tests |
+| `ir_benchmark_test.cpp` | ~1670 | 13 tests |
+
+Executor / runtime: `lib/executor/instantiate/module.cpp` (IR JIT pass), `lib/executor/helper.cpp` (`jit_*`, `enterFunction` IR path, `jit_call_indirect`), `include/runtime/instance/function.h`, `include/executor/executor.h` (`getIRJitEngine`), CMake under `lib/vm`, `lib/executor`, `test/ir`, `thirdparty/CMakeLists.txt`.
 
 ---
 
-## Architecture
+## 3. Major components
 
-### High-Level Flow
+### 3.1 `WasmToIRBuilder`
+**Location**: `include/vm/ir_builder.h`, `lib/vm/ir_builder.cpp` (~2900 lines)
 
-```
-WebAssembly Module
-       ↓
-   AST Parser (existing)
-       ↓
-   WasmToIRBuilder ← [NEW]
-       ↓
-   IR Graph (dstogov/ir)
-       ↓
-   IRJitEngine ← [NEW]
-       ↓
-   Native Machine Code
-       ↓
-   FunctionInstance (IR variant) ← [MODIFIED]
-       ↓
-   Executor dispatch ← [INTEGRATED - isIRJitFunction() check]
-```
+Translates a single function’s `AST::Instruction` stream into dstogov/ir. Module context is injected **after** `initialize()` (because `reset()` clears it), matching `lib/executor/instantiate/module.cpp`.
 
-### Key Classes and Functions
-
-#### 1. `WasmToIRBuilder` Class
-**Location**: `include/vm/ir_builder.h`, `lib/vm/ir_builder.cpp`
-
-Translates WebAssembly AST to dstogov/ir Sea-of-Nodes graph.
-
+**Public API (representative)**:
 ```cpp
 class WasmToIRBuilder {
 public:
-  // Initialize IR context for a function
   Expect<void> initialize(const AST::FunctionType &FuncType,
-                          Span<const std::pair<uint32_t, ValType>> LocalVars);
-  
-  // Process all instructions and build IR graph
+                        Span<const std::pair<uint32_t, ValType>> Locals);
+  void setModuleFunctions(Span<const AST::FunctionType *> FuncTypes) noexcept;
+  void setModuleTypes(Span<const AST::FunctionType *> Types) noexcept;
+  void setModuleGlobals(Span<const ValType> GlobalTypes) noexcept;
+  void setImportFuncNum(uint32_t Num) noexcept;
+  void setMaxCallArgs(uint32_t N) noexcept;
   Expect<void> buildFromInstructions(Span<const AST::Instruction> Instrs);
-  
-  // Get the built IR context for compilation
   ir_ctx *getIRContext() noexcept;
-  
-  // Reset and free resources
   void reset() noexcept;
-
 private:
-  // Type conversion
-  ir_type wasmTypeToIRType(ValType Type) const noexcept;
-  
-  // Instruction visitors (dispatch targets)
-  Expect<void> visitInstruction(const AST::Instruction &Instr);
-  Expect<void> visitConst(const AST::Instruction &Instr);
-  Expect<void> visitLocal(const AST::Instruction &Instr);
-  Expect<void> visitBinary(OpCode Op);
-  Expect<void> visitCompare(OpCode Op);
-  Expect<void> visitUnary(OpCode Op);
-  Expect<void> visitConversion(OpCode Op);
-  Expect<void> visitParametric(const AST::Instruction &Instr);
-  Expect<void> visitControl(const AST::Instruction &Instr);
-  Expect<void> visitMemory(const AST::Instruction &Instr);
-  
-  // Stack operations
-  void push(ir_ref Ref) noexcept;
-  ir_ref pop() noexcept;
-  ir_ref peek(uint32_t Depth) const noexcept;
-
-  // Member variables
-  ir_ctx Ctx;                              // IR context (stack-allocated)
-  bool Initialized;
-  std::vector<ir_ref> ValueStack;          // Operand stack simulation
-  std::unordered_map<uint32_t, ir_ref> Locals;  // SSA refs for locals
-  std::vector<LabelInfo> LabelStack;       // Control flow labels
-  uint32_t LocalCount;
+  // Visitors include visitCall, visitRefType, visitTable; control helpers for PHI/merge;
+  // `LabelInfo` tracks loop back-edges, if/else termination, ref-typed results (two stack slots).
+  ir_ctx Ctx;
+  std::vector<ir_ref> ValueStack;
+  std::map<uint32_t, ir_ref> Locals;
+  std::map<uint32_t, ir_type> LocalTypes;
+  std::vector<LabelInfo> LabelStack;
+  // Cached ir_ref loads from JitExecEnv: FuncTablePtr, GlobalBasePtr, MemoryBase, helpers, ArgsPtr, ...
 };
 ```
 
-#### 2. `IRJitEngine` Class
+### 3.2 `IRJitEngine` and `JitExecEnv`
 **Location**: `include/vm/ir_jit_engine.h`, `lib/vm/ir_jit_engine.cpp`
 
-JIT compiles IR graphs to native machine code.
-
 ```cpp
+struct JitExecEnv {
+  void **FuncTable;
+  uint32_t FuncTableSize;
+  // ...
+  void *GlobalBase;    // ValVariant*[] as void*
+  void *MemoryBase;
+  void *HostCallFn;         // jit_host_call
+  void *DirectOrHostFn;    // jit_direct_or_host
+  void *MemoryGrowFn;    // jit_memory_grow
+  void *MemorySizeFn;    // jit_memory_size
+  void *CallIndirectFn;  // jit_call_indirect
+  uint64_t MemorySizeBytes;
+  uint64_t RefResultBuf[2];
+};
+
 class IRJitEngine {
 public:
-  struct CompileResult {
-    void *NativeFunc;    // Pointer to generated code
-    size_t CodeSize;     // Size of generated code
-    ir_ctx *IRGraph;     // Retained for potential tier-up
-  };
-
-  // Compile IR graph to native code
+  struct CompileResult { void *NativeFunc; size_t CodeSize; ir_ctx *IRGraph; };
   Expect<CompileResult> compile(ir_ctx *Ctx);
-  
-  // Execute compiled function (TODO: integrate with executor)
-  Expect<void> invoke(void *NativeFunc, 
-                      Span<const ValType> ParamTypes,
-                      Span<const ValType> ReturnTypes,
-                      Span<ValVariant> Args,
-                      Span<ValVariant> Rets);
-  
-  // Release compiled code memory
+  Expect<void> invoke(void *NativeFunc, const AST::FunctionType &FuncType,
+                      Span<const ValVariant> Args, Span<ValVariant> Rets,
+                      void **FuncTable = nullptr, uint32_t FuncTableSize = 0,
+                      void *GlobalBase = nullptr,
+                      void *MemoryBase = nullptr, uint64_t MemorySize = 0);
   void release(void *NativeFunc, size_t CodeSize) noexcept;
+  void releaseIRGraph(ir_ctx *Ctx) noexcept;
 };
 ```
 
-#### 3. `FunctionInstance` Extension
+Native entry point shape: **`RetType (*)(JitExecEnv *, uint64_t *)`** (see `invoke` and `jit_call_indirect` fast paths in `helper.cpp`).
+
+### 3.3 `FunctionInstance` extension
 **Location**: `include/runtime/instance/function.h`
 
 Extended to store IR JIT compiled functions.
@@ -294,45 +338,83 @@ std::variant<WasmFunction, Symbol<CompiledFunction>,
 #endif
 ```
 
-### Component Interaction
+---
+
+## 4. Runtime behavior (executor, cache, trampolines, compile vs dispatch)
+
+### 4.1 Mixed function table (`IRJitEnvCache` in `helper.cpp`).
+  At runtime the cached per-module table is **not** “JIT-only”: each index holds the **native entry** for an IR JIT function, a **pointer to an LLVM `CompiledFunction`** symbol, or **`nullptr`** for wasm bodies still executed by the interpreter or for host functions. That allows `call`/`call_indirect` to reach the right target kind from generated code. When entering an IR JIT function, this cache is populated together with globals and memory0; **`IRJitEngine::invoke`** receives `FuncTable`, `GlobalBase`, `MemoryBase`, and the current memory size in bytes.
+
+### 4.2 Thread-local trampoline context.
+  `jit_host_call`, `jit_call_indirect`, and related paths use **thread-local** pointers to the active **`Executor`**, **`StackManager`**, and **`ModuleInstance`** (and memory0) while the JIT region runs. Trampolines assume they execute on the **same thread** as the executor invocation that invoked the JIT code.
+
+### 4.3 Direct vs import vs indirect calls. 
+  - **`jit_host_call`** — dispatches imports and interpreter paths through the executor. For **`call_indirect`**, the **function index** is encoded with **bit 31 set**: pass **`(0x80000000 | tableSlot)`** as `funcIdx` so the trampoline can resolve the table slot (see `ir_jit_engine.h` comments).  
+  - **`jit_direct_or_host`** — null-safe **direct** `call`: if the callee pointer is null, falls back to `jit_host_call`-style dispatch.  
+  - **`jit_call_indirect`** — full table resolution, type check, then JIT fast path or interpreter.
+
+### 4.4 Traps and non-local returns.
+  `IRJitEngine::invoke` installs **`setjmp`** on a buffer from **`wasmedge_ir_jit_get_termination_buf`**. **`jit_oob_trap`** uses **`longjmp`** with value **2** → **`MemoryOutOfBounds`**. Other non-zero returns (e.g. **`Terminated`** from `proc_exit` via **`jit_host_call`**) unwind without returning into generated code. This keeps trap semantics aligned with the interpreter.
+
+### 4.5 Moving linear memory. 
+  **`jit_memory_grow`** updates **`env->MemoryBase`** when the engine’s memory buffer is reallocated; generated code must always load the base from **`JitExecEnv`**, not cache a stale pointer across grow.
+
+### 4.6 Optional env-driven checks. 
+  **`jit_bounds_check`** is an outlined helper for linear-memory bounds; **in-IR** checks can be enabled with **`WASMEDGE_IR_JIT_BOUND_CHECK`** (see `WasmToIRBuilder::buildBoundsCheck`).
+
+
+The diagram below is the **same instantiate vs invoke split** as §1, zoomed into how IR JIT sits next to host and LLVM paths inside the executor.
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                   WasmEdge Runtime                      │
-├─────────────────────────────────────────────────────────┤
-│  Executor                                               │
-│    ├─→ Host Functions                                  │
-│    ├─→ LLVM Compiled Functions (existing)              │
-│    └─→ IR JIT Functions (NEW)                          │
-│           ↓                                             │
-│      IRJitEngine::compile()                             │
-│           ↓                                             │
-│      WasmToIRBuilder::buildFromInstructions()           │
-│           ↓                                             │
-│      dstogov/ir: ir_jit_compile()                       │
-└─────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                         WasmEdge Runtime                         │
+├──────────────────────────────────────────────────────────────────┤
+│  Executor (per call site)                                        │
+│                                                                  │
+│      ┌──────────────────┐                                        │
+│      │ Host functions   │                                        │
+│      └──────────────────┘                                        │
+│      ┌──────────────────┐                                        │
+│      │ LLVM AOT /       │  native symbol path                    │
+│      │ CompiledFunction │                                        │
+│      └──────────────────┘                                        │
+│      ┌──────────────────┐                                        │
+│      │ IR JIT           │  FuncInstance → native ptr             │
+│      └────────┬─────────┘                                        │
+│               │                                                  │
+│               │  ┌─ Instantiate (per wasm func) ─────────┐       │
+│               │  │                                       │       │
+│               │  │ WasmToIRBuilder::buildFromInstructions()│     │
+│               │  │            │                          │       │
+│               │  │            ▼                          │       │
+│               │  │        ir_ctx (dstogov/ir graph)      │       │
+│               │  │            │                          │       │
+│               │  │   IRJitEngine::compile()              │       │
+│               │  │            │                          │       │
+│               │  │            ▼                          │       │
+│               │  │   ir_jit_compile()  [dstogov/ir]      │       │
+│               │  │            │                          │       │
+│               │  │   upgradeToIRJit(native,size,IRGraph) │       │
+│               │  │                                       │       │
+│               │  └───────────────────────────────────────┘       │
+│               │                                                  │
+│               │  ┌─ Run-time (each call) ────────────────┐       │
+│               │  │                                       │       │
+│               │  │ IRJitEngine::invoke(                  │       │
+│               │  │   native, FuncType, Args, Rets,       │       │
+│               │  │   FuncTable, GlobalBase, MemoryBase)  │       │
+│               │  │            │                          │       │
+│               │  │            ▼                          │       │
+│               │  │ generated (JitExecEnv*, uint64_t*)    │       │
+│               │  │                                       │       │
+│               │  └───────────────────────────────────────┘       │
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘
 ```
-
-### Key Design Decisions
-
-1. **Stack-Allocated IR Context** - Following `ir/examples/`, contexts are stack-allocated for performance
-
-2. **SSA-Form Locals** - WebAssembly locals map to SSA values, not memory (no load/store needed)
-
-3. **Visitor Pattern** - Instructions dispatched by category to specific handlers
-
-4. **Optional Build** - `WASMEDGE_BUILD_IR_JIT=ON` enables; default OFF
-
-5. **Implicit Memory Base Parameter** - JIT functions receive memory base pointer as first parameter:
-   ```
-   Original Wasm:  func(i32, i32) -> i32
-   JIT Signature:  func(void* mem_base, i32, i32) -> i32
-   ```
-   This enables actual memory load/store operations using IR's `ir_LOAD_*` and `ir_STORE` macros.
 
 ---
 
-## Instruction Mapping
+## 5. Lowering: instruction mapping and codegen choices
 
 The dstogov/ir framework uses a **Sea-of-Nodes** intermediate representation, where each instruction is a node and dependencies are edges. The `WasmToIRBuilder` class translates WebAssembly instructions to this IR graph using a visitor pattern.
 
@@ -387,12 +469,13 @@ Expect<void> WasmToIRBuilder::visitInstruction(const AST::Instruction &Instr) {
   case OpCode::I32__lt_s:
     return visitCompare(Op);
     
-  // ... more categories
+    // ... more categories
+    // call / call_indirect → visitCall; ref.* → visitRefType; table.* → visitTable
   }
 }
 ```
 
-### Step 2: Handler Functions
+### Step 2: Handler functions
 
 Each category has a dedicated handler that uses IR macros. Here's how binary operations are mapped:
 
@@ -439,7 +522,7 @@ The IR macros (from `ir/ir_builder.h`) generate nodes in the Sea-of-Nodes graph:
 ir_fold2(ctx, IR_OPT(IR_ADD, IR_I32), op1, op2)
 ```
 
-### Available IR Macro Categories
+#### Available IR Macro Categories
 
 | Category | Example Macros | WebAssembly Mapping |
 |----------|---------------|---------------------|
@@ -528,18 +611,52 @@ case OpCode::I32__rotl:
 testBinaryOp(OpCode::I32__rotl);
 ```
 
+### Codegen and integration choices
+
+1. **Stack-allocated IR context** — Following `ir/examples/`, contexts are stack-allocated for performance.
+
+2. **SSA-form locals** — WebAssembly locals map to SSA values, not memory (no load/store needed for locals).
+
+3. **Visitor pattern** — Opcodes dispatch as in the steps above (`visitInstruction` → category handlers such as `visitBinary`, `visitControl`, `visitCall`, `visitRefType`, `visitTable`).
+
+4. **CMake** — `WASMEDGE_BUILD_IR_JIT` defaults **ON** in the root `CMakeLists.txt`; set **`OFF`** to drop IR JIT. Details: [Build & Test & Debug](#build--test--debug) §7.
+
+5. **`JitExecEnv` + args buffer** — Generated code receives **`JitExecEnv* env`** and **`uint64_t* args`** (Wasm parameters packed by `IRJitEngine::invoke`). The builder loads **`env->MemoryBase`**, **`env->GlobalBase`**, **`env->FuncTable`**, and helper function pointers to implement memory, globals, calls, `memory.size` / `memory.grow`, table/bulk ops, and traps (see §3.2).
+
+6. **Reference types on the stack** — **`funcref` / `externref`** values use **two** logical stack slots (type + pointer), with **`LabelInfo`** merge metadata for ref-typed block results (`RefBranchResults` / `mergeRefResults`).
+
+7. **Shared call argument buffer** — A pre-scan sets **`MaxCallArgs`**; the builder allocates a **shared** `uint64_t` buffer for outgoing calls to avoid per-call **`ir_ALLOCA`** in hot paths.
+
+8. **Compile validation and failure** — **`ir_check`** runs before **`ir_jit_compile`**. If lowering or compile fails, the function **stays** a normal **`WasmFunction`** and runs on the **interpreter** (graceful degradation).
+
+9. **`dstogov/ir` guard/snapshot features** — The IR framework supports **guards** and **snapshots** for speculative optimization (thesis [§5](#5-core-design-principles-of-dstogov-ir)). **WasmEdge does not currently wire speculative guards** for Wasm; this integration is **baseline lowering + `ir_jit_compile`**, not speculative tiered IR.
+
 ---
 
-## Build & Test Instructions
+## 6. Recap: key design decisions
 
-### Prerequisites
+| Topic | Choice |
+|--------|--------|
+| IR storage | `ir_ctx` stack-allocated in `WasmToIRBuilder`; optional **retain** `IRGraph` in `IRJitFunction` for future tier-up (often **`nullptr`** today). |
+| Code memory | `mmap` RW → encode → **RX** (`mprotect`). |
+| Wasm params | Packed into **`uint64_t[]`**; floats use raw bit patterns in the low bits of slots. |
+| Module context | Set **after** `initialize()` so **`reset()`** does not drop module-scoped tables. |
+| SIMD / atomics / exceptions | Not implemented in IR JIT (see [Implementation Status](#implementation-status)). |
+
+---
+
+# Build & Test & Debug
+
+This section covers configuring and building WasmEdge with IR JIT, running tests, quick verification, and **debugging** (GDB, IR dumps, Sightglass env knobs). The summary at the top of this document under **Build defaults and debugging** lists the main env vars; details below expand on that.
+
+## Prerequisites
 
 - CMake 3.11+
 - C++20 compiler (GCC 11+, Clang 13+)
 - Standard WasmEdge dependencies
 - `make`, `gcc`/`clang` for building `dstogov/ir`
 
-### 1. Clone with IR submodule
+## 1. Clone with IR submodule
 
 To ensure the `dstogov/ir` framework is available when you clone:
 
@@ -556,13 +673,11 @@ git submodule update --init --recursive
 
 This will populate `thirdparty/ir` with the `dstogov/ir` sources.
 
-### 2. The `dstogov/ir` Submodule
-
 The IR JIT integration treats `dstogov/ir` as an external project built with its own Makefile. 
 Thanks to WasmEdge's CMake configuration, **you do not need to build `libir.a` manually**. 
-When you configure WasmEdge with `WASMEDGE_BUILD_IR_JIT=ON`, the CMake build system will automatically configure and build the submodule matching your CPU architecture (detecting x86_64 vs. AArch64) and link it into `libwasmedge`.
+When **`WASMEDGE_BUILD_IR_JIT`** is **ON** (the CMake default), the build system configures and builds the `dstogov/ir` submodule for your CPU architecture (x86_64 vs. AArch64) and links it into `libwasmedge`.
 
-### 3. Configure and build WasmEdge with IR JIT
+## 2. Configure and build WasmEdge with IR JIT
 
 From the WasmEdge repo root:
 
@@ -570,27 +685,29 @@ From the WasmEdge repo root:
 mkdir -p build
 cd build
 
-# Configure with IR JIT enabled (LLVM optional)
+# Explicit Release + tests; IR JIT + LLVM match CMake defaults (both ON unless you override)
 cmake -DCMAKE_BUILD_TYPE=Release \
       -DWASMEDGE_BUILD_IR_JIT=ON \
       -DWASMEDGE_BUILD_TESTS=ON \
       ..
 
 # Build everything
-make -j8
+make -j32
 ```
 
 Key flags:
 
-- **`WASMEDGE_BUILD_IR_JIT=ON`**: enables IR JIT integration and automatically builds the `dstogov/ir` submodule.
+- **`WASMEDGE_BUILD_IR_JIT`**: defaults to **`ON`** in CMake; set **`OFF`** to exclude the IR baseline JIT and `thirdparty/ir`. When **ON**, CMake builds the `dstogov/ir` submodule and links it into `libwasmedge`.
 - **`WASMEDGE_BUILD_TESTS=ON`**: ensures the unit, integration, and e2e test suites are built.
-- **`WASMEDGE_USE_LLVM=ON`**: optional; required for **Sightglass AOT** mode (compare IR JIT vs LLVM AOT). When ON, the benchmark test links `wasmedgeLLVM` and can compile kernels to .so and run them.
+- **`WASMEDGE_USE_LLVM`**: defaults to **`ON`**; set **`OFF`** for a build without the LLVM-based compilation runtime. **Sightglass AOT** and other LLVM-dependent tests need it **ON** (benchmark test links `wasmedgeLLVM` when enabled).
 
-### 4. Building Specific Components
+For **GDB** (backtraces, stepping), prefer **`CMAKE_BUILD_TYPE=Debug`** when reconfiguring (`cmake -DCMAKE_BUILD_TYPE=Debug ..` from `build/`). Debug WasmEdge also drives a **debug** build of `thirdparty/ir` via CMake (assertions, better symbols). See also [§9. Debug](#9-debug).
+
+## 3. Building Specific Components
 
 For faster iteration during development, you can build specific parts of the project in isolation:
 
-#### Building the IR Submodule Only
+### Building the IR Submodule Only
 
 CMake builds `thirdparty/ir/libir.a` automatically when you run `make` inside the WasmEdge build directory. To trigger it in isolation:
 
@@ -599,17 +716,11 @@ cd build
 make wasmedgeIRBuild
 ```
 
-To rebuild from scratch (e.g. after changing `ir_x86.dasc`), delete the cached library first:
-
-```bash
-rm thirdparty/ir/libir.a   # from WasmEdge repo root
-cd build && make wasmedgeIRBuild
-```
-
 **Manual build** — if you need to build `libir.a` by hand directly in the submodule:
 
 ```bash
 cd thirdparty/ir
+make clean
 
 # Debug build (assertions enabled, better GDB symbols — used by WasmEdge CMake by default)
 make BUILD=debug libir.a
@@ -624,26 +735,37 @@ CFLAGS=-fPIC BUILD_CFLAGS=-fPIC make BUILD=debug libir.a
 make BUILD=debug TARGET=aarch64 libir.a
 ```
 
-> **Note:** WasmEdge's CMake uses `BUILD=debug` by default (`thirdparty/CMakeLists.txt` line 29) on all platforms so that IR assertions catch codegen bugs during development. Switch to `BUILD=release` in the CMakeLists.txt `_ir_make_args` line for production builds where the extra checks are not needed.
+> **Note:** WasmEdge’s CMake chooses the IR makefile **`BUILD=debug`** when **`CMAKE_BUILD_TYPE=Debug`** and **`BUILD=release`** when the WasmEdge build is not Debug (`thirdparty/CMakeLists.txt`, `_ir_make_args`). There is no separate “always debug libir” mode for Release WasmEdge builds.
 
-#### Building Specific Core Libraries
+### Building Specific Core Libraries
 To build just the individual static libraries (useful when modifying specific subsystems):
 ```bash
 cd build
-make wasmedgeVM -j8
-make wasmedgeExecutor -j8
-make wasmedgeLoader -j8
+make wasmedgeVM -j32
+make wasmedgeExecutor -j32
+make wasmedgeLoader -j32
 ```
 
-#### Building Specific Test Suites
+### Building Specific Test Suites
 To compile just the test executables (much faster than building everything):
 ```bash
 cd build
-make wasmedgeIRTests wasmedgeIRInstructionTests -j8
-make wasmedgeIRExecutionTests wasmedgeIRIntegrationTests wasmedgeIRE2ETests wasmedgeIRBenchmarkTests -j8
+make wasmedgeIRTests wasmedgeIRInstructionTests -j32
+make wasmedgeIRExecutionTests wasmedgeIRIntegrationTests wasmedgeIRE2ETests wasmedgeIRBenchmarkTests -j32
 ```
 
-### 5. Running the Tests
+### Verfication
+With **`WASMEDGE_BUILD_IR_JIT=ON`** (the default), check that IR symbols are present:
+
+```bash
+nm thirdparty/ir/libir.a | grep "T ir_jit_compile"
+# Should show: T ir_jit_compile (or similar)
+
+nm lib/vm/libwasmedgeVM.a | grep "WasmToIRBuilder"
+# Should show WasmEdge::VM::WasmToIRBuilder symbols
+```
+
+## 4. Running the Tests
 
 **Full IR test suite (Execution, Benchmarks, E2E, Unit, Integration):**
 ```bash
@@ -671,192 +793,128 @@ cd build
 
 **Sightglass benchmark suite (Interpreter vs JIT vs AOT):**
 
-1. **Obtain testdata** (if `test/ir/testdata/sightglass/` is missing):
-   ```bash
-   ./utils/download_sightglass.sh
-   ```
-
-2. **Run all kernels, all modes** (from repo root):
-   ```bash
-   ./test/ir/run_sightglass_all.sh build/
-   ```
-   Uses per-run timeout `SIGHTGLASS_TIMEOUT` (default 15s). Build with `-DWASMEDGE_BUILD_IR_JIT=ON -DWASMEDGE_BUILD_TESTS=ON`; add `-DWASMEDGE_USE_LLVM=ON` for AOT.
-
-3. **Run only JIT and AOT** (skip Interpreter, faster):
-   ```bash
-   SIGHTGLASS_TIMEOUT=30 WASMEDGE_SIGHTGLASS_SKIP_INTERP=1 ./test/ir/run_sightglass_all.sh build/
-   ```
-
-4. **Run a single kernel or mode** (gtest filter + env):
-   ```bash
-   WASMEDGE_SIGHTGLASS_KERNEL=noop ./build/test/ir/wasmedgeIRBenchmarkTests --gtest_filter='*SightglassSuite*'
-   WASMEDGE_SIGHTGLASS_MODE=JIT WASMEDGE_SIGHTGLASS_KERNEL=quicksort ./build/test/ir/wasmedgeIRBenchmarkTests --gtest_filter='*SightglassSuite*'
-   ```
-
 **Environment variables for Sightglass:**
 
 | Variable | Effect |
 |----------|--------|
-| `WASMEDGE_SIGHTGLASS_KERNEL` | Run only this kernel (e.g. `noop`, `quicksort`). |
-| `WASMEDGE_SIGHTGLASS_MODE` | Run only this mode: `Interpreter`, `JIT`, or `AOT`. |
-| `WASMEDGE_SIGHTGLASS_SKIP_INTERP=1` | In test: skip Interpreter; in script: run only JIT and AOT. |
+| `WASMEDGE_SIGHTGLASS_KERNEL` | Run only this kernel (e.g. `noop`, `quicksort`; with or without `.wasm`). |
+| `WASMEDGE_SIGHTGLASS_MODE` | Run only this mode: `Interpreter`, `IR_JIT`, `JIT`, or `AOT`. Use **`IR_JIT`** to exercise only the IR JIT column. |
+| `WASMEDGE_SIGHTGLASS_QUICK` | `1` (default in some paths) runs a subset; set **`0`** to run every `*.wasm` under `test/ir/testdata/sightglass/`. |
+| `WASMEDGE_IR_JIT_OPT_LEVEL` | `0`, `1`, or `2` — passed through to `ir_jit_compile` (default **2**). Lower when chasing codegen issues. |
+| `WASMEDGE_IR_JIT_BOUND_CHECK` | Set to **`1`** to emit extra in-IR memory bounds checks (see `WasmToIRBuilder::buildBoundsCheck`). |
+| `WASMEDGE_SIGHTGLASS_SKIP_INTERP=1` | Skip Interpreter (often slow) in `SightglassSuite`. |
 | `WASMEDGE_SIGHTGLASS_SKIP_AOT=1` | In test: skip AOT (e.g. when not built with LLVM). |
 | `SIGHTGLASS_TIMEOUT` | Per-run timeout in seconds (script only; default 15). |
 
-### 7. Building without IR JIT (Default)
+**IR JIT–only Sightglass example** (from `build/`):
 
 ```bash
-mkdir -p build
 cd build
-cmake ..
-make -j8
+WASMEDGE_SIGHTGLASS_MODE=IR_JIT
+WASMEDGE_IR_JIT_OPT_LEVEL=2
+WASMEDGE_SIGHTGLASS_QUICK=0   # all kernels; omit or use 1 for quick sweep
+WASMEDGE_SIGHTGLASS_KERNEL=quicksort timeout 30 ./test/ir/wasmedgeIRBenchmarkTests --gtest_filter='*SightglassSuite*'
 ```
 
-### 8. Verification
-
-Check that IR symbols are present:
+**Loop all Sightglass kernels (IR JIT only):**
 
 ```bash
-nm thirdparty/ir/libir.a | grep "T ir_jit_compile"
-# Should show: T ir_jit_compile (or similar)
+cd build
+for wasm in ../test/ir/testdata/sightglass/*.wasm; do
+  kernel="$(basename "$wasm" .wasm)"
+  echo "Testing $kernel:"
+  WASMEDGE_SIGHTGLASS_KERNEL="$kernel" WASMEDGE_SIGHTGLASS_MODE=IR_JIT \
+    WASMEDGE_SIGHTGLASS_QUICK=1 WASMEDGE_IR_JIT_OPT_LEVEL=2 WASMEDGE_IR_JIT_BOUND_CHECK=0 \
+    stdbuf -oL timeout 30 ./test/ir/wasmedgeIRBenchmarkTests --gtest_filter='*SightglassSuite*' 2>&1
+done | tee /tmp/wasm-test.log
+```
 
-nm lib/vm/libwasmedgeVM.a | grep "WasmToIRBuilder"
-# Should show WasmEdge::VM::WasmToIRBuilder symbols
+## 5. Debug
+
+#### Debug builds and fast targets
+
+- Reconfigure with **`CMAKE_BUILD_TYPE=Debug`** for clearer stack traces and symbols (then `cmake --build .` or target-specific builds).
+- Build only what you need, e.g. `cmake --build . --target wasmedgeIRBenchmarkTests -j$(nproc)`.
+- To rebuild **`libir.a`** by hand with PIC (e.g. Linux shared linking): `CFLAGS=-fPIC BUILD_CFLAGS=-fPIC make BUILD=debug libir.a` in `thirdparty/ir` (see [§4. Building Specific Components](#4-building-specific-components)).
+
+### GDB and JIT-generated code
+
+Run under GDB from `build/` with env vars set (example: single Sightglass kernel, IR JIT, opt level 2):
+
+```bash
+cd build
+WASMEDGE_SIGHTGLASS_MODE=IR_JIT WASMEDGE_SIGHTGLASS_KERNEL=quicksort WASMEDGE_IR_JIT_OPT_LEVEL=2 \
+  gdb --args ./test/ir/wasmedgeIRBenchmarkTests --gtest_filter='*SightglassSuite*'
+```
+
+JIT regions are registered with **`ir_gdb_register`** as symbols named **`wasm_jit_NNN`** (`000`, `001`, …). After a fault in generated code, shallow backtraces are common; use:
+
+| Goal | GDB |
+|------|-----|
+| Faulting instruction | `x/i $pc` |
+| Nearby machine code | `disas $pc-32,$pc+32` |
+| Register / pointer state | `info registers` |
+| Correlate `wasm_jit_NNN` to a Wasm function | `NNN` is a running index of JIT-compiled functions in that process. Set breakpoints on **`WasmEdge::Executor::enterFunction`** or **`WasmEdge::VM::IRJitEngine::invoke`**, run, then see which kernel / call path runs before continuing into the crash. |
+
+### IR text dumps (`WASMEDGE_IR_JIT_DUMP`)
+
+If **`WASMEDGE_IR_JIT_DUMP`** is set to any non-empty value, `IRJitEngine::compile` (`lib/vm/ir_jit_engine.cpp`) writes **per compiled Wasm function** (in compile order):
+
+1. **`/tmp/wasmedge_ir_NNN_before.ir`** — IR text before `ir_jit_compile` (`ir_save` without CFG extras).
+2. **`/tmp/wasmedge_ir_NNN_after.ir`** — after successful compile (`ir_save` with **`IR_SAVE_CFG`**; see `ir.h`).
+
+Use **`WASMEDGE_IR_JIT_OPT_LEVEL=0`** (or `1`) when isolating codegen issues; dumps reflect the graph at that optimization level. The standalone **`thirdparty/ir`** `ir` tool supports extra **`--save-ir-after-*`** flags, but those are **not** wired into WasmEdge’s JIT path—only the env-driven pair above unless you add more hooks.
+
+Example:
+
+```bash
+WASMEDGE_IR_JIT_DUMP=1 WASMEDGE_IR_JIT_OPT_LEVEL=2 ./test/ir/wasmedgeIRE2ETests --gtest_filter='*'
+# Inspect /tmp/wasmedge_ir_*.ir
 ```
 
 ---
 
-## Key Components
+# Testing Strategy
 
-### File Structure
+Tests live under `test/ir/` (Google Test). They check **lowering → `ir_jit_compile` → native execution** in layers, with **196** `TEST`/`TEST_F` cases total across six binaries. **Opcode-by-opcode breakdowns** are in [Implementation Status](#implementation-status); this section avoids duplicating those tables.
 
-```
-WasmEdge/
-├── CMakeLists.txt                          [modified]
-├── include/
-│   ├── runtime/instance/
-│   │   └── function.h                      [modified - upgradeToIRJit]
-│   └── vm/
-│       ├── ir_builder.h                    [new]
-│       └── ir_jit_engine.h                 [new]
-├── lib/
-│   ├── executor/
-│   │   ├── CMakeLists.txt                  [modified - IR JIT linkage]
-│   │   ├── helper.cpp                      [modified - func_table, global/memory base]
-│   │   └── instantiate/
-│   │       └── module.cpp                  [modified - IR JIT compilation hook]
-│   └── vm/
-│       ├── CMakeLists.txt                  [modified]
-│       ├── ir_builder.cpp                  [new]
-│       └── ir_jit_engine.cpp               [new]
-├── thirdparty/
-│   ├── CMakeLists.txt                      [modified]
-│   └── ir/
-│       └── CMakeLists.txt                  [new]
-├── test/ir/
-│   ├── testdata/
-│   │   ├── factorial.wat                   [new - E2E test module]
-│   │   ├── factorial.wasm                  [new - compiled E2E test]
-│   │   ├── fibonacci.wat                   [new - benchmark algorithms]
-│   │   ├── fibonacci.wasm                  [new - compiled benchmarks]
-│   │   └── sightglass/                     [Sightglass .wasm kernels]
-│   ├── ir_e2e_test.cpp                     [new - E2E integration tests]
-│   ├── ir_benchmark_test.cpp               [new - algorithm + Sightglass benchmarks]
-│   └── run_sightglass_all.sh               [run Sightglass kernels: Interpreter/JIT/AOT]
-└── thirdparty/ir/                           [dstogov/ir submodule]
-    ├── ir.h
-    ├── ir_builder.h
-    └── examples/                           [studied for patterns]
-```
+## Goals
 
-### Code Statistics
+| Goal | How it is tested |
+|------|------------------|
+| Lowering builds valid IR | Levels 1–2: `buildFromInstructions` succeeds; `ir_instruction_test` sweeps categories |
+| Backend accepts the graph | Level 3: `IRJitEngine::compile` / `ir_check` |
+| Results match Wasm semantics | Level 4: `ir_execution_test` runs via `IRJitEngine::invoke` (**`JitExecEnv`** ABI, same shape as the executor) |
+| Real modules and backends | Integration, E2E, benchmarks (Sightglass compares Interpreter / IR JIT / LLVM AOT when built) |
 
-**New Files**: 4 headers + 2 implementations + 6 test files = 12 files  
-**Modified Files**: 8 files  
-**Lines of Code Added**: ~6,500 lines
+## Four levels (compact)
 
-| Component | Lines | Description |
-|-----------|-------|-------------|
-| ir_builder.h | 145 | Translation layer interface (includes PreIfLocals, ResultType) |
-| ir_builder.cpp | ~2,376 | Complete Wasm→IR lowering (~166 instrs + PHI node fixes) |
-| ir_jit_engine.h | 50 | JIT engine interface |
-| ir_jit_engine.cpp | 233 | Compilation and execution (updated calling convention) |
-| ir_basic_test.cpp | 916 | Basic functionality tests (33 tests) |
-| ir_instruction_test.cpp | 720 | Comprehensive instruction tests (43 tests) |
-| ir_execution_test.cpp | 1,550 | Execution correctness tests (79 tests) |
-| ir_integration_test.cpp | 403 | Integration tests (6 tests) |
-| ir_e2e_test.cpp | 325 | End-to-end integration tests (5 tests) |
-| ir_benchmark_test.cpp | ~1,397 | Algorithm + Sightglass benchmarks (13 tests) |
-| factorial.wat | 57 | E2E test module source |
-| fibonacci.wat | 172 | Benchmark algorithms (fib, ackermann, primes, etc.) |
-| function.h | +50 | IR JIT function variant + upgradeToIRJit |
-| module.cpp | +80 | IR JIT compilation hook |
-| helper.cpp | +60 | Runtime context (func_table, globals, memory) |
-| CMake files | +200 | Build & test configuration |
+| Level | Question | Primary sources |
+|-------|----------|-----------------|
+| **1** | Does the opcode lower? | `ir_basic_test.cpp` |
+| **2** | Do whole categories lower? | `ir_instruction_test.cpp` (helpers like `testBinaryOp`, table/bulk/ref smoke) |
+| **3** | Does `ir_jit_compile` succeed? | Mixed in basic + instruction tests; `Compile_All_I32_Ops` style checks |
+| **4** | Does native code compute correctly? | `ir_execution_test.cpp` (81 tests: mostly **i32/i64**, plus **8** control, **19** memory, **4** calls, **5** globals, **2** ref) |
 
----
+**Note:** Float ops are **exercised at IR level** in `ir_instruction_test`; there is **no** large **f32/f64 execution** suite yet.
 
-## WasmEdge Integration
+## Suite inventory
 
-The IR JIT compiler is fully integrated with WasmEdge's module instantiation and execution pipeline. When a Wasm module is loaded and instantiated, eligible functions are automatically compiled to native code using the IR JIT.
+| Executable | Source | Cases | Role |
+|------------|--------|------:|------|
+| `wasmedgeIRTests` | `ir_basic_test.cpp` | 33 | Small IR + compile smoke |
+| `wasmedgeIRInstructionTests` | `ir_instruction_test.cpp` | 58 | Category lowering + JIT compile |
+| `wasmedgeIRExecutionTests` | `ir_execution_test.cpp` | 81 | Correctness via `invoke` |
+| `wasmedgeIRIntegrationTests` | `ir_integration_test.cpp` | 6 | VM `invoke` path (factorial, memory, globals, etc.) |
+| `wasmedgeIRE2ETests` | `ir_e2e_test.cpp` | 5 | `testdata/*.wasm` through loader + instantiation |
+| `wasmedgeIRBenchmarkTests` | `ir_benchmark_test.cpp` | 13 | Algorithms + **`SightglassSuite`** |
+| **Total** | | **196** | |
 
-### Integration Flow
+**Layout:** `test/ir/` also has `run_sightglass_all.sh`, `testdata/` (`factorial`, `fibonacci`, `sightglass/`), and `CMakeLists.txt`.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│ 1. Module Loading (Loader::parseModule)                         │
-│    └── Parse .wasm binary into AST::Module                      │
-├─────────────────────────────────────────────────────────────────┤
-│ 2. Validation (Validator::validate)                             │
-│    └── Type checking and semantic validation                    │
-├─────────────────────────────────────────────────────────────────┤
-│ 3. Instantiation (Executor::registerModule)                     │
-│    └── Instantiate functions, memories, globals, tables         │
-│    └── **IR JIT COMPILATION** (after all sections ready)        │
-│        ├── For each WasmFunction:                               │
-│        │   ├── WasmToIRBuilder::initialize()                    │
-│        │   ├── WasmToIRBuilder::buildFromInstructions()         │
-│        │   └── IRJitEngine::compile()                           │
-│        └── If successful: FuncInst->upgradeToIRJit()            │
-├─────────────────────────────────────────────────────────────────┤
-│ 4. Execution (Executor::invoke)                                 │
-│    └── If isIRJitFunction(): call native code directly          │
-│    └── Otherwise: fall back to interpreter                      │
-└─────────────────────────────────────────────────────────────────┘
-```
+## End-to-end loader tests
 
-### Key Integration Points
-
-#### 1. Function Upgrade (`include/runtime/instance/function.h`)
-```cpp
-// After JIT compilation succeeds, upgrade function variant
-bool upgradeToIRJit(void *NativeFunc, size_t CodeSize, ir_ctx *IRGraph);
-```
-
-#### 2. Compilation Hook (`lib/executor/instantiate/module.cpp`)
-```cpp
-// Compile functions after all module sections are instantiated
-#ifdef WASMEDGE_BUILD_IR_JIT
-  VM::IRJitEngine IREngine;
-  VM::WasmToIRBuilder IRBuilder;
-  // ... compile each function
-  FuncInst->upgradeToIRJit(CompRes->NativeFunc, CompRes->CodeSize, nullptr);
-#endif
-```
-
-#### 3. Runtime Context (`lib/executor/helper.cpp`)
-```cpp
-// Build function table for inter-function calls
-void **FuncTable = buildFunctionTable(ModInst);
-
-// Get global and memory base addresses
-void *GlobalBase = getGlobalBaseFromInstance(ModInst);
-void *MemoryBase = getMemoryBaseFromInstance(ModInst);
-```
-
-### End-to-End Test Results
-
-The integration is verified with real `.wasm` files compiled from `.wat`:
+`wasmedgeIRE2ETests` loads real `.wasm` files (e.g. under `test/ir/testdata/`) through the normal loader and instantiation path with IR JIT enabled:
 
 | Test | Description | Status |
 |------|-------------|--------|
@@ -866,796 +924,40 @@ The integration is verified with real `.wasm` files compiled from `.wat`:
 | LoadAndRunMemoryOps | Memory store/load | ✅ JIT |
 | LoadAndRunGlobalOps | Global get/set/increment | ✅ JIT |
 
-**All 6 functions in the test module compile and execute via JIT successfully.**
+Each case passes under IR JIT when enabled; modules are compiled from `.wat` where applicable.
 
-### Build Configuration
+### How execution tests are structured
 
-Enable IR JIT with CMake:
-```bash
-cmake -DWASMEDGE_BUILD_IR_JIT=ON ..
-```
+Fixtures build minimal Wasm, **lower**, **compile**, then call **`IRJitEngine::invoke`** with `FuncTable` / `MemoryBase` as needed (see `Call_DirectToNative`, `Memory_*`, `invokeI32` helpers in `ir_execution_test.cpp`). Miscompilation of **sign extension**, **branch merge**, or **calls** shows up as wrong numeric results.
 
-This sets `-DWASMEDGE_BUILD_IR_JIT` for all relevant targets and links the IR library.
+## Sightglass and benchmarks
 
----
+**Benchmark** binary runs **`SightglassSuite`**: real `.wasm` kernels under **Interpreter**, **IR JIT**, **LLVM JIT**, and **LLVM AOT**. Outputs (stdout/stderr/exit) are cross-checked across modes.
 
-## Testing Strategy
-
-> **Test Coverage Status**
-> 
-> The test suite verifies **IR generation, JIT compilation, AND execution correctness**:
-> - ✅ Instructions translate to valid IR nodes
-> - ✅ IR graphs compile to native code without errors
-> - ✅ **I32/I64 arithmetic, bitwise, comparison, unary** - Execution verified (43 tests)
-> - ✅ **Control flow** - if/else, early return, nested branches - Execution verified (5 tests)
-> - ✅ **Memory operations** - load/store with sign/zero extension - Execution verified (19 tests)
-> - ⚠️ **NOT YET TESTED**: Float operations execution correctness
-> 
-> The `ir_execution_test.cpp` calls JIT-compiled functions and verifies computed results.
-
-The test suite uses a **multi-level verification strategy** to ensure correctness of instruction mappings. Tests are located in `test/ir/` and use Google Test (gtest) framework.
-
-### Test Philosophy
-
-The tests verify correctness at multiple levels:
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│ Level 1: IR Generation     - Does the mapping build?    ✅ │
-├─────────────────────────────────────────────────────────────┤
-│ Level 2: Bulk Coverage     - Are all instructions mapped?✅ │
-├─────────────────────────────────────────────────────────────┤
-│ Level 3: JIT Compilation   - Does it compile to native? ✅ │
-├─────────────────────────────────────────────────────────────┤
-│ Level 4: Execution         - Does it compute correctly? ✅ │
-│          ✅ I32/I64 arithmetic, bitwise, comparison, unary  │
-│          ✅ Control flow: if/else, early return, nested     │
-│          ✅ Memory: load/store with sign/zero extension     │
-│          ⚠️ Float operations not yet tested                 │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Level 1: IR Generation Verification
-
-Tests verify WebAssembly instructions can be translated to IR nodes without errors:
-
-```cpp
-TEST(IRBuilderTest, I32Add) {
-  WasmToIRBuilder Builder;
-
-  // 1. Set up function signature: (i32, i32) -> (i32)
-  std::vector<ValType> ParamTypes = {ValType(TypeCode::I32), ValType(TypeCode::I32)};
-  std::vector<ValType> RetTypes = {ValType(TypeCode::I32)};
-  AST::FunctionType FuncType(ParamTypes, RetTypes);
-
-  // 2. Initialize the builder
-  ASSERT_TRUE(Builder.initialize(FuncType, {}));
-
-  // 3. Build WebAssembly instruction sequence
-  std::vector<AST::Instruction> Instrs;
-  Instrs.emplace_back(OpCode::Local__get);
-  Instrs[0].getTargetIndex() = 0;
-  Instrs.emplace_back(OpCode::Local__get);
-  Instrs[1].getTargetIndex() = 1;
-  Instrs.emplace_back(OpCode::I32__add);      // <-- Instruction being tested
-  Instrs.emplace_back(OpCode::Return);
-
-  // 4. Verify IR generation succeeds
-  auto Res = Builder.buildFromInstructions(Instrs);
-  ASSERT_TRUE(Res);   // ✅ Mapping worked without error
-}
-```
-
-**What this verifies:**
-- The opcode is recognized in the dispatch switch
-- The correct IR macro is called
-- Stack operations (pop/push) work correctly
-- No runtime errors during translation
-
-### Level 2: Bulk Coverage Testing
-
-The `ir_instruction_test.cpp` uses helper functions to test **entire categories** efficiently:
-
-```cpp
-class IRInstructionTest : public ::testing::Test {
-protected:
-  // Helper to test any binary operation
-  void testBinaryOp(OpCode Op, TypeCode Type1 = TypeCode::I32, 
-                     TypeCode Type2 = TypeCode::I32,
-                     TypeCode RetType = TypeCode::I32) {
-    WasmToIRBuilder Builder;
-    std::vector<ValType> ParamTypes = {ValType(Type1), ValType(Type2)};
-    std::vector<ValType> RetTypes = {ValType(RetType)};
-    AST::FunctionType FuncType(ParamTypes, RetTypes);
-    
-    EXPECT_TRUE(Builder.initialize(FuncType, {}));
-    
-    std::vector<AST::Instruction> Instrs;
-    Instrs.emplace_back(OpCode::Local__get);
-    Instrs[0].getTargetIndex() = 0;
-    Instrs.emplace_back(OpCode::Local__get);
-    Instrs[1].getTargetIndex() = 1;
-    Instrs.emplace_back(Op);                   // <-- Generic instruction
-    Instrs.emplace_back(OpCode::Return);
-    
-    EXPECT_TRUE(Builder.buildFromInstructions(Instrs));
-    ASSERT_NE(Builder.getIRContext(), nullptr);
-  }
-
-  // Helper for unary operations
-  void testUnaryOp(OpCode Op, TypeCode InType = TypeCode::I32,
-                    TypeCode RetType = TypeCode::I32);
-};
-
-// Test ALL i32 arithmetic in one test
-TEST_F(IRInstructionTest, I32_Arithmetic) {
-  testBinaryOp(OpCode::I32__add);
-  testBinaryOp(OpCode::I32__sub);
-  testBinaryOp(OpCode::I32__mul);
-  testBinaryOp(OpCode::I32__div_s);
-  testBinaryOp(OpCode::I32__div_u);
-  testBinaryOp(OpCode::I32__rem_s);
-  testBinaryOp(OpCode::I32__rem_u);
-}
-```
-
-### Level 3: JIT Compilation Verification
-
-Tests verify the IR graph can be compiled to machine code:
-
-```cpp
-TEST(IRJitEngineTest, CompileSimpleArithmetic) {
-  WasmToIRBuilder Builder;
-  // ... build instructions ...
-  ASSERT_TRUE(Builder.buildFromInstructions(Instrs));
-
-  // Compile with JIT engine
-  IRJitEngine Engine;
-  auto CompRes = Engine.compile(Builder.getIRContext());
-
-  if (CompRes) {
-    // Verify compilation produced valid code
-    ASSERT_NE(CompRes.value().NativeFunc, nullptr);  // ✅ Got function pointer
-    ASSERT_GT(CompRes.value().CodeSize, 0);          // ✅ Generated code
-    ASSERT_NE(CompRes.value().IRGraph, nullptr);     // ✅ IR graph exists
-
-    // Clean up
-    Engine.release(CompRes.value().NativeFunc, CompRes.value().CodeSize);
-  }
-}
-```
-
-**What this verifies:**
-- IR graph is valid and complete
-- IR optimizations pass without error
-- Register allocation succeeds
-- Code generation produces machine code
-
-### Level 4: Execution Correctness Testing
-
-The most critical level - tests **actually execute** the JIT-compiled native code and verify it produces correct results. This is implemented in `ir_execution_test.cpp`.
-
-#### Testing Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│  Test Fixture: IRExecutionTest / MemoryExecutionTest                │
-├─────────────────────────────────────────────────────────────────────┤
-│  1. Build WebAssembly instruction sequence                          │
-│  2. Lower to IR using WasmToIRBuilder                               │
-│  3. JIT compile to native code using IRJitEngine                    │
-│  4. Cast to C function pointer                                      │
-│  5. Call the function with test inputs                              │
-│  6. Compare returned value against expected result                  │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-#### How It Works
-
-**Step 1: Build a minimal Wasm function**
-
-```cpp
-void* buildBinaryOp(OpCode Op, TypeCode Type1, TypeCode Type2, TypeCode RetType) {
-  // Create function type: (param0, param1) -> result
-  std::vector<ValType> ParamTypes = {ValType(Type1), ValType(Type2)};
-  std::vector<ValType> RetTypes = {ValType(RetType)};
-  AST::FunctionType FuncType(ParamTypes, RetTypes);
-  
-  Builder.initialize(FuncType, {});
-  
-  // Build instruction sequence: local.get 0, local.get 1, <op>, end
-  std::vector<AST::Instruction> Instrs;
-  Instrs.emplace_back(OpCode::Local__get);
-  Instrs.back().getTargetIndex() = 0;
-  Instrs.emplace_back(OpCode::Local__get);
-  Instrs.back().getTargetIndex() = 1;
-  Instrs.emplace_back(Op);  // The operation being tested
-  Instrs.emplace_back(OpCode::End);
-  
-  Builder.buildFromInstructions(Instrs);
-  return Engine.compile(Builder.getIRContext())->NativeFunc;
-}
-```
-
-**Step 2: Execute and verify**
-
-```cpp
-TEST_F(IRExecutionTest, I32_Add_Basic) {
-  // Build JIT function for i32.add
-  void* Func = buildBinaryOp(OpCode::I32__add, TypeCode::I32, TypeCode::I32, TypeCode::I32);
-  ASSERT_NE(Func, nullptr);
-  
-  // Cast to C function pointer (memory base is implicit first param)
-  using FnType = int32_t (*)(void*, int32_t, int32_t);
-  auto fn = reinterpret_cast<FnType>(Func);
-  
-  // Execute and verify results
-  EXPECT_EQ(fn(Memory.data(), 10, 20), 30);      // Basic addition
-  EXPECT_EQ(fn(Memory.data(), -5, 5), 0);        // Negative numbers
-  EXPECT_EQ(fn(Memory.data(), 100, -30), 70);    // Mixed signs
-}
-```
-
-#### Memory Operations Testing
-
-Memory tests use a more sophisticated approach:
-
-**Step 1: Pre-initialize memory with known patterns**
-
-```cpp
-void SetUp() override {
-  // Known i32 value (0x12345678) at offset 16
-  Memory[16] = 0x78; Memory[17] = 0x56; Memory[18] = 0x34; Memory[19] = 0x12;
-  
-  // Negative byte (0xFF = -1 signed) at offset 48 for sign extension tests
-  Memory[48] = 0xFF;
-  
-  // Value 0x80 (128 unsigned, -128 signed) at offset 50
-  Memory[50] = 0x80;
-}
-```
-
-**Step 2: Load tests - verify values read from memory**
-
-```cpp
-TEST_F(MemoryExecutionTest, Memory_I32_Load8_S) {
-  void* Func = buildLoadFunc(OpCode::I32__load8_s, TypeCode::I32);
-  auto fn = reinterpret_cast<int32_t (*)(void*, int32_t)>(Func);
-  
-  // Load byte 0x80 with SIGN extension -> should be -128
-  EXPECT_EQ(fn(Memory.data(), 50), -128);
-  
-  // Load byte 0xFF with SIGN extension -> should be -1  
-  EXPECT_EQ(fn(Memory.data(), 48), -1);
-}
-
-TEST_F(MemoryExecutionTest, Memory_I32_Load8_U) {
-  void* Func = buildLoadFunc(OpCode::I32__load8_u, TypeCode::I32);
-  auto fn = reinterpret_cast<int32_t (*)(void*, int32_t)>(Func);
-  
-  // Load byte 0x80 with ZERO extension -> should be 128
-  EXPECT_EQ(fn(Memory.data(), 50), 128);
-  
-  // Load byte 0xFF with ZERO extension -> should be 255
-  EXPECT_EQ(fn(Memory.data(), 48), 255);
-}
-```
-
-**Step 3: Store tests - verify values written to memory**
-
-```cpp
-TEST_F(MemoryExecutionTest, Memory_I32_Store) {
-  void* Func = buildStoreFunc(OpCode::I32__store, TypeCode::I32);
-  auto fn = reinterpret_cast<void (*)(void*, int32_t, int32_t)>(Func);
-  
-  // Store 0xDEADBEEF at offset 100
-  fn(Memory.data(), 100, static_cast<int32_t>(0xDEADBEEF));
-  
-  // Verify bytes in little-endian order
-  EXPECT_EQ(Memory[100], 0xEF);
-  EXPECT_EQ(Memory[101], 0xBE);
-  EXPECT_EQ(Memory[102], 0xAD);
-  EXPECT_EQ(Memory[103], 0xDE);
-}
-```
-
-**Step 4: Round-trip tests - store then load back**
-
-```cpp
-TEST_F(MemoryExecutionTest, Memory_I32_RoundTrip) {
-  auto store = reinterpret_cast<void (*)(void*, int32_t, int32_t)>(StoreFunc);
-  auto load = reinterpret_cast<int32_t (*)(void*, int32_t)>(LoadFunc);
-  
-  int32_t testValues[] = {0, 1, -1, INT32_MAX, INT32_MIN, 0x12345678};
-  for (int32_t val : testValues) {
-    store(Memory.data(), 300, val);
-    EXPECT_EQ(load(Memory.data(), 300), val);  // Must match!
-  }
-}
-```
-
-#### Control Flow Testing
-
-Control flow tests verify branch logic produces correct results:
-
-```cpp
-TEST_F(IRExecutionTest, ControlFlow_IfElse_Max) {
-  // Build: max(a, b) = if (a > b) then a else b
-  std::vector<AST::Instruction> Instrs;
-  // Compare: a > b
-  Instrs.emplace_back(OpCode::Local__get); Instrs.back().getTargetIndex() = 0;
-  Instrs.emplace_back(OpCode::Local__get); Instrs.back().getTargetIndex() = 1;
-  Instrs.emplace_back(OpCode::I32__gt_s);
-  Instrs.emplace_back(OpCode::If);
-  // True branch: return a
-  Instrs.emplace_back(OpCode::Local__get); Instrs.back().getTargetIndex() = 0;
-  Instrs.emplace_back(OpCode::Return);
-  Instrs.emplace_back(OpCode::Else);
-  // False branch: return b
-  Instrs.emplace_back(OpCode::Local__get); Instrs.back().getTargetIndex() = 1;
-  Instrs.emplace_back(OpCode::Return);
-  Instrs.emplace_back(OpCode::End);
-  // ... build and compile ...
-  
-  // Verify max() behavior
-  EXPECT_EQ(fn(Memory.data(), 10, 5), 10);   // 10 > 5, return 10
-  EXPECT_EQ(fn(Memory.data(), 3, 7), 7);     // 3 < 7, return 7
-  EXPECT_EQ(fn(Memory.data(), -5, -10), -5); // -5 > -10, return -5
-}
-```
-
-#### Function Call Testing
-
-Function calls test both direct (`call`) and indirect (`call_indirect`) invocations:
-
-**JIT Function Signature with Call Support**
-
-All JIT-compiled functions now receive three implicit parameters:
-```cpp
-// JIT signature: RetType func(void** func_table, uint32_t table_size, void* mem_base, Params...)
-// - func_table: Array of function pointers for inter-function calls
-// - table_size: Number of entries (for call_indirect bounds checking)
-// - mem_base: Linear memory base pointer
-```
-
-**Direct Call Test (`call`)**
-
-```cpp
-// Native function that will be called by JIT code
-static int32_t native_double(void**, uint32_t, void*, int32_t x) {
-  return x * 2;
-}
-
-TEST_F(IRExecutionTest, Call_DirectToNative) {
-  // Build Wasm: local.get 0, call 0, return
-  // Creates caller(x) that calls func_table[0](x)
-  
-  void* FuncTable[1] = { reinterpret_cast<void*>(&native_double) };
-  
-  using FnType = int32_t (*)(void**, uint32_t, void*, int32_t);
-  auto caller_fn = reinterpret_cast<FnType>(CompiledFunc);
-  
-  // Verify: caller(5) -> native_double(5) -> 10
-  EXPECT_EQ(caller_fn(FuncTable, 1, Memory.data(), 5), 10);
-}
-```
-
-**Indirect Call Test (`call_indirect`)**
-
-```cpp
-TEST_F(IRExecutionTest, CallIndirect_RuntimeIndex) {
-  // Build Wasm: local.get 0, local.get 1, call_indirect type=0
-  // Creates caller(value, index) that calls func_table[index](value)
-  
-  void* FuncTable[2] = {
-    reinterpret_cast<void*>(&native_double),  // Index 0: x*2
-    reinterpret_cast<void*>(&native_triple)   // Index 1: x*3
-  };
-  
-  using FnType = int32_t (*)(void**, uint32_t, void*, int32_t, int32_t);
-  auto caller_fn = reinterpret_cast<FnType>(CompiledFunc);
-  
-  // Verify runtime dispatch
-  EXPECT_EQ(caller_fn(FuncTable, 2, Memory.data(), 5, 0), 10);  // 5*2
-  EXPECT_EQ(caller_fn(FuncTable, 2, Memory.data(), 5, 1), 15);  // 5*3
-}
-```
-
-**call_indirect Implementation Details**
-
-- Bounds check: `if (index >= table_size)` trap
-- Function pointer lookup: `FuncTablePtr[index]`
-- Uses chained `ir_IF` for bounds check with trap path
-- PHI node merges return values from valid/trap paths
-
-#### What Level 4 Catches
-
-| Issue Type | Example | How Detected |
-|------------|---------|--------------|
-| **Wrong IR mapping** | `i32.sub` mapped to `ir_ADD` | `sub(10, 3)` returns 13 instead of 7 |
-| **Sign vs unsigned** | Using `ir_DIV` instead of `ir_DIV_U` | `div_u(-1, 2)` returns wrong value |
-| **Endianness** | Bytes stored in wrong order | Load after store returns different value |
-| **Sign extension** | Using zero-extend instead of sign-extend | `load8_s(0xFF)` returns 255 instead of -1 |
-| **Control flow** | Branch targets incorrect | `if(true)` executes wrong branch |
-| **Dead code** | Return values lost after branch | `if/else` returns 0 for both branches |
-
-### Sightglass Benchmark Suite
-
-The **Sightglass** benchmark suite is integrated to compare **Interpreter**, **IR JIT** (dstogov/ir), and **LLVM AOT** on real-world WASI-style kernels. It provides performance metrics and cross-mode correctness checks.
-
-**Location:** `test/ir/ir_benchmark_test.cpp` (gtest `SightglassSuite`), `test/ir/run_sightglass_all.sh`, `test/ir/testdata/sightglass/*.wasm`.
-
-**What it does:**
-
-- Runs each kernel in `test/ir/testdata/sightglass/` in one or more modes: **Interpreter**, **JIT** (IR JIT), **AOT** (LLVM-compiled .so, when `WASMEDGE_USE_LLVM=ON`).
-- Uses minimal WASI and `bench` host stubs so kernels can instantiate and run; captures **stdout**, **stderr**, and **exit code** per run.
-- **Correctness:** For each kernel, JIT output is required to match Interpreter (stdout, stderr, exit code). When AOT runs, AOT output is required to match the same reference (Interpreter or JIT). This verifies that IR JIT and LLVM AOT produce the same observable behavior as the interpreter.
-- **Metrics:** Reports instantiation latency (µs), work time (µs), and time-to-value (µs) per mode.
-
-**Modes and environment:**
-
-- **Interpreter** – no JIT; execution is interpreted.
-- **JIT** – IR JIT (dstogov/ir) compiles at instantiation; execution uses compiled code.
-- **AOT** – Wasm is compiled to a native .so with the LLVM pipeline, then the VM loads the .so and runs it (no interpreter, no IR JIT). Requires `WASMEDGE_USE_LLVM=ON` and links `wasmedgeLLVM` for the benchmark test.
-
-**Script (`run_sightglass_all.sh`):**
-
-- Runs each kernel in isolation with a per-run timeout (default 15s; set `SIGHTGLASS_TIMEOUT`).
-- By default runs all three modes (Interpreter, JIT, AOT). Set **`WASMEDGE_SIGHTGLASS_SKIP_INTERP=1`** to run only JIT and AOT (faster, no interpreter).
-- Set **`WASMEDGE_SIGHTGLASS_SKIP_AOT=1`** to skip AOT (e.g. when not built with LLVM).
-- Summarizes pass/fail/timeout per mode.
-
-**Testdata:** Populate `test/ir/testdata/sightglass/` with `.wasm` kernels (e.g. from the Sightglass project). Run `utils/download_sightglass.sh` if the directory is missing.
-
-This suite complements the unit and execution tests by validating **real WASI kernels** and **cross-backend consistency** (Interpreter ≈ JIT ≈ AOT).
-
-### Test Categories and Coverage
-
-| Test Category | What's Verified | File Location |
-|---------------|-----------------|---------------|
-| **Initialization** | Function types, parameters, locals | `ir_basic_test.cpp` |
-| **Constants** | i32/i64/f32/f64.const | `ir_basic_test.cpp` |
-| **Locals** | local.get/set/tee | `ir_basic_test.cpp` |
-| **I32 Operations** | All 15+ i32 opcodes | `ir_instruction_test.cpp` |
-| **I64 Operations** | All 15+ i64 opcodes | `ir_instruction_test.cpp` |
-| **F32/F64 Operations** | Float arithmetic/comparison | `ir_instruction_test.cpp` |
-| **Parametric** | drop, select | `ir_instruction_test.cpp` |
-| **Control Flow** | block, loop, if, br, return | `ir_instruction_test.cpp` |
-| **Type Conversions** | wrap, extend, trunc, convert, reinterpret | `ir_instruction_test.cpp` |
-| **Memory** | All load/store variants | `ir_instruction_test.cpp` |
-| **JIT Compilation** | Full pipeline to native code | Both test files |
-
-### Current Test Results
-
-```bash
-# Basic Test Suite (33 tests)
-[==========] 33 tests from 3 test suites
-[  PASSED  ] 33 tests (100%)
-
-# Comprehensive Instruction Test Suite (43 tests)
-[==========] 43 tests from 1 test suite
-[  PASSED  ] 43 tests (100%)
-
-# Execution Correctness Test Suite (79 tests)
-[==========] 79 tests from 2 test suites
-[  PASSED  ] 79 tests (100%)
-
-# Integration Test Suite (6 tests)
-[==========] 6 tests from 1 test suite
-[  PASSED  ] 6 tests (100%)
-
-# End-to-End Test Suite (5 tests)
-[==========] 5 tests from 1 test suite
-[  PASSED  ] 5 tests (100%)
-
-# Benchmark Test Suite (13 tests)
-[==========] 13 tests from 1 test suite
-[  PASSED  ] 13 tests (100%)
-  - FibonacciRecursive_Correctness
-  - FibonacciIterative_Correctness  
-  - Ackermann_Correctness
-  - SumToN_Correctness
-  - GCD_Correctness
-  - IsPrime_Correctness
-  - CountPrimes_Correctness
-  - Benchmark_FibonacciIterative (~4.5M calls/sec)
-  - Benchmark_CountPrimes (~170k calls/sec)
-  - Quicksort_Correctness
-  - Benchmark_Quicksort
-  - SightglassSuite (Interpreter/JIT/AOT cross-mode correctness + metrics)
-
-Type Conversion Coverage (FULL IMPLEMENTATION):
-  ✅ Integer wrap/extend - ir_TRUNC, ir_SEXT, ir_ZEXT
-  ✅ Float to int - ir_FP2I32/I64/U32/U64
-  ✅ Saturating trunc - ir_FP2I32/I64/U32/U64
-  ✅ Int to float - ir_INT2F/D with unsigned handling
-  ✅ Float promote/demote - ir_F2D/D2F
-  ✅ Reinterpret - ir_BITCAST_I32/I64/F/D
-  ✅ Sign extension - Shift-based implementation
-
-Control Flow & Calls Coverage (IR Generation + Execution ✅):
-  ✅ nop, unreachable - Direct IR mapping
-  ✅ block - Forward-jump with ir_END/ir_MERGE, result type support
-  ✅ loop - ir_LOOP_BEGIN/ir_LOOP_END with back-edges and PHI nodes for locals
-  ✅ if/else/end - ir_IF/ir_IF_TRUE/ir_IF_FALSE with proper termination tracking
-  ✅ if (result type) - PHI nodes for merging branch results
-  ✅ if without else - PHI nodes for merging locals with fallthrough path
-  ✅ br - Unconditional branch (forward/backward)
-  ✅ br_if - Conditional branch with ir_IF
-  ✅ br_table - Multi-way branch using chained comparisons
-  ✅ return - ir_RETURN with dead code elimination
-  ✅ call - Direct function call via func_table pointer
-  ✅ call_indirect - Indirect call with runtime index and bounds checking
-
-Global Operations Coverage (IR Generation + Execution ✅):
-  ✅ global.get - Load via ValVariant** (double indirection)
-  ✅ global.set - Store via ValVariant** (double indirection)
-
-TOTAL: 179/179 tests passing ✅
-  - Basic IR Generation: 33 tests
-  - Instruction Coverage: 43 tests
-  - Execution Correctness: 79 tests (includes 8 control flow + 19 memory + 4 function call + 5 global tests)
-  - Integration Tests: 6 tests
-  - End-to-End Tests: 5 tests
-  - Benchmark Tests: 13 tests (algorithm correctness + SightglassSuite)
-```
-
-**Test Suite Structure:**
-```
-test/ir/
-├── ir_basic_test.cpp        (33 tests - IR generation)
-├── ir_instruction_test.cpp  (43 tests - bulk instruction coverage)
-├── ir_execution_test.cpp    (79 tests - execution correctness)
-├── ir_integration_test.cpp  (6 tests - WasmEdge runtime integration)
-├── ir_e2e_test.cpp          (5 tests - real .wasm file loading)
-├── ir_benchmark_test.cpp    (13 tests - algorithms + SightglassSuite)
-├── run_sightglass_all.sh    (run Sightglass kernels: Interpreter/JIT/AOT)
-├── testdata/
-│   ├── factorial.wat/wasm   (E2E test module)
-│   ├── fibonacci.wat/wasm   (benchmark algorithms)
-│   └── sightglass/          (Sightglass .wasm kernels)
-└── CMakeLists.txt           (build configuration)
-```
-
-**Execution Tests Coverage (79 tests):**
-```
-I32 Operations Verified (29 tests):
-  ✅ Arithmetic: add, sub, mul, div_s, div_u, rem_s, rem_u (incl. overflow)
-  ✅ Bitwise: and, or, xor, shl, shr_s, shr_u, rotl, rotr
-  ✅ Comparison: eq, ne, lt_s, lt_u, le_s, gt_s, ge_s
-  ✅ Unary: eqz, clz, ctz, popcnt
-
-I64 Operations Verified (14 tests):
-  ✅ Arithmetic: add, sub, mul, div_s, div_u, rem_s (incl. overflow)
-  ✅ Comparison: eq, lt_s, lt_u
-  ✅ Unary: eqz, clz, ctz, popcnt
-
-Control Flow Verified (8 tests):
-  ✅ ControlFlow_IfElse_Basic - if/else with return in both branches
-  ✅ ControlFlow_IfElse_Max - max(a,b) using comparison + if/else
-  ✅ ControlFlow_NestedIfElse_Sign - nested if/else for sign function
-  ✅ ControlFlow_EarlyReturn_Clamp - early returns with if (no else)
-  ✅ ControlFlow_IfElse_Abs - absolute value using if/else
-  ✅ ControlFlow_BrTable_DefaultOnly - br_table with only default case
-  ✅ ControlFlow_BrTable_Switch - br_table multi-way branch
-  ✅ ControlFlow_BrTable_SingleCase - br_table with single case
-
-Function Calls Verified (4 tests):
-  ✅ Call_DirectToNative - direct call to native function via func_table
-  ✅ Call_MultipleArgs - call with multiple arguments
-  ✅ CallIndirect_RuntimeIndex - indirect call with runtime index
-  ✅ CallIndirect_ConstantIndex - indirect call with constant index
-
-Global Operations Verified (5 tests):
-  ✅ Global_GetI32 - i32 global read
-  ✅ Global_SetI32 - i32 global write
-  ✅ Global_Increment - global get + set roundtrip
-  ✅ Global_Multiple - multiple globals access
-  ✅ Global_I64 - i64 global read
-
-Memory Operations Verified (19 tests):
-  ✅ Memory_I32_Load - 32-bit load verification
-  ✅ Memory_I32_Load8_S - 8-bit load with sign extension
-  ✅ Memory_I32_Load8_U - 8-bit load with zero extension
-  ✅ Memory_I32_Load16_S - 16-bit load with sign extension
-  ✅ Memory_I32_Load16_U - 16-bit load with zero extension
-  ✅ Memory_I64_Load - 64-bit load verification
-  ✅ Memory_I64_Load8_S - 8-bit to i64 with sign extension
-  ✅ Memory_I64_Load8_U - 8-bit to i64 with zero extension
-  ✅ Memory_I64_Load32_S - 32-bit to i64 with sign extension
-  ✅ Memory_I64_Load32_U - 32-bit to i64 with zero extension
-  ✅ Memory_I32_Store - 32-bit store verification
-  ✅ Memory_I32_Store8 - truncated 8-bit store
-  ✅ Memory_I32_Store16 - truncated 16-bit store
-  ✅ Memory_I64_Store - 64-bit store verification
-  ✅ Memory_I64_Store8 - truncated 8-bit store (i64)
-  ✅ Memory_I64_Store16 - truncated 16-bit store (i64)
-  ✅ Memory_I64_Store32 - truncated 32-bit store (i64)
-  ✅ Memory_I32_RoundTrip - store/load round-trip verification
-  ✅ Memory_I64_RoundTrip - store/load round-trip verification (i64)
-```
-
-**Benchmark Tests (13 tests):**
-```
-Integer Algorithm Correctness (8 tests):
-  ✅ FibonacciRecursive - recursive fibonacci (tests recursive calls + if result type)
-  ✅ FibonacciIterative - iterative fibonacci (tests loops + locals)
-  ✅ Ackermann - Ackermann function (tests deep recursion + nested if)
-  ✅ SumToN - sum 1..n (tests basic loop)
-  ✅ GCD - Euclidean GCD (tests loop + conditional)
-  ✅ IsPrime - primality test (tests early return in loop)
-  ✅ TestIsPrimeWrapper - wrapper for is_prime (tests call mechanism)
-  ✅ CountPrimes - count primes up to n (tests nested control flow + calls)
-
-Performance Benchmarks (2 tests):
-  ✅ Benchmark_FibonacciIterative - fib(35) x 100k iterations (~4.5M calls/sec)
-  ✅ Benchmark_CountPrimes - count_primes(1000) x 1k iterations (~170k calls/sec)
-
-Quicksort + Sightglass (3 tests):
-  ✅ Quicksort_Correctness - quicksort algorithm correctness
-  ✅ Benchmark_Quicksort - quicksort performance
-  ✅ SightglassSuite - Sightglass kernels in Interpreter/JIT/AOT; cross-mode correctness + metrics
-```
-
-### Instruction Coverage Verification
-
-```
-Total Instructions Tested: ~145
-├─ I32 Binary (14): ✅ add, sub, mul, div_s, div_u, rem_s, rem_u, and, or, xor, shl, shr_s, shr_u, rotl, rotr
-├─ I64 Binary (14): ✅ add, sub, mul, div_s, div_u, rem_s, rem_u, and, or, xor, shl, shr_s, shr_u, rotl, rotr
-├─ F32 Binary (6): ✅ add, sub, mul, div, min, max
-├─ F64 Binary (6): ✅ add, sub, mul, div, min, max
-├─ I32 Compare (10): ✅ eq, ne, lt_s, lt_u, le_s, le_u, gt_s, gt_u, ge_s, ge_u
-├─ I64 Compare (10): ✅ eq, ne, lt_s, lt_u, le_s, le_u, gt_s, gt_u, ge_s, ge_u
-├─ F32 Compare (6): ✅ eq, ne, lt, le, gt, ge
-├─ F64 Compare (6): ✅ eq, ne, lt, le, gt, ge
-├─ I32 Unary (4): ✅ eqz, clz, ctz, popcnt
-├─ I64 Unary (4): ✅ eqz, clz, ctz, popcnt
-├─ F32 Unary (7): ✅ abs, neg, sqrt†, ceil†, floor†, trunc†, nearest†
-├─ F64 Unary (7): ✅ abs, neg, sqrt†, ceil†, floor†, trunc†, nearest†
-├─ Parametric (2): ✅ drop, select
-├─ Control Flow (10): ✅ FULL IMPLEMENTATION
-│  ├─ nop, unreachable: Direct IR mapping
-│  ├─ block: Forward-jump target with ir_END/ir_MERGE at end
-│  ├─ loop: ir_LOOP_BEGIN/ir_LOOP_END with back-edges + PHI nodes for loop variables
-│  ├─ if/else: ir_IF/ir_IF_TRUE/ir_IF_FALSE with merge
-│  ├─ br: Unconditional (forward to block end, or back to loop)
-│  ├─ br_if: Conditional with ir_IF for condition
-│  ├─ br_table: Multi-way branch with chained comparisons
-│  ├─ return: ir_RETURN with optional value
-│  ├─ call: Direct call via func_table[index]
-│  └─ call_indirect: Indirect call via func_table[runtime_index] with bounds check
-├─ Type Conversions (37): ✅ FULL IMPLEMENTATION
-│  ├─ Integer wrap/extend: i32.wrap_i64, i64.extend_i32_s/u
-│  ├─ Float to int: i32.trunc_f32_s/u, i32.trunc_f64_s/u, i64.trunc_f32_s/u, i64.trunc_f64_s/u
-│  ├─ Saturating trunc: i32.trunc_sat_f32_s/u, i32.trunc_sat_f64_s/u, i64.trunc_sat_f32_s/u, i64.trunc_sat_f64_s/u
-│  ├─ Int to float: f32.convert_i32_s/u, f32.convert_i64_s/u, f64.convert_i32_s/u, f64.convert_i64_s/u
-│  ├─ Float promote/demote: f32.demote_f64, f64.promote_f32
-│  ├─ Reinterpret: i32.reinterpret_f32, i64.reinterpret_f64, f32.reinterpret_i32, f64.reinterpret_i64
-│  └─ Sign extension: i32.extend8_s, i32.extend16_s, i64.extend8_s, i64.extend16_s, i64.extend32_s
-├─ Memory Loads (14): ✅ i32/i64/f32/f64.load, i32/i64 partial loads (with sign/zero-extend)
-└─ Memory Stores (9): ✅ i32/i64/f32/f64.store, i32/i64 partial stores (with truncation)
-
-† Float math placeholders (return operand unchanged)
-```
-
-### Running Tests
+## Running tests
 
 ```bash
 cd build
-
-# Build all IR tests
-make -j8 wasmedgeIRTests wasmedgeIRInstructionTests wasmedgeIRExecutionTests \
+make -j32 wasmedgeIRTests wasmedgeIRInstructionTests wasmedgeIRExecutionTests \
          wasmedgeIRIntegrationTests wasmedgeIRE2ETests wasmedgeIRBenchmarkTests
-
-# Run individual test suites
-./test/ir/wasmedgeIRTests              # Basic IR generation (33 tests)
-./test/ir/wasmedgeIRInstructionTests   # Instruction coverage (43 tests)
-./test/ir/wasmedgeIRExecutionTests     # Execution correctness (79 tests)
-./test/ir/wasmedgeIRIntegrationTests   # Runtime integration (6 tests)
-./test/ir/wasmedgeIRE2ETests           # End-to-end with .wasm (5 tests)
-./test/ir/wasmedgeIRBenchmarkTests     # Algorithm + Sightglass benchmarks (13 tests)
-
-# Run all IR tests via CTest
-ctest -R IR
-
-# Run all tests with verbose output
-ctest -R IR -V
+ctest -R IR -V --output-on-failure
 ```
 
-### Manual Verification
+Individual binaries: `./test/ir/wasmedgeIRTests`, `wasmedgeIRInstructionTests`, `wasmedgeIRExecutionTests`, `wasmedgeIRIntegrationTests`, `wasmedgeIRE2ETests`, `wasmedgeIRBenchmarkTests`.
 
-```bash
-# 1. Build verification
-cd build
-make wasmedgeVM -j8
-echo "Exit code: $?"  # Should be 0
+## Gaps
 
-# 2. Library verification
-ls -lh thirdparty/ir/libir.a  # ~1-2 MB (built by CMake when WASMEDGE_BUILD_IR_JIT=ON)
-ls -lh lib/vm/libwasmedgeVM.a
-
-# 3. Symbol verification
-nm thirdparty/ir/libir.a | grep "T ir_jit_compile"
-nm lib/vm/libwasmedgeVM.a | grep "WasmToIRBuilder"
-```
-
-### ✅ Execution-Level Testing
-
-The test suite includes **79 execution correctness tests** that call JIT-compiled functions and verify computed results:
-
-```cpp
-// Example from ir_execution_test.cpp
-TEST_F(IRExecutionTest, I32_Add_Basic) {
-  void* Func = buildBinaryOp(OpCode::I32__add, TypeCode::I32, TypeCode::I32, TypeCode::I32);
-  ASSERT_NE(Func, nullptr);
-  
-  using FnType = int32_t (*)(void*, int32_t, int32_t);
-  auto fn = reinterpret_cast<FnType>(Func);
-  
-  // Execute JIT-compiled code and verify results
-  EXPECT_EQ(fn(Memory.data(), 10, 20), 30);
-  EXPECT_EQ(fn(Memory.data(), -5, 5), 0);
-  EXPECT_EQ(fn(Memory.data(), 100, -30), 70);
-}
-```
-
-**Coverage**: I32/I64 arithmetic (43 tests), control flow (8 tests), function calls (4 tests), global operations (5 tests), memory operations (19 tests)
-
-### ✅ Completed Test Coverage
-
-1. **IR Builder Tests** ✅
-   - Function initialization
-   - Type conversion
-   - Instruction lowering
-   - SSA value tracking
-   - Local variable management
-
-2. **IR JIT Engine Tests** ✅
-   - Compilation success
-   - Code generation
-   - Memory management
-   - Code release
-
-3. **Integration Tests** ✅ (6 tests)
-   - Simple arithmetic: `(i32.const 10) (i32.const 20) (i32.add)`
-   - Local variables: `(local.get 0) (local.get 1) (i32.mul)`
-   - **Factorial (iterative)**: Tests loops with PHI nodes, local variable updates, and conditional branching
-   - Memory access: Store and load round-trip verification
-   - Global access: Counter increment using global.get/set
-   - Conditional logic: Max function using if/else
-
-4. **Execution Correctness Tests** ✅ (79 tests)
-   - I32/I64 arithmetic, bitwise, comparison, unary (43 tests)
-   - Control flow: if/else, nested, early return, br_table (8 tests)
-   - Function calls: direct and indirect (4 tests)
-   - Global operations: get/set for i32/i64 (5 tests)
-   - Memory: load/store with sign/zero extension (19 tests)
-
-5. **End-to-End Tests** ✅ (5 tests)
-   - Load real .wasm files through WasmEdge loader/validator
-   - Compile all functions via IR JIT at module instantiation
-   - Execute through WasmEdge executor dispatch
-
-6. **Benchmark Tests** ✅ (13 tests)
-   - Correctness: fibonacci, ackermann, sum, GCD, prime counting, quicksort
-   - Performance: throughput measurements for real algorithms
-   - SightglassSuite: Sightglass kernels in Interpreter/JIT/AOT; cross-mode correctness + metrics
-   - Tests complex control flow: recursive calls, nested if with result types, loops modifying locals
-
-### Remaining Test Gaps
-
-| Category | Status | Notes |
-|----------|--------|-------|
-| **Float execution** | ⚠️ Not tested | Need execution tests for f32/f64 operations |
-| **Type conversions** | ⚠️ IR only | Need execution correctness tests |
-| **Edge cases** | ⚠️ Partial | Need more overflow/underflow/NaN testing |
+| Area | Notes |
+|------|--------|
+| **Float execution** | No dedicated f32/f64 exec battery (IR mapping exists) |
+| **Conversions** | Many covered at IR level; execution coverage thinner |
+| **Edge cases** | NaN/overflow/underflow could use more tests |
 
 ---
 
-## References
+# References
 
-### Key Files to Reference
+## Key Files to Reference
 
 - **IR Examples**: `thirdparty/ir/examples/` (or `ir/examples/` in the dstogov/ir repo)
   - `0001-basic.c` - Basic function compilation pattern
@@ -1666,10 +968,9 @@ TEST_F(IRExecutionTest, I32_Add_Basic) {
   - `ir.h` - Core IR types and functions
   - `ir_builder.h` - Builder macros (ir_PARAM, ir_ADD, etc.)
 
-- **WasmEdge Executor**: `lib/executor/helper.cpp`
-  - `enterFunction()` - Function dispatch point
+- **WasmEdge executor**: `lib/executor/helper.cpp` — `enterFunction` / `invoke` IR JIT branch (`isIRJitFunction` → `IRJitEngine::invoke`), plus `jit_host_call`, `jit_call_indirect`, and related trampolines.
 
-### Related Documentation
+## Related Documentation
 
 See `notes/` directory for additional documentation:
 - Build instructions
@@ -1677,7 +978,7 @@ See `notes/` directory for additional documentation:
 - Performance notes
 - Development logs
 
-### External Resources
+## External Resources
 
 - **dstogov/ir**: https://github.com/dstogov/ir
 - **WebAssembly Spec**: https://webassembly.github.io/spec/
@@ -1685,11 +986,19 @@ See `notes/` directory for additional documentation:
 
 ---
 
-## Implementation Status
+# Implementation Status
 
 This section provides a comprehensive breakdown of all WebAssembly instruction implementations.
 
-### ✅ Fully Implemented
+## Objective
+  - ✅ Integrate `dstogov/ir` into WasmEdge (`thirdparty/CMakeLists.txt` → `wasmedgeIR` imported target, `wasmedgeIRBuild`)
+  - ✅ Wasm→IR lowering (`WasmToIRBuilder`)
+  - ✅ JIT engine (`IRJitEngine`: mmap buffers, `ir_jit_compile`, GDB JIT registration, `invoke`)
+  - ✅ Execution tests (**81** in `ir_execution_test.cpp`) plus integration / E2E / benchmarks
+  - ✅ Executor path: `enterFunction` / `invoke` builds **`JitExecEnv`**, per-module **func table + global pointer array** cache, calls native code
+  - ⏳ Tier-up to LLVM / retain `ir_ctx` for optimization (not implemented; `upgradeToIRJit(..., nullptr)` today)
+
+## ✅ Fully Implemented
 
 | Category | Count | Instructions |
 |----------|-------|--------------|
@@ -1719,7 +1028,7 @@ This section provides a comprehensive breakdown of all WebAssembly instruction i
 | **Memory Size/Grow** | 2 | `memory.size`, `memory.grow` |
 | **TOTAL** | **183** | |
 
-### ⚠️ Placeholder Implementations (Dispatch but don't work correctly)
+## ⚠️ Placeholder Implementations (Dispatch but don't work correctly)
 
 | Category | Count | Instructions | Issue |
 |----------|-------|--------------|-------|
@@ -1727,7 +1036,7 @@ This section provides a comprehensive breakdown of all WebAssembly instruction i
 | **F64 Math** | 5 | `sqrt`, `ceil`, `floor`, `trunc`, `nearest` | Return operand unchanged (need intrinsic calls) |
 | **TOTAL** | **10** | | |
 
-### ❌ Not Implemented (Will return error)
+## ❌ Not Implemented (Will return error)
 
 | Category | Count | Instructions |
 |----------|-------|--------------|
@@ -1736,24 +1045,23 @@ This section provides a comprehensive breakdown of all WebAssembly instruction i
 | **Exceptions** | 6+ | `try`, `catch`, `throw`, etc. |
 | **TOTAL** | **~276+** | |
 
-### Summary
+## Summary
 
-| Status | Count | Percentage |
-|--------|-------|------------|
-| ✅ Fully Implemented | 183 | ~99% of core |
-| ⚠️ Placeholder | 10 | ~5% of core |
-| ❌ Not Implemented | 0 | 0% of core |
-| **Core Total** | **184** | 100% |
+| Status | Count | Notes |
+|--------|-------|--------|
+| ✅ Implemented (listed categories) | 183 | Scalar / memory / table / bulk / refs as in table above |
+| ⚠️ Placeholder | 10 | f32/f64 `sqrt`, `ceil`, `floor`, `trunc`, `nearest` (identity lowering) |
+| ❌ Not implemented | — | **SIMD (v128)**, **atomics**, **exceptions** — not in IR JIT |
 
-*Note: SIMD, Atomics, and Exceptions are considered advanced features and not counted in "core" percentages.*
+*Percentages in older revisions were misleading; treat SIMD/atomics/exceptions as unsupported until explicitly added.*
 
-### Priority for Completion
+## Priority for Completion
 
 **High Priority** (required for basic programs):
 1. ✅ ~~Type conversions (37)~~ - **COMPLETED**
-2. ✅ ~~Memory load/store (23)~~ - **COMPLETED** (implicit memory base param)
-3. ✅ ~~Global operations (2)~~ - **COMPLETED** (global_base param)
-4. ✅ ~~Function calls (2)~~ - **COMPLETED** (func_table param)
+2. ✅ ~~Memory load/store~~ — **DONE** (`JitExecEnv::MemoryBase` / outlined helpers)
+3. ✅ ~~Global operations~~ — **DONE** (`GlobalBase` as `ValVariant**`)
+4. ✅ ~~Function calls~~ — **DONE** (`FuncTable` + trampolines for imports / `call_indirect`)
 
 **Medium Priority** (common features):
 5. ⚠️ Float math (10) - `sqrt`, `ceil`, `floor`, etc.
@@ -1764,7 +1072,7 @@ This section provides a comprehensive breakdown of all WebAssembly instruction i
 9. ✅ ~~Reference types (3)~~ - **COMPLETED**
 10. ✅ ~~Bulk memory (4)~~ - **COMPLETED** (`memory.copy`, `memory.fill`, `memory.init`, `data.drop`; copy/fill use bounds-checking helpers)
 
-### Recommended Next Steps
+## Recommended Next Steps
 
 1. **Float Math Intrinsics** (10 instructions) - Quick win  
    Fix placeholders by adding `ir_CALL` to C library functions (`sqrtf`, `sqrt`, `ceilf`, `ceil`, etc.)

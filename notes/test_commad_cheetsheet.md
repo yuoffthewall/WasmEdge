@@ -9,7 +9,7 @@ cmake -DCMAKE_BUILD_TYPE=Debug \
 
 cmake -DCMAKE_BUILD_TYPE=Debug ..   # optional: better backtraces and JIT symbols
 
-cmake --build . --target wasmedgeIRBenchmarkTests -j32
+make wasmedgeIRBenchmarkTests -j32
 ```
 
 # Build thirdparty/ir
