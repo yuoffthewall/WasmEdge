@@ -8,6 +8,7 @@
 #include "ast/type.h"
 #include "common/errcode.h"
 #include "vm/ir_builder.h"
+#include "vm/ir_jit_reg_invoke.h"
 #include <spdlog/spdlog.h>
 
 // Include dstogov/ir headers
@@ -129,29 +130,27 @@ IRJitEngine::compile(ir_ctx *Ctx) {
       opt_level = 2;
   }
 
-  static int _dbg_func_id = 0;
-  int _dbg_cur_id = _dbg_func_id++;
-  bool _dbg_dump = std::getenv("WASMEDGE_IR_JIT_DUMP") != nullptr;
-  if (_dbg_dump) {
+  static int func_id = 0;
+  int cur_id = func_id++;
+  bool dump = std::getenv("WASMEDGE_IR_JIT_DUMP") != nullptr;
+  if (dump) {
     char fname[256];
-    snprintf(fname, sizeof(fname), "/tmp/wasmedge_ir_%03d_before.ir", _dbg_cur_id);
+    snprintf(fname, sizeof(fname), "/tmp/wasmedge_ir_%03d_before.ir", cur_id);
     FILE *f = fopen(fname, "w");
     if (f) { ir_save(Ctx, 0, f); fclose(f); }
   }
 
   size_t CodeSize = 0;
-  // void *NativeCode = safeIrJitCompile(Ctx, opt_level, &CodeSize);
-  // Not using Signal Handler for now to expose the failure.
   void *NativeCode = ir_jit_compile(Ctx, opt_level, &CodeSize);
 
   if (!NativeCode) {
-    spdlog::info("IR JIT: ir_jit_compile failed (func {})", _dbg_cur_id);
+    spdlog::info("IR JIT: ir_jit_compile failed (func {})", cur_id);
     return Unexpect(ErrCode::Value::RuntimeError);
   }
 
-  if (_dbg_dump) {
+  if (dump) {
     char fname[256];
-    snprintf(fname, sizeof(fname), "/tmp/wasmedge_ir_%03d_after.ir", _dbg_cur_id);
+    snprintf(fname, sizeof(fname), "/tmp/wasmedge_ir_%03d_after.ir", cur_id);
     FILE *f = fopen(fname, "w");
     if (f) { ir_save(Ctx, IR_SAVE_CFG, f); fclose(f); }
   }
@@ -162,7 +161,7 @@ IRJitEngine::compile(ir_ctx *Ctx) {
   // Register with GDB JIT interface so breakpoints / disassembly work
   {
     char gdb_name[64];
-    snprintf(gdb_name, sizeof(gdb_name), "wasm_jit_%03d", _dbg_cur_id);
+    snprintf(gdb_name, sizeof(gdb_name), "wasm_jit_%03d", cur_id);
     ir_gdb_register(gdb_name, NativeCode, CodeSize, 0, 0);
   }
 
@@ -219,28 +218,28 @@ Expect<void> IRJitEngine::invoke(void *NativeFunc,
     }
   }
 
-  // Uniform JIT signature: ret func(JitExecEnv* env, uint64_t* args)
+  // Register-based calling convention: dispatch through irJitInvokeNative
+  // which calls with native-typed args in SysV registers.
   if (RetTypes.empty()) {
-    using Fn = void (*)(JitExecEnv *, uint64_t *);
-    reinterpret_cast<Fn>(NativeFunc)(&Env, ArgsData);
+    detail::irJitInvokeNative(NativeFunc, &Env, FuncType, ArgsData);
   } else if (!Rets.empty()) {
     auto Code = RetTypes[0].getCode();
     if (Code == TypeCode::F32) {
-      using Fn = float (*)(JitExecEnv *, uint64_t *);
-      float F = reinterpret_cast<Fn>(NativeFunc)(&Env, ArgsData);
+      uint64_t Raw = detail::irJitInvokeNative(NativeFunc, &Env, FuncType, ArgsData);
+      float F;
+      std::memcpy(&F, &Raw, sizeof(F));
       Rets[0] = ValVariant(F);
     } else if (Code == TypeCode::F64) {
-      using Fn = double (*)(JitExecEnv *, uint64_t *);
-      double D = reinterpret_cast<Fn>(NativeFunc)(&Env, ArgsData);
+      uint64_t Raw = detail::irJitInvokeNative(NativeFunc, &Env, FuncType, ArgsData);
+      double D;
+      std::memcpy(&D, &Raw, sizeof(D));
       Rets[0] = ValVariant(D);
     } else {
-      using Fn = uint64_t (*)(JitExecEnv *, uint64_t *);
-      uint64_t Raw = reinterpret_cast<Fn>(NativeFunc)(&Env, ArgsData);
+      uint64_t Raw = detail::irJitInvokeNative(NativeFunc, &Env, FuncType, ArgsData);
       Rets[0] = rawToValVariant(Raw, RetTypes[0]);
     }
   } else {
-    using Fn = uint64_t (*)(JitExecEnv *, uint64_t *);
-    reinterpret_cast<Fn>(NativeFunc)(&Env, ArgsData);
+    detail::irJitInvokeNative(NativeFunc, &Env, FuncType, ArgsData);
   }
 
   return {};

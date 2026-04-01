@@ -198,9 +198,22 @@ Expect<void> WasmToIRBuilder::initialize(
     LocalCount += Count;
   }
 
-  // Uniform JIT signature: ret func(JitExecEnv* env, uint64_t* args)
+  // Register-based calling convention: ret func(JitExecEnv*, arg0, arg1, ...)
+  // Each wasm parameter is declared as a separate ir_PARAM with its native type.
+  // The IR library assigns SysV ABI registers (rdi/rsi/rdx/rcx/r8/r9 for int,
+  // xmm0-7 for FP) and spills overflow params to the stack automatically.
   EnvPtr = ir_PARAM(IR_ADDR, "exec_env", 1);
-  ArgsPtr = ir_PARAM(IR_ADDR, "args", 2);
+
+  // Declare each wasm parameter as a native-typed ir_PARAM (param numbers 2..)
+  // Note: all ir_PARAM calls must be consecutive (IR library assertion).
+  for (uint32_t i = 0; i < ParamTypes.size(); ++i) {
+    ir_type irType = wasmTypeToIRType(ParamTypes[i]);
+    char name[32];
+    snprintf(name, sizeof(name), "p%u", i);
+    Locals[i] = ir_PARAM(irType, name, i + 2);
+    LocalTypes[i] = irType;
+  }
+  ArgsPtr = IR_UNUSED;
 
   FuncTablePtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, FuncTable))));
   FuncTableSize = ir_LOAD_U32(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, FuncTableSize))));
@@ -211,16 +224,6 @@ Expect<void> WasmToIRBuilder::initialize(
   MemoryGrowFnPtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, MemoryGrowFn))));
   MemorySizeFnPtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, MemorySizeFn))));
   CallIndirectFnPtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, CallIndirectFn))));
-
-  // Load wasm parameters from the args array. Each slot is sizeof(uint64_t).
-  // On little-endian (x86_64), loading a narrower type from the slot address
-  // reads the correct lower bytes.
-  for (uint32_t i = 0; i < ParamTypes.size(); ++i) {
-    ir_type irType = wasmTypeToIRType(ParamTypes[i]);
-    ir_ref SlotAddr = ir_ADD_A(ArgsPtr, ir_CONST_ADDR(i * sizeof(uint64_t)));
-    Locals[i] = ir_LOAD(irType, SlotAddr);
-    LocalTypes[i] = irType;
-  }
 
   // Initialize additional locals to zero
   uint32_t localIdx = static_cast<uint32_t>(ParamTypes.size());
@@ -248,13 +251,16 @@ Expect<void> WasmToIRBuilder::initialize(
 
 Expect<void>
 WasmToIRBuilder::buildFromInstructions(Span<const AST::Instruction> Instrs) {
-  // Pre-pass: compute max callee arity so we can allocate SharedCallArgs once.
+  // Pre-pass: compute max callee arity for buffer-based calls only.
+  // Direct calls (funcIdx >= ImportFuncNum) use register-based ABI and don't
+  // need SharedCallArgs. Only host calls and call_indirect use the buffer.
   uint32_t maxArity = 0;
   for (const auto &Instr : Instrs) {
     OpCode Op = Instr.getOpCode();
     if (Op == OpCode::Call) {
       uint32_t idx = Instr.getTargetIndex();
-      if (idx < ModuleFuncTypes.size()) {
+      // Only host calls (import functions) use the buffer path.
+      if (idx < ImportFuncNum && idx < ModuleFuncTypes.size()) {
         uint32_t n =
             static_cast<uint32_t>(ModuleFuncTypes[idx]->getParamTypes().size());
         if (n > maxArity)
@@ -2765,19 +2771,7 @@ Expect<void> WasmToIRBuilder::visitCall(const AST::Instruction &Instr) {
     WasmArgs[i - 1] = ensureValidRef(pop(), T);
   }
 
-  // Marshal args into the pre-allocated shared buffer (or null for 0 args).
   uint32_t NumArgs = static_cast<uint32_t>(ParamTypes.size());
-  ir_ref CalleeArgs = IR_UNUSED;
-  if (NumArgs > 0) {
-    CalleeArgs = SharedCallArgs;
-    for (uint32_t i = 0; i < NumArgs; ++i) {
-      ir_ref SlotAddr =
-          ir_ADD_A(CalleeArgs, ir_CONST_ADDR(i * sizeof(uint64_t)));
-      ir_STORE(SlotAddr, WasmArgs[i]);
-    }
-  } else {
-    CalleeArgs = ir_CONST_ADDR(0);
-  }
 
   // Determine return type.
   ir_type RetType = IR_VOID;
@@ -2793,7 +2787,20 @@ Expect<void> WasmToIRBuilder::visitCall(const AST::Instruction &Instr) {
   bool IsHostCall = (Op == OpCode::Call && ResolvedFuncIdx < ImportFuncNum);
 
   if (IsHostCall) {
-    // Route through jit_host_call trampoline.
+    // Route through jit_host_call trampoline (buffer-based ABI).
+    // Marshal args into the pre-allocated shared buffer.
+    ir_ref CalleeArgs = IR_UNUSED;
+    if (NumArgs > 0) {
+      CalleeArgs = SharedCallArgs;
+      for (uint32_t i = 0; i < NumArgs; ++i) {
+        ir_ref SlotAddr =
+            ir_ADD_A(CalleeArgs, ir_CONST_ADDR(i * sizeof(uint64_t)));
+        ir_STORE(SlotAddr, WasmArgs[i]);
+      }
+    } else {
+      CalleeArgs = ir_CONST_ADDR(0);
+    }
+
     // Prototype: uint64_t jit_host_call(JitExecEnv*, uint32_t funcIdx,
     //                                   uint64_t* args)
     ir_ref HCFn = ensureValidRef(HostCallFnPtr, IR_ADDR);
@@ -2825,8 +2832,21 @@ Expect<void> WasmToIRBuilder::visitCall(const AST::Instruction &Instr) {
       }
     }
   } else if (Op == OpCode::Call_indirect) {
-    // call_indirect: dispatch through jit_call_indirect trampoline which
-    // resolves table[tableIdx][elemIdx], type-checks against typeIdx, then
+    // call_indirect: dispatch through jit_call_indirect trampoline (buffer-based ABI).
+    // Marshal args into the pre-allocated shared buffer.
+    ir_ref CalleeArgs = IR_UNUSED;
+    if (NumArgs > 0) {
+      CalleeArgs = SharedCallArgs;
+      for (uint32_t i = 0; i < NumArgs; ++i) {
+        ir_ref SlotAddr =
+            ir_ADD_A(CalleeArgs, ir_CONST_ADDR(i * sizeof(uint64_t)));
+        ir_STORE(SlotAddr, WasmArgs[i]);
+      }
+    } else {
+      CalleeArgs = ir_CONST_ADDR(0);
+    }
+
+    // Resolves table[tableIdx][elemIdx], type-checks against typeIdx, then
     // calls the target (JIT native or interpreter fallback).
     // Prototype: uint64_t jit_call_indirect(JitExecEnv *env, uint32_t tableIdx,
     //                uint32_t elemIdx, uint32_t typeIdx, uint64_t *args,
@@ -2878,21 +2898,15 @@ Expect<void> WasmToIRBuilder::visitCall(const AST::Instruction &Instr) {
     }
   } else {
     // Direct call: load callee from FuncTable and call it directly.
-    // For local functions (funcIdx >= ImportFuncNum), the FuncTable entry is
-    // always non-null (set by the JIT engine after compilation).  Functions
-    // that failed to compile are routed through jit_host_call at a higher
-    // level, so we can safely skip the null check here.
+    // Register-based calling convention: pass each wasm arg in its native type.
     ir_ref ValidFT = ensureValidRef(FuncTablePtr, IR_ADDR);
     ir_ref FuncPtr = ir_LOAD_A(ir_ADD_A(
         ValidFT,
         ir_CONST_ADDR(static_cast<uintptr_t>(ResolvedFuncIdx) * sizeof(void *))));
 
-    // Build prototype for direct JIT call: ret func(JitExecEnv*, uint64_t*)
-    // Always declare I64 return even for void callees: the unused rax value is
-    // harmless, and IR_VOID triggers an assertion in the IR x86 backend's
-    // address-fusion pass at O2.  Float/double callees return in xmm0 so they
-    // need their native return type in the prototype.
-    uint8_t DirectProtoParams[2] = {IR_ADDR, IR_ADDR};
+    // Build per-callee-type prototype: ret func(JitExecEnv*, arg0, arg1, ...)
+    // Always declare I64 return for void/integer callees (IR_VOID triggers an
+    // assertion in the IR x86 backend's address-fusion pass at O2).
     ir_type DirectRetType;
     if (RetType == IR_FLOAT) {
       DirectRetType = IR_FLOAT;
@@ -2902,13 +2916,25 @@ Expect<void> WasmToIRBuilder::visitCall(const AST::Instruction &Instr) {
       DirectRetType = IR_I64;
     }
 
-    ir_ref DirectProto = ir_proto(ctx, IR_FASTCALL_FUNC, DirectRetType, 2,
-                                  DirectProtoParams);
+    uint32_t TotalParams = 1 + NumArgs; // EnvPtr + wasm args
+    std::vector<uint8_t> ProtoParams(TotalParams);
+    ProtoParams[0] = IR_ADDR; // JitExecEnv*
+    for (uint32_t i = 0; i < NumArgs; ++i) {
+      ProtoParams[i + 1] = static_cast<uint8_t>(wasmTypeToIRType(ParamTypes[i]));
+    }
+    ir_ref DirectProto = ir_proto(ctx, IR_FASTCALL_FUNC, DirectRetType,
+                                  TotalParams, ProtoParams.data());
     ir_ref TypedFuncPtr =
         ir_emit2(ctx, IR_OPT(IR_PROTO, IR_ADDR), FuncPtr, DirectProto);
 
-    ir_ref DirectArgs[2] = {EnvPtrVal, CalleeArgs};
-    ir_ref CallResult = ir_CALL_N(DirectRetType, TypedFuncPtr, 2, DirectArgs);
+    // Pass args directly in registers: EnvPtr, then each wasm arg
+    std::vector<ir_ref> DirectArgs(TotalParams);
+    DirectArgs[0] = EnvPtrVal;
+    for (uint32_t i = 0; i < NumArgs; ++i) {
+      DirectArgs[i + 1] = WasmArgs[i];
+    }
+    ir_ref CallResult = ir_CALL_N(DirectRetType, TypedFuncPtr,
+                                   TotalParams, DirectArgs.data());
 
     if (!RetTypes.empty()) {
       if (RetType == IR_I32)

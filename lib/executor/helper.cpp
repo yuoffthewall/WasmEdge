@@ -9,6 +9,7 @@
 
 #ifdef WASMEDGE_BUILD_IR_JIT
 #include "vm/ir_jit_engine.h"
+#include "vm/ir_jit_reg_invoke.h"
 #include <csetjmp>
 #include <cstring>
 #endif
@@ -46,20 +47,12 @@ extern "C" uint64_t jit_host_call(WasmEdge::VM::JitExecEnv *env,
       return 0;
 
     // Fast path: if the target is a JIT function, call it directly
-    // instead of going through the executor (avoids deep stack recursion).
+    // using register-based calling convention (avoids deep stack recursion).
     if (funcInst->isIRJitFunction()) {
       void *nativeFunc = funcInst->getIRJitNativeFunc();
       if (nativeFunc) {
         const auto &ft = funcInst->getFuncType();
-        const auto &retTypes = ft.getReturnTypes();
-        if (retTypes.empty()) {
-          using Fn = void (*)(WasmEdge::VM::JitExecEnv *, uint64_t *);
-          reinterpret_cast<Fn>(nativeFunc)(env, args);
-          return 0;
-        } else {
-          using Fn = uint64_t (*)(WasmEdge::VM::JitExecEnv *, uint64_t *);
-          return reinterpret_cast<Fn>(nativeFunc)(env, args);
-        }
+        return WasmEdge::VM::detail::irJitInvokeNative(nativeFunc, env, ft, args);
       }
     }
   } else {
@@ -122,45 +115,23 @@ extern "C" uint64_t jit_host_call(WasmEdge::VM::JitExecEnv *env,
 }
 
 /// Trampoline for direct "call": if funcPtr is null (import), dispatch via
-/// jit_host_call; otherwise call the JIT function. Prevents null deref when
-/// ImportFuncNum is wrong or table entry is null.
+/// jit_host_call; otherwise call the JIT function using register-based ABI.
 /// retTypeCode: 0=void, 1=i32, 2=i64, 3=f32, 4=f64
 extern "C" uint64_t jit_direct_or_host(WasmEdge::VM::JitExecEnv *env,
                                        void *funcPtr, uint32_t funcIdx,
-                                       uint64_t *args, uint32_t retTypeCode) {
+                                       uint64_t *args, uint32_t /*retTypeCode*/) {
   if (!funcPtr)
     return jit_host_call(env, funcIdx, args);
-  switch (retTypeCode) {
-  case 0: {
-    using Fn = void (*)(WasmEdge::VM::JitExecEnv *, uint64_t *);
-    reinterpret_cast<Fn>(funcPtr)(env, args);
-    return 0;
+  // Look up the FuncType from the module to dispatch with register ABI.
+  if (g_jitModInst) {
+    auto funcs = g_jitModInst->getFunctionInstances();
+    if (funcIdx < funcs.size() && funcs[funcIdx]) {
+      const auto &ft = funcs[funcIdx]->getFuncType();
+      return WasmEdge::VM::detail::irJitInvokeNative(funcPtr, env, ft, args);
+    }
   }
-  case 1: {
-    using Fn = uint64_t (*)(WasmEdge::VM::JitExecEnv *, uint64_t *);
-    return reinterpret_cast<Fn>(funcPtr)(env, args) & 0xFFFFFFFFu;
-  }
-  case 2: {
-    using Fn = uint64_t (*)(WasmEdge::VM::JitExecEnv *, uint64_t *);
-    return reinterpret_cast<Fn>(funcPtr)(env, args);
-  }
-  case 3: {
-    using Fn = float (*)(WasmEdge::VM::JitExecEnv *, uint64_t *);
-    float f = reinterpret_cast<Fn>(funcPtr)(env, args);
-    uint64_t u;
-    std::memcpy(&u, &f, sizeof(f));
-    return u;
-  }
-  case 4: {
-    using Fn = double (*)(WasmEdge::VM::JitExecEnv *, uint64_t *);
-    double d = reinterpret_cast<Fn>(funcPtr)(env, args);
-    uint64_t u;
-    std::memcpy(&u, &d, sizeof(d));
-    return u;
-  }
-  default:
-    return 0;
-  }
+  // Fallback: no module context, dispatch via host call.
+  return jit_host_call(env, funcIdx, args);
 }
 
 /// call_indirect trampoline: delegates to Executor::jitCallIndirect which has
@@ -500,7 +471,7 @@ Expect<void> Executor::jitCallFunction(
 
 Expect<uint64_t> Executor::jitCallIndirect(
     Runtime::StackManager &StackMgr, uint32_t TableIdx, uint32_t ElemIdx,
-    uint32_t TypeIdx, uint64_t *Args, uint32_t RetTypeCode,
+    uint32_t TypeIdx, uint64_t *Args, uint32_t /*RetTypeCode*/,
     VM::JitExecEnv *Env) {
   // 1. Get the table instance.
   const auto *TabInst = getTabInstByIdx(StackMgr, TableIdx);
@@ -541,41 +512,13 @@ Expect<uint64_t> Executor::jitCallIndirect(
     return Unexpect(ErrCode::Value::IndirectCallTypeMismatch);
   }
 
-  // 5. Fast path: if the target is JIT-compiled, call native code directly.
+  // 5. Fast path: if the target is JIT-compiled, call native code directly
+  // using register-based calling convention.
   if (FuncInst->isIRJitFunction()) {
     void *NativeFunc = FuncInst->getIRJitNativeFunc();
     if (NativeFunc) {
-      switch (RetTypeCode) {
-      case 0: {
-        using Fn = void (*)(VM::JitExecEnv *, uint64_t *);
-        reinterpret_cast<Fn>(NativeFunc)(Env, Args);
-        return static_cast<uint64_t>(0);
-      }
-      case 1: {
-        using Fn = uint64_t (*)(VM::JitExecEnv *, uint64_t *);
-        return reinterpret_cast<Fn>(NativeFunc)(Env, Args) & 0xFFFFFFFFu;
-      }
-      case 2: {
-        using Fn = uint64_t (*)(VM::JitExecEnv *, uint64_t *);
-        return reinterpret_cast<Fn>(NativeFunc)(Env, Args);
-      }
-      case 3: {
-        using Fn = float (*)(VM::JitExecEnv *, uint64_t *);
-        float F = reinterpret_cast<Fn>(NativeFunc)(Env, Args);
-        uint64_t U = 0;
-        std::memcpy(&U, &F, sizeof(F));
-        return U;
-      }
-      case 4: {
-        using Fn = double (*)(VM::JitExecEnv *, uint64_t *);
-        double D = reinterpret_cast<Fn>(NativeFunc)(Env, Args);
-        uint64_t U = 0;
-        std::memcpy(&U, &D, sizeof(D));
-        return U;
-      }
-      default:
-        break;
-      }
+      const auto &FT = FuncInst->getFuncType();
+      return VM::detail::irJitInvokeNative(NativeFunc, Env, FT, Args);
     }
   }
 

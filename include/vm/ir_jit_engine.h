@@ -45,7 +45,6 @@ class WasmToIRBuilder;
 
 /// Execution environment passed as the first argument to every JIT-compiled
 /// function. Used with the uniform signature ret func(JitExecEnv*, uint64_t*).
-/// O0 code emitter has a bug fusing LOAD(addr)->ADDR with ADD; use O2
 /// (WASMEDGE_IR_JIT_OPT_LEVEL=2) when using this convention.
 struct JitExecEnv {
   void **FuncTable;

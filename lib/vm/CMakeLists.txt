@@ -9,6 +9,8 @@ if(WASMEDGE_BUILD_IR_JIT)
   list(APPEND WASMEDGE_VM_SOURCES
     ir_builder.cpp
     ir_jit_engine.cpp
+    ir_jit_reg_invoke.cpp
+    ir_jit_reg_invoke_autogen.cpp
   )
 endif()
 

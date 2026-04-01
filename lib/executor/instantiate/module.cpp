@@ -210,6 +210,7 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
         spdlog::info("IR JIT: skipping {}/{} funcs (call non-JIT targets)",
                      SkipCount, TotalDefined);
       }
+      spdlog::info("IR JIT: ImportFuncNum={}, TotalDefined={}", ImportFuncNum, TotalDefined);
     }
 
     // Compile each defined (non-imported) wasm function
@@ -232,7 +233,7 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
       // Skip functions marked by the pre-pass (imports, trap stubs,
       // or functions that transitively call non-JIT targets).
       if (SkipJit[FuncIdx]) {
-        spdlog::debug("IR JIT: skip func {} (non-JIT call target)", FuncIdx);
+        spdlog::info("IR JIT: skip func {} (non-JIT call target)", FuncIdx);
         CodeIdx++;
         FuncIdx++;
         continue;
@@ -272,14 +273,17 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
         IRBuilder.setModuleGlobals(GlobalTypes);
         IRBuilder.setImportFuncNum(ImportFuncNum);
         
-        // Pre-scan to find max call args for shared buffer allocation
+        // Pre-scan to find max call args for buffer-based calls only.
+        // Direct calls (funcIdx >= ImportFuncNum) use register-based ABI
+        // and don't need the SharedCallArgs buffer.
         {
           uint32_t MaxArgs = 0;
           for (const auto &I : InstrVec) {
             auto IOp = I.getOpCode();
             if (IOp == OpCode::Call) {
               uint32_t Idx = I.getTargetIndex();
-              if (Idx < FuncTypes.size()) {
+              // Only host calls (imports) use the buffer path.
+              if (Idx < ImportFuncNum && Idx < FuncTypes.size()) {
                 auto N = static_cast<uint32_t>(FuncTypes[Idx]->getParamTypes().size());
                 if (N > MaxArgs) MaxArgs = N;
               }
