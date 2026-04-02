@@ -148,7 +148,7 @@ public:
   struct CompileResult {
     void *NativeFunc;     // Pointer to generated native code
     size_t CodeSize;      // Size of generated code in bytes
-    ir_ctx *IRGraph;      // Preserved IR graph for potential tier-up
+    std::string IRText;   // Serialized IR text for potential tier-up
   };
 
   IRJitEngine() noexcept;
@@ -173,8 +173,6 @@ public:
   /// Release compiled code
   void release(void *NativeFunc, size_t CodeSize) noexcept;
 
-  /// Release IR graph
-  void releaseIRGraph(ir_ctx *Ctx) noexcept;
 
 private:
   /// Code buffer management

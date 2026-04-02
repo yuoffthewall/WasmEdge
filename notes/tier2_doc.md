@@ -18,15 +18,20 @@ Wasm bytecode
   v
 ir_ctx* (tier-1, at instantiation via dstogov/ir)
   |
-  +--> ir_jit_compile() --> native code (tier-1, fast)
+  +--> ir_save() --> IR text snapshot (before tier-1 mutates context)
+  |      |
+  |      +--> ir_jit_compile() --> native code (tier-1, fast)
   |
   +--> [hot function detected at runtime]
   |      |
   |      v
-  |    ir_emit_llvm() --> LLVM IR text
+  |    ir_load_safe(IR text) --> fresh ir_ctx*
   |      |
   |      v
-  |    LLVMParseIR --> LLVMRunPasses(O2) --> ORC LLJIT --> native code (tier-2)
+  |    GCM + scheduling passes --> ir_emit_llvm() --> LLVM IR text
+  |      |
+  |      v
+  |    LLVMParseIR --> LLVMVerifyModule --> LLVMRunPasses(O2) --> ORC LLJIT --> native code (tier-2)
   |      |
   |      v
   |    FuncTable[idx] = tier2_ptr  (atomic pointer swap)
@@ -48,9 +53,12 @@ Execution continues (tier-1 or tier-2 transparently)
 
 ### Phase 2: LLVM AOT Tier-2 Compiler -- COMPLETE
 
-- `Tier2Compiler` class: `ir_ctx* -> ir_emit_llvm -> LLVM ORC LLJIT`
+- `Tier2Compiler` class: IR text → `ir_load_safe` → fresh `ir_ctx` → GCM scheduling → `ir_emit_llvm` → LLVM ORC LLJIT
+- IR text serialized **before** `ir_jit_compile()` (which destroys the context)
+- Full scheduling pipeline on fresh context: def-use → CFG → dominators → loops → GCM → schedule → block ordering
 - Symbol registry (`jit_symbol_registry.h`) for resolving JIT helpers
 - `LLVMOrcAbsoluteSymbols` for registering helper addresses with LLJIT
+- `LLVMVerifyModule` safety net before LLVM codegen
 - LLVM IR dump support (`WASMEDGE_TIER2_DUMP_IR=1`)
 
 ### Phase 3: Background Compilation & Code Replacement -- COMPLETE
@@ -60,11 +68,12 @@ Execution continues (tier-1 or tier-2 transparently)
 - Atomic pointer swap: `FuncTable[idx] = tier2_ptr`
 - Counter saturation on enqueue (`UINT32_MAX` prevents re-triggering)
 
-### Phase 4: Polish & Testing -- IN PROGRESS
+### Phase 4: Polish & Testing -- COMPLETE
 
 - Fixed 8 bugs in `ir_emit_llvm.c` (see `notes/tier2_bug.md`)
-- 4 remaining open bugs (ir backend, not blocking core functionality)
-- Sightglass validation: 37/37 kernels pass at O2 (no regressions)
+- Fixed corrupted ir_ctx root cause (Bugs 9-11) by serializing IR text before tier-1 compile
+- Added `ir_load_safe()` to thirdparty/ir for non-fatal parse error recovery
+- Sightglass validation: 37/37 kernels pass at O2, both baseline and tier-2
 
 ---
 
@@ -84,13 +93,16 @@ Execution continues (tier-1 or tier-2 transparently)
 
 | File | Changes |
 |------|---------|
-| `thirdparty/ir/ir_emit_llvm.c` | 8 bug fixes for LLVM IR emission correctness |
+| `thirdparty/ir/ir_emit_llvm.c` | 8 bug fixes for LLVM IR emission + 3 null-deref fixes for ctx->loader |
+| `thirdparty/ir/ir_load.c` | `ir_load_safe()` — non-fatal parse error recovery via setjmp/longjmp |
+| `thirdparty/ir/ir.h` | Declaration for `ir_load_safe()` |
 | `lib/vm/ir_builder.cpp` | Symbol registry, IR_FUNC migration, fastcall flag, tier-up prologue |
 | `lib/executor/helper.cpp` | `jit_tier_up_notify`, `getTier2Manager` singleton |
-| `lib/executor/instantiate/module.cpp` | Counter allocation, threshold config, IR graph preservation |
+| `lib/executor/instantiate/module.cpp` | Counter allocation, threshold config, IR text passthrough |
 | `include/executor/executor.h` | `IRJitEnvCache` with `CallCounters` and `TierState` |
-| `include/vm/ir_jit_engine.h` | `JitExecEnv` with counter/notify fields, `CompileResult` with `IRGraph` |
-| `include/runtime/instance/function.h` | `IRJitFunction` with `IRGraph` field, `upgradeToIRJit()` |
+| `include/vm/ir_jit_engine.h` | `JitExecEnv` with counter/notify fields, `CompileResult` with `IRText` |
+| `include/runtime/instance/function.h` | `IRJitFunction` with `IRText` field, `upgradeToIRJit()` |
+| `lib/vm/ir_jit_engine.cpp` | Pre-compile IR text snapshot, removed `releaseIRGraph()` |
 | `lib/vm/CMakeLists.txt` | Conditional tier-2 sources, LLVM include dirs |
 
 ---
@@ -109,12 +121,17 @@ The `loaderHasSym` callback always returns `false` — this forces `ir_emit_llvm
 to emit `declare` statements for all external functions, which is required for
 the LLVM parser to resolve them.
 
-### 2. Post-compilation IR graph preservation
+### 2. Pre-compilation IR text serialization
 
-The `ir_ctx` is heap-copied after `ir_jit_compile()` via `detachIRContext()`.
-This is only done when tier-2 is enabled (`Tier2Threshold > 0`), avoiding
-overhead in tier-1-only mode. The copy is stored in
-`IRJitFunction::IRGraph` and freed in the destructor.
+The IR text is serialized via `ir_save()` + `open_memstream()` **before**
+`ir_jit_compile()` (which destructively mutates the ir_ctx). The serialized
+text is stored in `IRJitFunction::IRText` (a `std::string`). This avoids the
+previous approach of preserving a post-compilation ir_ctx pointer, which was
+broken because ir_jit_compile corrupts the context.
+
+The tier-2 compiler reloads the text into a fresh ir_ctx via `ir_load_safe()`
+with custom `ir_loader` callbacks, runs the full GCM scheduling pipeline, then
+emits LLVM IR.
 
 ### 3. Atomic pointer swap for code replacement
 
@@ -389,16 +406,22 @@ No regressions from tier-2 code changes (fastcall flag, symbol registry, etc.).
 
 | Metric | Count |
 |--------|-------|
-| Tier-2 compilations succeeded | 372+ |
-| Tier-2 functions live-swapped | 372+ |
+| Tier-2 compilations succeeded | 152+ |
+| Tier-2 functions live-swapped | 152+ |
 | LLVM IR parse errors | 0 |
-| Kernels passing | 34/37 |
-| Kernels crashing (ir backend) | 3 (blake3-scalar, blind-sig, shootout-nestedloop) |
+| LLVM verification failures | 0 |
+| Kernels passing | 37/37 |
+| Kernels crashing | 0 |
 
-The 3 ir backend crashes are assertion failures in `ir_print_const`,
-`ir_get_str`, and `ir_match_insn` — all within `thirdparty/ir`, triggered
-only during the tier-2 `ir_emit_llvm()` call on the background thread.
-These don't affect tier-1 execution.
+All 37 sightglass kernels pass with tier-2 enabled. The previous 3 failures
+(blake3-scalar, blind-sig, shootout-nestedloop) were caused by using a
+post-`ir_jit_compile` ir_ctx and are fixed by the IR text serialization
+approach.
+
+**Known limitation:** 1 function in rust-compression (func 185) has a
+MERGE with 255 inputs; ir_load's parser has a hard-coded `count > 255`
+limit and rejects it. This single function falls back to tier-1. This is
+an ir backend limitation in `ir_load.c`.
 
 ---
 
@@ -408,10 +431,11 @@ See `notes/tier2_bug.md` for full details. Summary:
 
 | # | Description | Category |
 |---|-------------|----------|
-| 9 | `ir_print_const` assertion with IR_FUNC nodes | ir backend |
-| 10 | `ir_get_str` strtab not preserved after compilation | ir backend |
-| 11 | NIY instruction assertion in ir_emit_llvm | ir backend |
 | 14 | O1 crash with IF/MERGE (pre-existing) | ir backend |
+| — | `ir_load` parser limit: MERGE/PHI with >255 inputs rejected | ir backend |
+
+Bugs 9, 10, 11 were all symptoms of using a corrupted post-`ir_jit_compile`
+ir_ctx — fixed by serializing IR text before compilation.
 
 ---
 
@@ -427,7 +451,7 @@ See `notes/tier2_bug.md` for full details. Summary:
 | 6 | Float constants / inf / NaN formatting | ir_emit_llvm.c |
 | 7 | Missing `x86_fastcallcc` on function def | ir_builder.cpp |
 | 8 | LLVM native target not initialized | tier2_compiler.cpp |
-| 9 | Shift amounts not masked (wasm/LLVM UB mismatch) | ir_emit_llvm.c |
+| 9-11 | Corrupted ir_ctx (ir_print_const, ir_get_str, NIY) | tier2 pipeline redesign |
 | 12 | rust-compression/regex tier-2 segfault (shift UB) | ir_emit_llvm.c |
 | 13 | Static ALLOCA misclassified as dynamic | ir_x86.dasc |
 
@@ -435,17 +459,15 @@ See `notes/tier2_bug.md` for full details. Summary:
 
 ## Next Steps
 
-1. **Fix ir backend bugs** (Bugs 9-11) — contribute patches to dstogov/ir:
-   - Add `IR_FUNC` handling to `ir_print_const()`
-   - Preserve strtab across `ir_jit_compile()`
-   - Implement missing instruction opcodes in `ir_emit_llvm()`
-
-3. **Memory management** — the current LLJIT instances are intentionally leaked.
+1. **Memory management** — the current LLJIT instances are intentionally leaked.
    Implement proper lifetime management in `Tier2Manager` (track LLJIT
    instances, dispose on module unload).
 
-4. **Performance measurement** — compare tier-1 vs tier-2 execution time on
+2. **Performance measurement** — compare tier-1 vs tier-2 execution time on
    long-running sightglass kernels to quantify the optimization benefit.
 
-5. **Threshold tuning** — profile real workloads to find optimal call count
+3. **Threshold tuning** — profile real workloads to find optimal call count
    thresholds. Current defaults (10000/1000) are reasonable starting points.
+
+4. **ir_load parser limit** — contribute patch to dstogov/ir to raise the
+   255-input limit for variable-operand instructions (MERGE/PHI).

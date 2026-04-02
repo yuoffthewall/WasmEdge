@@ -348,13 +348,9 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
           continue;
         }
         // Upgrade function to IR JIT.
-        // Preserve IR graph when tier-2 is enabled (needed for ir_emit_llvm).
-        ir_ctx *PreservedGraph = nullptr;
-        if (Tier2Threshold > 0) {
-          PreservedGraph = IRBuilder.detachIRContext();
-        }
+        // Pass serialized IR text for potential tier-2 LLVM recompilation.
         FuncInst->upgradeToIRJit(CompRes->NativeFunc, CompRes->CodeSize,
-                                 PreservedGraph);
+                                 std::move(CompRes->IRText));
         SuccessCount++;
       }
       CodeIdx++;

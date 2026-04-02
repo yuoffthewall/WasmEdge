@@ -139,9 +139,24 @@ IRJitEngine::compile(ir_ctx *Ctx) {
     if (f) { ir_save(Ctx, 0, f); fclose(f); }
   }
 
+  // Snapshot IR text BEFORE ir_jit_compile (which mutates the context).
+  // Tier-2 reloads this text into a fresh ir_ctx for LLVM emission.
+  std::string IRText;
+  {
+    char *buf = nullptr;
+    size_t len = 0;
+    FILE *memf = open_memstream(&buf, &len);
+    if (memf) {
+      ir_save(Ctx, 0, memf);
+      fclose(memf);
+      if (buf && len > 0) {
+        IRText.assign(buf, len);
+      }
+      free(buf);
+    }
+  }
+
   size_t CodeSize = 0;
-  // void *NativeCode = safeIrJitCompile(Ctx, opt_level, &CodeSize);
-  // Not using Signal Handler for now to expose the failure.
   void *NativeCode = ir_jit_compile(Ctx, opt_level, &CodeSize);
 
   if (!NativeCode) {
@@ -169,7 +184,7 @@ IRJitEngine::compile(ir_ctx *Ctx) {
   CompileResult Result;
   Result.NativeFunc = NativeCode;
   Result.CodeSize = CodeSize;
-  Result.IRGraph = Ctx; // Preserve for potential tier-up
+  Result.IRText = std::move(IRText);
 
   return Result;
 }
@@ -264,11 +279,6 @@ void IRJitEngine::release(void *NativeFunc, size_t) noexcept {
   }
 }
 
-void IRJitEngine::releaseIRGraph(ir_ctx *Ctx) noexcept {
-  if (Ctx) {
-    ir_free(Ctx);
-  }
-}
 
 void *IRJitEngine::allocateExecutable(size_t Size) {
   // Allocate memory with read-write permissions initially (W^X compliant)

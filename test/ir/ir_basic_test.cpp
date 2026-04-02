@@ -647,7 +647,7 @@ TEST(IRJitEngineTest, CompileSimpleArithmetic) {
   if (CompRes) {
     ASSERT_NE(CompRes.value().NativeFunc, nullptr);
     ASSERT_GT(CompRes.value().CodeSize, 0);
-    ASSERT_NE(CompRes.value().IRGraph, nullptr);
+    ASSERT_FALSE(CompRes.value().IRText.empty());
 
     // Clean up
     Engine.release(CompRes.value().NativeFunc, CompRes.value().CodeSize);

@@ -8,12 +8,13 @@
 #include "vm/jit_symbol_registry.h"
 #include <spdlog/spdlog.h>
 
-// dstogov/ir headers
+// dstogov/ir headers (for loading serialized IR text)
 extern "C" {
 #include "ir.h"
 }
 
 // LLVM C API headers
+#include <llvm-c/Analysis.h>
 #include <llvm-c/Core.h>
 #include <llvm-c/IRReader.h>
 #include <llvm-c/LLJIT.h>
@@ -24,7 +25,6 @@ extern "C" {
 #include <llvm-c/Transforms/PassBuilder.h>
 
 #include <cstdio>
-#include <cstring>
 #include <string>
 #include <vector>
 
@@ -40,10 +40,101 @@ Tier2Compiler::Tier2Compiler() noexcept : P(std::make_unique<Impl>()) {
 Tier2Compiler::~Tier2Compiler() noexcept = default;
 
 // ---------------------------------------------------------------------------
-// Emit LLVM IR text from ir_ctx* via ir_emit_llvm → open_memstream.
+// Minimal ir_loader callbacks for reloading serialized IR text.
+// The loader only needs func_init (to ir_init the context) and func_process
+// (to capture the parsed result).  All other callbacks are optional.
 // ---------------------------------------------------------------------------
+struct Tier2Loader {
+  ir_loader Base;
+  ir_ctx *Result; // Set by func_process — the caller must ir_free + delete.
+};
+
+static bool tier2_func_init(ir_loader *loader, ir_ctx *ctx, const char *) {
+  (void)loader;
+  ir_init(ctx, IR_FUNCTION | IR_OPT_FOLDING, IR_CONSTS_LIMIT_MIN,
+          IR_INSNS_LIMIT_MIN);
+  return true;
+}
+
+static bool tier2_func_process(ir_loader *loader, ir_ctx *ctx, const char *) {
+  auto *L = reinterpret_cast<Tier2Loader *>(loader);
+
+  // ir_save doesn't encode ret_type; ir_load sets it to -1 (unset).
+  // Infer it from the RETURN instruction's operand type.
+  if (ctx->ret_type == static_cast<ir_type>(-1)) {
+    for (ir_ref i = 1; i < ctx->insns_count; i++) {
+      ir_insn *insn = &ctx->ir_base[i];
+      if (insn->op == IR_RETURN && insn->op2) {
+        ctx->ret_type = static_cast<ir_type>(ctx->ir_base[insn->op2].type);
+        break;
+      }
+    }
+  }
+
+  // Shallow-copy the ctx so that ir_load's subsequent ir_free(&ctx) doesn't
+  // destroy the data we need.  We null the original's pointers to prevent
+  // double-free.
+  auto *Copy = new (std::nothrow) ir_ctx;
+  if (!Copy)
+    return false;
+  std::memcpy(Copy, ctx, sizeof(ir_ctx));
+  // Zero the original so ir_free in ir_load.c is a no-op.
+  std::memset(ctx, 0, sizeof(ir_ctx));
+  L->Result = Copy;
+  return true;
+}
+
+static bool tier2_external_func_dcl(ir_loader *, const char *, uint32_t,
+                                     ir_type, uint32_t, const uint8_t *) {
+  return true; // Accept all external function declarations.
+}
+
+static bool tier2_external_sym_dcl(ir_loader *, const char *, uint32_t) {
+  return true;
+}
+
+/// Load serialized IR text into a fresh ir_ctx.  Caller owns the returned
+/// ir_ctx and must ir_free + delete it.
+static ir_ctx *loadIRText(const std::string &IRText) {
+  ir_loader_init();
+
+  Tier2Loader L{};
+  L.Base.default_func_flags = IR_FUNCTION | IR_OPT_FOLDING;
+  L.Base.func_init = tier2_func_init;
+  L.Base.func_process = tier2_func_process;
+  L.Base.external_func_dcl = tier2_external_func_dcl;
+  L.Base.external_sym_dcl = tier2_external_sym_dcl;
+  L.Result = nullptr;
+
+  FILE *F = fmemopen(const_cast<char *>(IRText.data()), IRText.size(), "r");
+  if (!F) {
+    ir_loader_free();
+    return nullptr;
+  }
+
+  ir_load_safe(&L.Base, F);
+  fclose(F);
+  ir_loader_free();
+
+  return L.Result;
+}
+
+/// Convert a dstogov/ir ir_ctx* to LLVM IR text via ir_emit_llvm.
+/// Runs the full scheduling pipeline (GCM + schedule + block ordering) on a
+/// fresh context so that instructions are placed in dominating blocks.
 static bool emitLLVMIR(ir_ctx *Ctx, const std::string &FuncName,
                        std::string &OutIR) {
+  ir_build_def_use_lists(Ctx);
+  if (!ir_build_cfg(Ctx)
+   || !ir_build_dominators_tree(Ctx)
+   || !ir_find_loops(Ctx)
+   || !ir_gcm(Ctx)
+   || !ir_schedule(Ctx)
+   || !ir_schedule_blocks(Ctx)) {
+    spdlog::error("tier2: IR scheduling passes failed for {}", FuncName);
+    return false;
+  }
+
   char *Buf = nullptr;
   size_t BufSize = 0;
   FILE *MemStream = open_memstream(&Buf, &BufSize);
@@ -101,17 +192,31 @@ static void registerSymbolsWithLLJIT(LLVMOrcLLJITRef J) {
 // ---------------------------------------------------------------------------
 // Tier2Compiler::compile
 // ---------------------------------------------------------------------------
-Expect<Tier2CompileResult> Tier2Compiler::compile(ir_ctx *Ctx,
+Expect<Tier2CompileResult> Tier2Compiler::compile(const std::string &IRTextIn,
                                                    const std::string &FuncName,
                                                    unsigned OptLevel) {
-  // 1. Emit LLVM IR text from the ir_ctx* graph.
+  if (IRTextIn.empty()) {
+    spdlog::warn("tier2: empty IR text for {}", FuncName);
+    return Unexpect(ErrCode::Value::RuntimeError);
+  }
+
+  // 1. Reload IR text into a fresh ir_ctx, then emit LLVM IR from it.
+  ir_ctx *Ctx = loadIRText(IRTextIn);
+  if (!Ctx) {
+    spdlog::warn("tier2: failed to reload IR text for {}", FuncName);
+    return Unexpect(ErrCode::Value::RuntimeError);
+  }
+
   std::string IRText;
-  if (!emitLLVMIR(Ctx, FuncName, IRText)) {
+  bool EmitOk = emitLLVMIR(Ctx, FuncName, IRText);
+  ir_free(Ctx);
+  ::operator delete(Ctx);
+
+  if (!EmitOk) {
     return Unexpect(ErrCode::Value::RuntimeError);
   }
 
   if (std::getenv("WASMEDGE_TIER2_DUMP_IR")) {
-    // Write to /tmp for inspection (spdlog may truncate).
     std::string DumpPath = "/tmp/tier2_" + FuncName + ".ll";
     if (FILE *F = fopen(DumpPath.c_str(), "w")) {
       fwrite(IRText.data(), 1, IRText.size(), F);
@@ -136,6 +241,21 @@ Expect<Tier2CompileResult> Tier2Compiler::compile(ir_ctx *Ctx,
     LLVMDisposeMessage(ErrMsg);
     LLVMOrcDisposeThreadSafeContext(TSCtx);
     return Unexpect(ErrCode::Value::RuntimeError);
+  }
+
+  // 2b. Verify the LLVM IR module. ir_emit_llvm can produce domination errors
+  //     or other invalid IR that would crash LLVM's codegen.
+  {
+    char *VerifyMsg = nullptr;
+    if (LLVMVerifyModule(Mod, LLVMReturnStatusAction, &VerifyMsg)) {
+      spdlog::warn("tier2: LLVM verification failed for {}: {}", FuncName,
+                    VerifyMsg ? VerifyMsg : "(null)");
+      LLVMDisposeMessage(VerifyMsg);
+      LLVMDisposeModule(Mod);
+      LLVMOrcDisposeThreadSafeContext(TSCtx);
+      return Unexpect(ErrCode::Value::RuntimeError);
+    }
+    LLVMDisposeMessage(VerifyMsg);
   }
 
   // 3. Run LLVM optimization passes.

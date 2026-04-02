@@ -83,15 +83,14 @@ void Tier2Manager::workerLoop() {
     }
 
     const auto &JitFunc = FuncInst->getIRJitFunc();
-    ir_ctx *Ctx = JitFunc.IRGraph;
-    if (!Ctx) {
-      spdlog::warn("tier2: func {} has no preserved IR graph", Req.FuncIdx);
+    if (JitFunc.IRText.empty()) {
+      spdlog::warn("tier2: func {} has no preserved IR text", Req.FuncIdx);
       continue;
     }
 
-    // Compile with LLVM.
+    // Load IR text → ir_ctx → LLVM IR → optimize → native code.
     std::string FuncName = fmt::format("wasm_tier2_{:03d}", Req.FuncIdx);
-    auto Result = Compiler.compile(Ctx, FuncName, 2);
+    auto Result = Compiler.compile(JitFunc.IRText, FuncName, 2);
     if (!Result) {
       spdlog::warn("tier2: compilation failed for func {} ({})", Req.FuncIdx,
                     FuncName);
