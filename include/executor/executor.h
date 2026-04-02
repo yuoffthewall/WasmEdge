@@ -1209,6 +1209,10 @@ private:
     std::vector<void *> FuncTable;
     std::vector<ValVariant *> GlobalPtrs;
     void *MemoryBase = nullptr;
+    /// Tier-2 profiling: per-function call counters.
+    std::vector<uint32_t> CallCounters;
+    /// Tier-2 state: 0=tier1, 1=enqueued, 2=tier2.
+    std::vector<uint8_t> TierState;
   };
   mutable std::unordered_map<const Runtime::Instance::ModuleInstance *,
                              IRJitEnvCache>

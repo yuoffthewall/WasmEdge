@@ -1,0 +1,434 @@
+# Tier-2 Bugs (ir backend & WasmEdge)
+
+Bugs discovered during tier-2 LLVM recompilation pipeline development.
+Bugs in `thirdparty/ir` are logged but fixed in-place (not deferred) per user request.
+
+---
+
+## Bug 1: `ir_emit_llvm` emits `zext i32 to ptr` instead of `inttoptr` — FIXED
+
+**Date:** 2026-04-03
+**Status:** Fixed
+**Location:** `thirdparty/ir/ir_emit_llvm.c`, `IR_ZEXT` / `IR_SEXT` / `IR_TRUNC` cases (~line 1149)
+**Category:** ir backend bug
+
+**Root cause:** The `IR_ZEXT` handler unconditionally emitted `zext` regardless
+of whether the target type is a pointer. In the dstogov/ir type system,
+`IR_ADDR` (pointer) satisfies `IR_IS_TYPE_INT()` because it's defined as
+`uintptr_t` — so the integer-only guards don't catch it. LLVM IR's `zext` only
+works between integer types; `i32 → ptr` requires `inttoptr`.
+
+**Reproduction:**
+```
+WASMEDGE_SIGHTGLASS_KERNEL=quicksort WASMEDGE_TIER2_ENABLE=1 \
+WASMEDGE_TIER2_THRESHOLD=10 WASMEDGE_TIER2_DUMP_IR=1 \
+WASMEDGE_SIGHTGLASS_MODE=IR_JIT WASMEDGE_IR_JIT_OPT_LEVEL=2 \
+./test/ir/wasmedgeIRBenchmarkTests --gtest_filter='*SightglassSuite*'
+```
+Check `/tmp/tier2_wasm_tier2_*.ll` for the pattern `zext i32 ... to ptr`.
+
+**Example (from `wasm_tier2_019.ll:39`):**
+```llvm
+%d32 = sub i32 %d29, 4
+%d33 = zext i32 %d32 to ptr       ; <-- INVALID
+```
+**Expected:** `%d33 = inttoptr i32 %d32 to ptr`
+
+**Fix:** In the `IR_ZEXT`, `IR_SEXT`, and `IR_TRUNC` cases, added checks:
+- If target is `IR_ADDR` and source is not `IR_ADDR` → emit `inttoptr`
+- If source is `IR_ADDR` and target is not `IR_ADDR` → emit `ptrtoint`
+- Otherwise → emit original instruction (`zext`/`sext`/`trunc`)
+
+**Impact:** All tier-2 compilations for wasm functions using memory (nearly all)
+would fail to parse. This was the first and most common error.
+
+---
+
+## Bug 2: Empty blocks skipped but still referenced by PHI nodes — FIXED
+
+**Date:** 2026-04-03
+**Status:** Fixed
+**Location:** `thirdparty/ir/ir_emit_llvm.c`, block iteration loop (~line 1014),
+  `ir_emit_phi()` (~line 363), `ir_emit_if()` (~line 647), END/LOOP_END (~line 1253),
+  `ir_emit_switch()` (~line 700, 732)
+**Category:** ir backend bug
+
+**Root cause:** Two mechanisms in `ir_emit_llvm` are inconsistent:
+
+1. **Block emission** (line 1014): Blocks with `IR_BB_EMPTY` flag are skipped
+   entirely — no label, no instructions.
+2. **Branch emission**: `ir_skip_empty_target_blocks()` is called to redirect
+   branches past empty blocks. E.g., `br i1 %cond, label %l15, label %l14`
+   instead of `br i1 %cond, label %l13, label %l14` (where l13 is empty).
+3. **PHI emission** (line 363): PHI nodes use raw predecessor block numbers
+   from `ctx->cfg_edges`, which still reference the empty block.
+
+Result: PHI at `%l15` says `phi i32 [%d51, %l13]` but block `l13` doesn't exist
+in the output, and no branch targets `l13`. LLVM verifier rejects this with
+"PHINode should have one entry for each predecessor of its parent basic block".
+
+**Fix:** Three coordinated changes:
+1. **Emit all empty blocks** as trivial jumps: `l13: br label %l15`
+2. **Stop using `ir_skip_empty_target_blocks()`** in the LLVM emitter. Branches
+   now target the original block (including empty ones).
+   - Added `ir_get_true_false_blocks_noskip()` — identical to
+     `ir_get_true_false_blocks()` but without the skip call.
+   - Removed the skip call in switch default/case emission (lines 700, 732).
+   - Removed the skip call in END/LOOP_END emission (line 1253).
+3. **PHI emission unchanged** — raw predecessors are now correct because the
+   empty blocks exist in the output.
+
+LLVM's optimization passes trivially eliminate the extra jumps during tier-2
+compilation, so there is no performance cost.
+
+---
+
+## Bug 3: Malformed `select` for non-boolean conditions — FIXED
+
+**Date:** 2026-04-03
+**Status:** Fixed
+**Location:** `thirdparty/ir/ir_emit_llvm.c`, `ir_emit_conditional_op()` (~line 567)
+**Category:** ir backend bug
+
+**Root cause:** `ir_emit_conditional_op()` unconditionally called
+`ir_emit_def_ref(ctx, f, def)` first (which prints `\t%d{N} = `), then for
+non-boolean conditions branched into code that emits a comparison instruction
+*on a new line* (`\t%t{N} = icmp ne ...\n`), followed by the select.
+
+This produced:
+```
+\t%d404 = \t%t404 = icmp ne i32 %d396, 0
+select i1 %t404, i32 -1, i32 %d403
+```
+Two assignment operators on one line, then `select` on the next with no
+assignment. Both are invalid LLVM IR.
+
+**Expected:**
+```
+\t%t404 = icmp ne i32 %d396, 0
+\t%d404 = select i1 %t404, i32 -1, i32 %d403
+```
+
+**Fix:** For non-boolean conditions (integer and float), moved
+`ir_emit_def_ref()` to AFTER the comparison instruction. The comparison is
+emitted first as a standalone instruction, then the select with its own
+assignment.
+
+---
+
+## Bug 4: `llvm.cttz`/`llvm.ctlz` second arg missing `i1` type — FIXED
+
+**Date:** 2026-04-03
+**Status:** Fixed
+**Location:** `thirdparty/ir/ir_emit_llvm.c`, `ir_emit_bitop()` (~line 527)
+**Category:** ir backend bug
+
+**Root cause:** `ir_emit_bitop()` emitted the "is_zero_poison" parameter as
+bare `0` instead of `i1 0`. LLVM intrinsic `@llvm.cttz.i32(i32, i1)` requires
+a typed second argument. Without the type, the LLVM parser sees `0` at argument
+position and expects a type annotation.
+
+**Example:**
+```llvm
+%d300 = call i32 @llvm.cttz.i32(i32 %d198, 0)    ; INVALID
+%d300 = call i32 @llvm.cttz.i32(i32 %d198, i1 0)  ; CORRECT
+```
+
+**Fix:** Changed `fprintf(f, ", 0")` to `fprintf(f, ", i1 0")` in the `poison`
+branch of `ir_emit_bitop()`.
+
+**Impact:** 30 functions across multiple kernels (blind-sig, bz2, etc.) failed
+tier-2 parse. This was the second most common error after Bug 1.
+
+---
+
+## Bug 5: `bitcast i1 to i8` — invalid cast between different-width types — FIXED
+
+**Date:** 2026-04-03
+**Status:** Fixed
+**Location:** `thirdparty/ir/ir_emit_llvm.c`, `IR_BITCAST` handler (~line 1224)
+**Category:** ir backend bug
+
+**Root cause:** The `IR_BITCAST` handler only checked for `IR_ADDR` conversions
+(inttoptr/ptrtoint). For all other cases, it emitted `bitcast`. But LLVM's
+`bitcast` requires source and destination to have the same bit width. `i1` (1
+bit) to `i8` (8 bits) is not valid for bitcast.
+
+In the dstogov/ir type system, `IR_BOOL` has `ir_type_size == 1` (byte) and
+`IR_I8`/`IR_U8` also have `ir_type_size == 1` (byte). So a simple size check
+`ir_type_size[src] != ir_type_size[dst]` does NOT catch this case — they appear
+same-sized despite being `i1` vs `i8` in LLVM.
+
+**Example (from `wasm_tier2_349.ll:3512`):**
+```llvm
+%d2880 = bitcast i1 %d2879 to i8   ; INVALID
+%d2880 = zext i1 %d2879 to i8      ; CORRECT
+```
+
+**Fix:** Extended the `IR_BITCAST` handler with a new branch:
+```c
+else if (IR_IS_TYPE_INT(insn->type) && IR_IS_TYPE_INT(src_type)
+         && (ir_type_size[insn->type] != ir_type_size[src_type]
+             || insn->type == IR_BOOL || src_type == IR_BOOL))
+```
+- If target is `IR_BOOL` → emit `trunc`
+- If source is `IR_BOOL` → emit `zext`
+- If target wider → `zext`; narrower → `trunc`
+
+---
+
+## Bug 6: Float constants and special values not round-tripping — FIXED
+
+**Date:** 2026-04-03
+**Status:** Fixed
+**Location:** `thirdparty/ir/ir_emit_llvm.c`, float constant emission (~line 291–323)
+**Category:** ir backend bug (two sub-issues)
+
+### Bug 6a: Float constant precision loss
+
+**Root cause:** Float constants (`IR_FLOAT`) were emitted using C `%e` format
+(6 significant digits). LLVM IR requires that float constants round-trip exactly
+when parsed as double and truncated to float. `%e` doesn't guarantee this —
+`1.700000e+38` may not convert back to the same 32-bit float value.
+
+**Fix:** All float constants (except `0.0` and `NaN`) now use hex-double
+format: `0x%016PRIX64`. The float is promoted to double, then the double's raw
+IEEE 754 bits are printed in hex. This is the canonical LLVM approach.
+
+### Bug 6b: Double infinity/NaN emitted as text
+
+**Root cause:** `fprintf(f, "%e", d)` on `±inf` produces the text `inf` or
+`-inf`, which LLVM IR doesn't accept as constant syntax. Similarly, `nan` was
+emitted via `fprintf(f, "nan")` which is also invalid.
+
+**Example:**
+```llvm
+%d1592 = fcmp olt double %d1584, inf   ; INVALID
+%d1592 = fcmp olt double %d1584, 0x7FF0000000000000  ; CORRECT
+```
+
+**Fix:** Combined `isnan(d)` and `isinf(d)` into a single check that emits hex
+format for all special FP values. Also fixed `log10(d)` → `log10(fabs(d))` to
+avoid NaN when `d` is negative.
+
+---
+
+## Bug 7: Function definition missing `x86_fastcallcc` — FIXED
+
+**Date:** 2026-04-03
+**Status:** Fixed
+**Location:** `lib/vm/ir_builder.cpp`, `initialize()` (~line 293)
+**Category:** WasmEdge bug (our code)
+
+**Root cause:** The ir_ctx was initialized with:
+```c
+uint32_t ir_flags = IR_FUNCTION;
+```
+This omits the calling convention flag. `ir_emit_llvm()` reads
+`ctx->flags & IR_CALL_CONV_MASK` to emit the function definition's calling
+convention. Without `IR_CC_FASTCALL` (0x02), the function definition gets
+no calling convention annotation — defaulting to the C calling convention.
+
+Meanwhile, tier-1 callers (generated by `ir_jit_compile`) use `x86_fastcallcc`
+because all prototypes are created with `IR_FASTCALL_FUNC`. On x86-64 Linux:
+- **C convention:** args in `rdi`, `rsi`, `rdx`, `rcx`
+- **fastcall:** first two integer args in `ecx`, `edx`
+
+When tier-2 code (C convention) replaced a tier-1 function (called with fastcall),
+the function read `env` from `rdi` instead of `ecx`, getting garbage — segfault.
+
+**Fix:** Changed to `IR_FUNCTION | IR_FASTCALL_FUNC`.
+
+**Impact:** Caused segfaults in any kernel that executed tier-2 compiled code.
+Affected `shootout-ackermann` and `rust-compression` (though rust-compression
+has additional issues — see Bug 11).
+
+---
+
+## Bug 8: LLVM native target not initialized — FIXED
+
+**Date:** 2026-04-03
+**Status:** Fixed
+**Location:** `lib/vm/tier2_compiler.cpp`, `Tier2Compiler` constructor (~line 36)
+**Category:** WasmEdge bug (our code)
+
+**Root cause:** `LLVMOrcCreateLLJIT()` requires LLVM's native target to be
+registered. Without calling `LLVMInitializeNativeTarget()`,
+`LLVMInitializeNativeAsmPrinter()`, and `LLVMInitializeNativeAsmParser()`, ORC
+LLJIT fails with `"Unable to find target for this triple (no targets are registered)"`.
+
+**Fix:** Added all three initialization calls to `Tier2Compiler()` constructor.
+
+---
+
+## Bug 9: `ir_print_const` assertion with IR_FUNC nodes — OPEN
+
+**Date:** 2026-04-03
+**Status:** Open (ir backend bug)
+**Location:** `thirdparty/ir/ir.c:137`
+
+**Root cause:** `ir_print_const()` asserts:
+```c
+IR_ASSERT(((insn->op) > IR_NOP && (insn->op) <= IR_C_FLOAT)
+          || insn->op == IR_FUNC_ADDR);
+```
+When the ir_ctx contains `IR_FUNC` nodes (named function constants created by
+`ir_const_func()`), this assertion fires because it only expects `IR_FUNC_ADDR`.
+`IR_FUNC` is a different opcode used by the ir_loader mechanism for named symbol
+resolution.
+
+Our tier-1 builder migrated from `ir_const_func_addr()` to `ir_const_func()`
+to support `ir_emit_llvm()` (which requires named symbols for `declare`
+statements). The backend's `ir_print_const()` was never updated for this path.
+
+**Affected kernel:** blake3-scalar — crashes in the tier-2 background thread
+during `ir_emit_llvm()`.
+
+**Workaround:** None. The ir backend's `ir_print_const()` needs an `IR_FUNC` case.
+
+---
+
+## Bug 10: `ir_get_str` assertion — strtab not preserved after compilation — OPEN
+
+**Date:** 2026-04-03
+**Status:** Open (ir backend bug)
+**Location:** `thirdparty/ir/ir.c:723`
+
+**Root cause:** `ir_get_str()` asserts `ctx->strtab.data != NULL`. When
+`ir_emit_llvm()` encounters an `IR_FUNC` node, it calls `ir_get_str()` to
+retrieve the function name. But after `ir_jit_compile()`, the strtab may have
+been freed during internal optimization/cleanup passes.
+
+Our tier-2 pipeline calls `ir_emit_llvm()` on a **post-compilation** ir_ctx
+(one that has already been through `ir_jit_compile()`). The ir library was not
+designed for this use case — `ir_emit_llvm()` was intended to run BEFORE
+compilation, not after.
+
+**Affected kernel:** shootout-nestedloop.
+
+**Possible fix:** Deep-copy the strtab before `ir_jit_compile()`, or modify
+`ir_jit_compile()` to preserve it. Alternatively, snapshot the ir_ctx BEFORE
+compilation rather than after (would require refactoring the pipeline).
+
+---
+
+## Bug 11: `NIY instruction` assertion in ir_emit_llvm — OPEN
+
+**Date:** 2026-04-03
+**Status:** Open (ir backend bug)
+**Location:** `thirdparty/ir/ir_emit_llvm.c:1380`
+
+**Root cause:** The switch statement in `ir_emit_func()` has a default case:
+```c
+default:
+    IR_ASSERT(0 && "NIY instruction");
+```
+Some IR instruction opcodes generated by the ir optimizer (e.g., SCCP, codegen)
+are not implemented in the LLVM emitter. This is expected — `ir_emit_llvm` was
+likely developed alongside a subset of IR opcodes and never fully completed.
+
+**Affected kernels:** Various (encountered during tier-2 background compilation).
+
+**Possible fix:** Implement the missing instruction handlers in ir_emit_llvm.c.
+Requires identifying which opcodes are unhandled (log the `insn->op` value
+before the assert).
+
+---
+
+## Bug 12: rust-compression segfault with tier-2 compiled code — FIXED
+
+**Date:** 2026-04-03
+**Status:** Fixed
+**Location:** `thirdparty/ir/ir_emit_llvm.c` — SHL/SHR/SAR emission
+**Category:** ir_emit_llvm semantic bug (wasm/LLVM shift semantics mismatch)
+
+**Root cause:** `ir_emit_llvm` emitted shift operations (`shl`, `lshr`, `ashr`)
+without masking the shift amount. WebAssembly defines all shifts as modular
+(shift amount taken mod bit-width), and x86 hardware naturally masks shift
+counts (mod 64 for 64-bit, mod 32 for 32-bit). So tier-1 native code worked
+correctly even with shift amounts >= bit-width.
+
+However, LLVM IR defines shifts by >= bit-width as producing **poison** (undefined
+behavior). At O2, LLVM's optimizer exploits this: it sees a shift amount that is
+provably >= 64 and replaces the result with `undef` or optimizes away dependent
+code. This caused a tier-2 compiled function (func 239 in rust-compression) to
+produce wrong output values, leading to incorrect control flow downstream that
+eventually called a NULL FuncTable entry (func 487, a non-JIT-compiled function).
+
+**Specific example:** In function 239, `ir_ctx` constant `c_28 = 4294967295`
+(= 0xFFFFFFFF, used as both a shift delta and a 32-bit mask):
+```
+d_65 = ADD(d_64, 4294967295)   ; d_64 in [0,63], so d_65 > 4 billion
+d_66 = SHR(d_60, d_65)         ; shift by >64 bits = LLVM UB!
+```
+Tier-1 (x86): `SHR reg, cl` masks to `(d_64 + 0xFFFFFFFF) & 63 = d_64 - 1`. Correct.
+Tier-2 (LLVM O2): shift by > 64 → poison → wrong results → crash.
+
+**Fix:** Added `ir_emit_shift_op()` in `ir_emit_llvm.c` that emits an `and`
+instruction to mask the shift amount before the shift:
+- Constant shift amounts: mask folded at emit time
+- Variable shift amounts: `%masked = and iN %amt, (bits-1)` emitted before shift
+
+This also fixed the `regex` kernel crash (same root cause, different function).
+
+**Impact:** rust-compression and regex now pass with tier-2. Tier-2 results
+improved from 33/37 to 34/37.
+
+---
+
+## Bug 13: Static ALLOCA misclassified as dynamic when not in BB1 — FIXED
+
+**Date:** 2026-04-03
+**Status:** Fixed
+**Location:** `thirdparty/ir/ir_x86.dasc`, line ~2698 (`ir_match`, `IR_ALLOCA` case)
+**Category:** ir backend bug
+
+**Root cause:** The `ir_match` pass classifies an `ALLOCA` as `IR_STATIC_ALLOCA`
+(compiled as a fixed prologue stack expansion) **only if it is in basic block 1**
+(`cfg_map[ref] == 1`). If the ALLOCA is in any other block, the library falls
+through to set `IR_USE_FRAME_POINTER` and treat it as a dynamic alloca.
+
+The tier-up counter instrumentation emits an `IF/MERGE` in the prologue (counter
+check + conditional call to `jit_tier_up_notify`). Everything after the MERGE —
+including parameter loads and the wasm body's `ALLOCA` — gets a control dependency
+on the MERGE, pushing the ALLOCA into **BB4** (after SCCP/GCM scheduling).
+
+Since `cfg_map[alloca_ref] == 4 != 1`, the ALLOCA is classified as dynamic. The
+library then sets `IR_USE_FRAME_POINTER` (uses `rbp` as frame pointer instead of
+a general-purpose register), which cascades into a completely different register
+allocation that produces **incorrect machine code** for certain functions.
+
+**Symptoms:**
+| Opt level | Behavior |
+|-----------|----------|
+| O0 | Correct output |
+| O1 | SIGSEGV crash |
+| O2 | Silent wrong output (brotli compressed 168242 vs expected 167110) |
+
+Only 1 of 637 functions in `rust-compression.wasm` was affected (function 83).
+Isolated via binary search using `WASMEDGE_IFMERGE_MIN`/`MAX` env-var cutoff.
+
+**Fix:** Relax the static ALLOCA check from "must be in BB1" to "must be in a
+non-loop block" (`b == 1 || (b > 0 && ctx->cfg_blocks[b].loop_depth == 0)`).
+A constant-size ALLOCA in a non-loop block executes exactly once per function
+invocation, so it is safe to compile as a static prologue stack expansion.
+
+**Verification:** After the fix, the standalone `ir` tool produces identical
+assembly for func 83 with and without IF/MERGE. The `rust-compression` sightglass
+kernel passes at O2 with all functions using IF/MERGE.
+
+See `notes/static_alloca_frame_pointer_bug.md` for full debugging methodology.
+
+---
+
+## Bug 14 (known, pre-existing): O1 crash with IF/MERGE in prologue
+
+**Date:** 2026-04-03
+**Status:** Open (pre-existing ir backend bug)
+
+**Description:**
+`rust-compression` crashes at O1 with IF/MERGE in the prologue (tier-up counter
+check). O1 does not run SCCP. Not related to the ALLOCA classification issue
+(Bug 13). Separate root cause.
+
+**Workaround:** Skip O1 when testing (per project rules).

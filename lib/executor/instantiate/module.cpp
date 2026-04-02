@@ -171,6 +171,24 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
         ImportFuncNum++;
       }
     }
+    // Tier-2: read tier-up thresholds from env vars.
+    uint32_t Tier2Threshold = 0;
+    uint32_t Tier2LoopThreshold = 0;
+    if (const char *E = std::getenv("WASMEDGE_TIER2_ENABLE")) {
+      if (E[0] == '1' && E[1] == '\0') {
+        Tier2Threshold = 10000;
+        Tier2LoopThreshold = 1000;
+        if (const char *T = std::getenv("WASMEDGE_TIER2_THRESHOLD")) {
+          Tier2Threshold = static_cast<uint32_t>(std::atoi(T));
+        }
+        if (const char *T = std::getenv("WASMEDGE_TIER2_LOOP_THRESHOLD")) {
+          Tier2LoopThreshold = static_cast<uint32_t>(std::atoi(T));
+        }
+        spdlog::debug("IR JIT tier-2 enabled: threshold={}, loop_threshold={}",
+                      Tier2Threshold, Tier2LoopThreshold);
+      }
+    }
+
     const auto &CodeSegs = CodeSec.getContent();
     // ----------------------------------------------------------------
     // Pre-pass: determine which functions are safe to JIT-compile.
@@ -258,7 +276,22 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
       {
         // Build IR
         IRBuilder.reset();
-        
+        IRBuilder.setFuncIdx(FuncIdx);
+
+        // Tier-2: set call-counter threshold if tier-2 is enabled.
+        // Pre-scan for loops to choose threshold.
+        if (Tier2Threshold > 0) {
+          bool FuncHasLoop = false;
+          for (const auto &I : InstrVec) {
+            if (I.getOpCode() == OpCode::Loop) {
+              FuncHasLoop = true;
+              break;
+            }
+          }
+          IRBuilder.setTierUpThreshold(
+              FuncHasLoop ? Tier2LoopThreshold : Tier2Threshold);
+        }
+
         auto InitRes = IRBuilder.initialize(FuncType, Locals);
         if (!InitRes.has_value()) {
           InitFailCount++;
@@ -314,9 +347,14 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
           FuncIdx++;
           continue;
         }
-        // Upgrade function to IR JIT
+        // Upgrade function to IR JIT.
+        // Preserve IR graph when tier-2 is enabled (needed for ir_emit_llvm).
+        ir_ctx *PreservedGraph = nullptr;
+        if (Tier2Threshold > 0) {
+          PreservedGraph = IRBuilder.detachIRContext();
+        }
         FuncInst->upgradeToIRJit(CompRes->NativeFunc, CompRes->CodeSize,
-                                 nullptr);  // Don't preserve IR graph for now
+                                 PreservedGraph);
         SuccessCount++;
       }
       CodeIdx++;

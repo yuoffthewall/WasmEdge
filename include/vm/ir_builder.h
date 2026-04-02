@@ -69,6 +69,15 @@ public:
   /// Used to pre-allocate a shared args buffer in the function prologue.
   void setMaxCallArgs(uint32_t N) noexcept { MaxCallArgs = N; }
 
+  /// Set the function index within the module (used for tier-up counter offset).
+  void setFuncIdx(uint32_t Idx) noexcept { FuncIdx = Idx; }
+
+  /// Set the tier-up call count threshold. 0 disables counter instrumentation.
+  void setTierUpThreshold(uint32_t T) noexcept { TierUpThreshold = T; }
+
+  /// After buildFromInstructions(), returns true if the function contains loops.
+  bool hasLoop() const noexcept { return HasLoop; }
+
   /// Set module types from the type section (indexed by type index).
   /// Used for call_indirect type resolution.
   void setModuleTypes(Span<const AST::FunctionType *> Types) noexcept {
@@ -86,6 +95,11 @@ public:
 
   /// Finalize and get the IR context
   ir_ctx *getIRContext() noexcept { return &Ctx; }
+
+  /// Detach the IR context: heap-allocates a copy that the caller owns.
+  /// The caller must call ir_free() + delete on the returned pointer.
+  /// Returns nullptr if not initialized.
+  ir_ctx *detachIRContext() noexcept;
 
   /// Reset the builder for a new function
   void reset() noexcept;
@@ -257,6 +271,13 @@ private:
   
   // Module-level information for globals
   std::vector<ValType> ModuleGlobalTypes;  // Types of all module globals
+
+  // Tier-2 profiling
+  uint32_t FuncIdx = 0;           // Module function index (for counter offset)
+  uint32_t TierUpThreshold = 0;   // Call count threshold (0 = disabled)
+  bool HasLoop = false;           // Set during buildFromInstructions if Loop opcode seen
+  ir_ref CallCountersPtr;         // Loaded from JitExecEnv::CallCounters
+  ir_ref TierUpNotifyFnPtr;       // Loaded from JitExecEnv::TierUpNotifyFn
 };
 
 } // namespace VM

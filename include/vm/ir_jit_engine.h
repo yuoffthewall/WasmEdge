@@ -61,6 +61,10 @@ struct JitExecEnv {
   uint64_t MemorySizeBytes; // Current linear memory size in bytes (for bounds checking)
   /// 16-byte buffer for ref-return helpers (jit_ref_func, jit_table_get).
   uint64_t RefResultBuf[2];
+  /// Tier-2 profiling: per-function call counters (indexed by func idx).
+  uint32_t *CallCounters;
+  /// Tier-2 profiling: pointer to tier_up_notify(JitExecEnv*, uint32_t funcIdx).
+  void *TierUpNotifyFn;
 };
 
 /// Host call trampoline: dispatches calls to non-JIT functions (imports)
@@ -131,6 +135,11 @@ extern "C" void jit_memory_init(JitExecEnv *env, uint32_t memIdx,
                                 uint32_t len);
 /// data.drop: clears data segment dataIdx.
 extern "C" void jit_data_drop(JitExecEnv *env, uint32_t dataIdx);
+/// Tier-2 tier-up notification: called when a function's call counter hits the
+/// threshold. Sets counter to UINT32_MAX to prevent re-triggering, and enqueues
+/// the function for LLVM AOT recompilation (once Tier2Manager is wired up).
+extern "C" void jit_tier_up_notify(JitExecEnv *env, uint32_t funcIdx,
+                                   uint32_t counterVal);
 
 /// IR JIT Engine - compiles and executes IR code
 class IRJitEngine {
@@ -158,7 +167,8 @@ public:
                       Span<const ValVariant> Args, Span<ValVariant> Rets,
                       void **FuncTable = nullptr, uint32_t FuncTableSize = 0,
                       void *GlobalBase = nullptr,
-                      void *MemoryBase = nullptr, uint64_t MemorySize = 0);
+                      void *MemoryBase = nullptr, uint64_t MemorySize = 0,
+                      uint32_t *CallCounters = nullptr);
 
   /// Release compiled code
   void release(void *NativeFunc, size_t CodeSize) noexcept;

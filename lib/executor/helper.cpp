@@ -9,6 +9,9 @@
 
 #ifdef WASMEDGE_BUILD_IR_JIT
 #include "vm/ir_jit_engine.h"
+#if defined(WASMEDGE_USE_LLVM)
+#include "vm/tier2_manager.h"
+#endif
 #include <csetjmp>
 #include <cstring>
 #endif
@@ -22,6 +25,14 @@ static thread_local WasmEdge::Executor::Executor *g_jitExecutor = nullptr;
 static thread_local WasmEdge::Runtime::StackManager *g_jitStackMgr = nullptr;
 static thread_local const WasmEdge::Runtime::Instance::ModuleInstance *g_jitModInst = nullptr;
 static thread_local WasmEdge::Runtime::Instance::MemoryInstance *g_jitMemory0 = nullptr;
+
+#if defined(WASMEDGE_USE_LLVM)
+/// Global Tier2Manager: lazy-initialized on first tier-up, lives for process.
+static WasmEdge::VM::Tier2Manager *getTier2Manager() {
+  static auto *Mgr = new WasmEdge::VM::Tier2Manager();
+  return Mgr;
+}
+#endif
 
 extern "C" uint64_t jit_host_call(WasmEdge::VM::JitExecEnv *env,
                                   uint32_t funcIdx, uint64_t *args) {
@@ -445,6 +456,25 @@ extern "C" void jit_data_drop(WasmEdge::VM::JitExecEnv *env, uint32_t dataIdx) {
   if (data)
     data->clear();
 }
+
+extern "C" void jit_tier_up_notify(WasmEdge::VM::JitExecEnv *env,
+                                   uint32_t funcIdx, uint32_t counterVal) {
+  // Called from the JIT function prologue when counter == threshold (via
+  // IF/MERGE in the IR builder). Prevent re-triggering by saturating counter.
+  if (env->CallCounters) {
+    env->CallCounters[funcIdx] = UINT32_MAX;
+  }
+
+  spdlog::debug("tier-up triggered for func {} (counter={})",
+                funcIdx, counterVal);
+
+#if defined(WASMEDGE_USE_LLVM)
+  // Enqueue for tier-2 LLVM recompilation if we have the module context.
+  if (g_jitModInst && env->FuncTable) {
+    getTier2Manager()->enqueue(funcIdx, g_jitModInst, env->FuncTable);
+  }
+#endif
+}
 #endif
 
 namespace WasmEdge {
@@ -864,6 +894,11 @@ Executor::enterFunction(Runtime::StackManager &StackMgr,
       auto MemInsts = ModInst->getMemoryInstances();
       Cache.MemoryBase =
           (!MemInsts.empty() && MemInsts[0]) ? MemInsts[0]->getDataPtr() : nullptr;
+      // Tier-2 profiling: initialize per-function call counters (zero-filled).
+      if (Cache.CallCounters.size() != FuncInsts.size()) {
+        Cache.CallCounters.resize(FuncInsts.size(), 0);
+        Cache.TierState.resize(FuncInsts.size(), 0);
+      }
     }
     void **FuncTable =
         Cache.FuncTable.empty() ? nullptr : Cache.FuncTable.data();
@@ -892,9 +927,11 @@ Executor::enterFunction(Runtime::StackManager &StackMgr,
         g_jitMemory0
             ? static_cast<uint64_t>(g_jitMemory0->getPageSize()) * UINT64_C(65536)
             : 0;
+    uint32_t *CallCounters =
+        Cache.CallCounters.empty() ? nullptr : Cache.CallCounters.data();
     auto Res = IREngine.invoke(Func.getIRJitNativeFunc(), FuncType, Args, Rets,
                                FuncTable, FuncTableSize, GlobalBase,
-                               MemoryBase, MemSizeBytes);
+                               MemoryBase, MemSizeBytes, CallCounters);
 
     if (!Res) {
       if (Res.error() != ErrCode::Value::Terminated) {

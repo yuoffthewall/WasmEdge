@@ -9,6 +9,7 @@
 #include "ast/type.h"
 #include "common/errcode.h"
 #include "vm/ir_jit_engine.h"
+#include "vm/jit_symbol_registry.h"
 
 // Include dstogov/ir headers
 extern "C" {
@@ -22,34 +23,144 @@ extern "C" {
 #include <cstdlib>
 #include <cstring>
 #include <set>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace WasmEdge {
 namespace VM {
 
-// Helpers for Wasm div_u/rem_u (IR expects U32/U64 operands; stack has I32/I64).
-// JIT code calls these by address so ir_check passes.
-namespace {
-uint32_t wasm_i32_div_u(uint32_t a, uint32_t b) {
-  return b ? (a / b) : 0;  // Wasm traps on div-by-zero
-}
-uint32_t wasm_i32_rem_u(uint32_t a, uint32_t b) {
-  return b ? (a % b) : 0;
-}
-uint64_t wasm_i64_div_u(uint64_t a, uint64_t b) {
-  return b ? (a / b) : 0;
-}
-uint64_t wasm_i64_rem_u(uint64_t a, uint64_t b) {
-  return b ? (a % b) : 0;
+// ---------------------------------------------------------------------------
+// Named-function symbol registry for ir_const_func / ir_loader integration.
+//
+// dstogov/ir JIT resolves IR_FUNC constants (named functions) via the
+// ir_loader::resolve_sym_name callback.  We register all JIT helper functions
+// (jit_host_call, jit_bounds_check, wasm_i32_div_u, …) here so that:
+//   1. Tier-1 (ir_jit_compile) resolves them at native-code-gen time.
+//   2. Tier-2 (ir_emit_llvm → LLVM ORC) can emit proper `declare @name(…)`
+//      and resolve them via the same registry.
+// ---------------------------------------------------------------------------
+
+/// Global symbol registry: name → address.
+static std::unordered_map<std::string, void *> &getSymbolRegistry() {
+  static std::unordered_map<std::string, void *> Registry;
+  return Registry;
 }
 
-// Wasm f32/f64.copysign: magnitude from first stack operand, sign from second (top).
+/// Register a symbol in the global registry.
+static void registerSymbol(const char *Name, void *Addr) {
+  getSymbolRegistry()[Name] = Addr;
+}
+
+/// Resolve a symbol by name (used by ir_loader callback).
+static void *resolveSymbol(const char *Name) {
+  auto &Reg = getSymbolRegistry();
+  auto It = Reg.find(Name);
+  return It != Reg.end() ? It->second : nullptr;
+}
+
+/// ir_loader callback: resolve_sym_name.
+static void *loaderResolveSym(ir_loader */*loader*/, const char *name,
+                              uint32_t /*flags*/) {
+  return resolveSymbol(name);
+}
+
+/// ir_loader callback: has_sym — always return false so ir_emit_llvm emits
+/// `declare` for every external function (required for valid LLVM IR).
+/// The JIT backend does not use has_sym, only ir_emit_llvm does.
+static bool loaderHasSym(ir_loader */*loader*/, const char */*name*/) {
+  return false;
+}
+
+/// ir_loader callback: add_sym — register a newly declared symbol.
+static bool loaderAddSym(ir_loader */*loader*/, const char *name, void *addr) {
+  if (addr) {
+    registerSymbol(name, addr);
+  }
+  return true;
+}
+
+/// Static ir_loader instance shared by all builder contexts.
+static ir_loader SharedLoader = {
+    0,             // default_func_flags
+    nullptr,       // init_module
+    nullptr,       // external_sym_dcl
+    nullptr,       // external_func_dcl
+    nullptr,       // forward_func_dcl
+    nullptr,       // sym_dcl
+    nullptr,       // sym_data
+    nullptr,       // sym_data_str
+    nullptr,       // sym_data_pad
+    nullptr,       // sym_data_ref
+    nullptr,       // sym_data_end
+    nullptr,       // func_init
+    nullptr,       // func_process
+    loaderResolveSym, // resolve_sym_name
+    loaderHasSym,  // has_sym
+    loaderAddSym,  // add_sym
+    nullptr,       // add_label
+};
+
+// Helpers for Wasm div_u/rem_u, copysign. These need C linkage and stable
+// names so they can be resolved by the ir_loader (tier-1) and LLVM ORC (tier-2).
+extern "C" {
+static uint32_t wasm_i32_div_u(uint32_t a, uint32_t b) {
+  return b ? (a / b) : 0;
+}
+static uint32_t wasm_i32_rem_u(uint32_t a, uint32_t b) {
+  return b ? (a % b) : 0;
+}
+static uint64_t wasm_i64_div_u(uint64_t a, uint64_t b) {
+  return b ? (a / b) : 0;
+}
+static uint64_t wasm_i64_rem_u(uint64_t a, uint64_t b) {
+  return b ? (a % b) : 0;
+}
 static float wasm_f32_copysign(float mag, float sign_src) {
   return std::copysignf(mag, sign_src);
 }
 static double wasm_f64_copysign(double mag, double sign_src) {
   return std::copysign(mag, sign_src);
 }
+} // extern "C"
+
+/// Register all JIT helper symbols once. Thread-safe via static init.
+static void ensureSymbolsRegistered() {
+  static bool Done = [] {
+    // extern "C" JIT helpers (from ir_jit_engine.h / helper.cpp)
+    registerSymbol("jit_host_call", (void *)&jit_host_call);
+    registerSymbol("jit_direct_or_host", (void *)&jit_direct_or_host);
+    registerSymbol("jit_call_indirect", (void *)&jit_call_indirect);
+    registerSymbol("jit_bounds_check", (void *)&jit_bounds_check);
+    registerSymbol("jit_memory_grow", (void *)&jit_memory_grow);
+    registerSymbol("jit_memory_size", (void *)&jit_memory_size);
+    registerSymbol("jit_memory_copy", (void *)&jit_memory_copy);
+    registerSymbol("jit_memory_fill", (void *)&jit_memory_fill);
+    registerSymbol("jit_memory_init", (void *)&jit_memory_init);
+    registerSymbol("jit_data_drop", (void *)&jit_data_drop);
+    registerSymbol("jit_ref_func", (void *)&jit_ref_func);
+    registerSymbol("jit_table_get", (void *)&jit_table_get);
+    registerSymbol("jit_table_set", (void *)&jit_table_set);
+    registerSymbol("jit_table_size", (void *)&jit_table_size);
+    registerSymbol("jit_table_grow", (void *)&jit_table_grow);
+    registerSymbol("jit_table_fill", (void *)&jit_table_fill);
+    registerSymbol("jit_table_copy", (void *)&jit_table_copy);
+    registerSymbol("jit_table_init", (void *)&jit_table_init);
+    registerSymbol("jit_elem_drop", (void *)&jit_elem_drop);
+    registerSymbol("jit_tier_up_notify", (void *)&jit_tier_up_notify);
+    registerSymbol("jit_oob_trap", (void *)&jit_oob_trap);
+    // Internal math helpers
+    registerSymbol("wasm_i32_div_u", (void *)&wasm_i32_div_u);
+    registerSymbol("wasm_i32_rem_u", (void *)&wasm_i32_rem_u);
+    registerSymbol("wasm_i64_div_u", (void *)&wasm_i64_div_u);
+    registerSymbol("wasm_i64_rem_u", (void *)&wasm_i64_rem_u);
+    registerSymbol("wasm_f32_copysign", (void *)&wasm_f32_copysign);
+    registerSymbol("wasm_f64_copysign", (void *)&wasm_f64_copysign);
+    return true;
+  }();
+  (void)Done;
+}
+
+namespace {
 
 /// Mark locals that have local.set / local.tee in this span. Uses JumpEnd /
 /// JumpElse from the loader (offsets in the same contiguous instruction array).
@@ -113,6 +224,22 @@ WasmToIRBuilder::WasmToIRBuilder() noexcept
 
 WasmToIRBuilder::~WasmToIRBuilder() noexcept { reset(); }
 
+ir_ctx *WasmToIRBuilder::detachIRContext() noexcept {
+  if (!Initialized) {
+    return nullptr;
+  }
+  // Heap-allocate and shallow-copy the ir_ctx struct. All internal pointers
+  // (instruction buffer, constant pool, etc.) transfer to the new copy.
+  auto *Detached = new (std::nothrow) ir_ctx;
+  if (!Detached) {
+    return nullptr;
+  }
+  std::memcpy(Detached, &Ctx, sizeof(ir_ctx));
+  // Mark the builder's context as not-initialized so reset() won't ir_free it.
+  Initialized = false;
+  return Detached;
+}
+
 void WasmToIRBuilder::reset() noexcept {
   if (Initialized) {
     ir_free(&Ctx);
@@ -141,6 +268,11 @@ void WasmToIRBuilder::reset() noexcept {
   ModuleGlobalTypes.clear();
   FuncInstrs = Span<const AST::Instruction>();
   CurInstrIdx = 0;
+  // Note: FuncIdx and TierUpThreshold are NOT reset here — they are set
+  // before initialize() and must survive the reset() call inside initialize().
+  HasLoop = false;
+  CallCountersPtr = 0;
+  TierUpNotifyFnPtr = 0;
 }
 
 Expect<void> WasmToIRBuilder::initialize(
@@ -158,7 +290,7 @@ Expect<void> WasmToIRBuilder::initialize(
     else if (e[0] == '2' && e[1] == '\0')
       ir_opt_level = 2;
   }
-  uint32_t ir_flags = IR_FUNCTION;
+  uint32_t ir_flags = IR_FUNCTION | IR_FASTCALL_FUNC;
   if (ir_opt_level > 0) {
     ir_flags |= IR_OPT_FOLDING | IR_OPT_CFG | IR_OPT_CODEGEN;
     ir_flags |= IR_OPT_MEM2SSA;
@@ -173,6 +305,11 @@ Expect<void> WasmToIRBuilder::initialize(
   // Pre-allocating avoids the realloc during optimization.
   ir_init(&Ctx, ir_flags, 256, IR_INSNS_LIMIT_MIN);
   Initialized = true;
+
+  // Register named symbols and attach the loader so ir_jit_compile can
+  // resolve IR_FUNC constants and ir_emit_llvm can emit proper declare's.
+  ensureSymbolsRegistered();
+  Ctx.loader = &SharedLoader;
 
   // Set return type
   const auto &RetTypes = FuncType.getReturnTypes();
@@ -211,6 +348,32 @@ Expect<void> WasmToIRBuilder::initialize(
   MemoryGrowFnPtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, MemoryGrowFn))));
   MemorySizeFnPtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, MemorySizeFn))));
   CallIndirectFnPtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, CallIndirectFn))));
+  CallCountersPtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, CallCounters))));
+  TierUpNotifyFnPtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, TierUpNotifyFn))));
+
+  // Tier-2 profiling: increment call counter and conditionally notify.
+  if (TierUpThreshold > 0) {
+    // counterAddr = CallCounters + FuncIdx * sizeof(uint32_t)
+    ir_ref CounterAddr = ir_ADD_A(CallCountersPtr,
+        ir_CONST_ADDR(static_cast<uintptr_t>(FuncIdx) * sizeof(uint32_t)));
+    ir_ref CounterVal = ir_LOAD_U32(CounterAddr);
+    ir_ref Incremented = ir_ADD_U32(CounterVal, ir_CONST_U32(1));
+    ir_STORE(CounterAddr, Incremented);
+
+    ir_ref Cmp = ir_EQ(Incremented, ir_CONST_U32(TierUpThreshold));
+    ir_ref IfRef = ir_IF(Cmp);
+    ir_IF_TRUE(IfRef);
+
+    uint8_t NotifyParams[3] = {IR_ADDR, IR_U32, IR_U32};
+    ir_ref NotifyProto = ir_proto(ctx, IR_FASTCALL_FUNC, IR_VOID, 3, NotifyParams);
+    ir_ref NotifyFn = ir_const_func(ctx, ir_str(ctx, "jit_tier_up_notify"), NotifyProto);
+    ir_CALL_3(IR_VOID, NotifyFn, EnvPtr, ir_CONST_U32(FuncIdx), Incremented);
+
+    ir_ref TrueEnd = ir_END();
+    ir_IF_FALSE(IfRef);
+    ir_ref FalseEnd = ir_END();
+    ir_MERGE_2(TrueEnd, FalseEnd);
+  }
 
   // Load wasm parameters from the args array. Each slot is sizeof(uint64_t).
   // On little-endian (x86_64), loading a narrower type from the slot address
@@ -248,11 +411,14 @@ Expect<void> WasmToIRBuilder::initialize(
 
 Expect<void>
 WasmToIRBuilder::buildFromInstructions(Span<const AST::Instruction> Instrs) {
-  // Pre-pass: compute max callee arity so we can allocate SharedCallArgs once.
+  // Pre-pass: compute max callee arity and detect loops.
+  HasLoop = false;
   uint32_t maxArity = 0;
   for (const auto &Instr : Instrs) {
     OpCode Op = Instr.getOpCode();
-    if (Op == OpCode::Call) {
+    if (Op == OpCode::Loop) {
+      HasLoop = true;
+    } else if (Op == OpCode::Call) {
       uint32_t idx = Instr.getTargetIndex();
       if (idx < ModuleFuncTypes.size()) {
         uint32_t n =
@@ -730,7 +896,7 @@ Expect<void> WasmToIRBuilder::visitInstruction(const AST::Instruction &Instr) {
     uint32_t srcMemIdx = Instr.getSourceIndex();
     uint8_t ProtoParams[6] = {IR_ADDR, IR_U32, IR_U32, IR_U32, IR_U32, IR_U32};
     ir_ref Proto = ir_proto(ctx, IR_FASTCALL_FUNC, IR_VOID, 6, ProtoParams);
-    ir_ref Fn = ir_const_func_addr(ctx, (uintptr_t)&jit_memory_copy, Proto);
+    ir_ref Fn = ir_const_func(ctx, ir_str(ctx, "jit_memory_copy"), Proto);
     ir_CALL_6(IR_VOID, Fn, EnvPtrVal, ir_CONST_I32(static_cast<int32_t>(dstMemIdx)),
               ir_CONST_I32(static_cast<int32_t>(srcMemIdx)),
               coerceToType(Dst, IR_U32), coerceToType(Src, IR_U32),
@@ -748,7 +914,7 @@ Expect<void> WasmToIRBuilder::visitInstruction(const AST::Instruction &Instr) {
     uint32_t memIdx = Instr.getTargetIndex();
     uint8_t ProtoParams[5] = {IR_ADDR, IR_U32, IR_U32, IR_U32, IR_U32};
     ir_ref Proto = ir_proto(ctx, IR_FASTCALL_FUNC, IR_VOID, 5, ProtoParams);
-    ir_ref Fn = ir_const_func_addr(ctx, (uintptr_t)&jit_memory_fill, Proto);
+    ir_ref Fn = ir_const_func(ctx, ir_str(ctx, "jit_memory_fill"), Proto);
     ir_CALL_5(IR_VOID, Fn, EnvPtrVal, ir_CONST_I32(static_cast<int32_t>(memIdx)),
               coerceToType(Off, IR_U32), coerceToType(Val, IR_U32),
               coerceToType(N, IR_U32));
@@ -766,7 +932,7 @@ Expect<void> WasmToIRBuilder::visitInstruction(const AST::Instruction &Instr) {
     uint32_t dataIdx = Instr.getSourceIndex();
     uint8_t ProtoParams[6] = {IR_ADDR, IR_U32, IR_U32, IR_U32, IR_U32, IR_U32};
     ir_ref Proto = ir_proto(ctx, IR_FASTCALL_FUNC, IR_VOID, 6, ProtoParams);
-    ir_ref Fn = ir_const_func_addr(ctx, (uintptr_t)&jit_memory_init, Proto);
+    ir_ref Fn = ir_const_func(ctx, ir_str(ctx, "jit_memory_init"), Proto);
     ir_CALL_6(IR_VOID, Fn, EnvPtrVal, ir_CONST_I32(static_cast<int32_t>(memIdx)),
               ir_CONST_I32(static_cast<int32_t>(dataIdx)),
               coerceToType(Dst, IR_U32), coerceToType(Src, IR_U32),
@@ -780,7 +946,7 @@ Expect<void> WasmToIRBuilder::visitInstruction(const AST::Instruction &Instr) {
     uint32_t dataIdx = Instr.getTargetIndex();
     uint8_t ProtoParams[2] = {IR_ADDR, IR_U32};
     ir_ref Proto = ir_proto(ctx, IR_FASTCALL_FUNC, IR_VOID, 2, ProtoParams);
-    ir_ref Fn = ir_const_func_addr(ctx, (uintptr_t)&jit_data_drop, Proto);
+    ir_ref Fn = ir_const_func(ctx, ir_str(ctx, "jit_data_drop"), Proto);
     ir_CALL_2(IR_VOID, Fn, EnvPtrVal,
               ir_CONST_I32(static_cast<int32_t>(dataIdx)));
     return {};
@@ -975,7 +1141,7 @@ Expect<void> WasmToIRBuilder::visitBinary(OpCode Op) {
   case OpCode::I32__div_u: {
     // IR DIV_U32 requires U32 operands; stack has I32. Call helper (same bits).
     ir_ref Proto = ir_proto_2(ctx, IR_FASTCALL_FUNC, IR_I32, IR_I32, IR_I32);
-    ir_ref Func = ir_const_func_addr(ctx, (uintptr_t)&wasm_i32_div_u, Proto);
+    ir_ref Func = ir_const_func(ctx, ir_str(ctx, "wasm_i32_div_u"), Proto);
     Result = ir_CALL_2(IR_I32, Func, Left, Right);
     break;
   }
@@ -985,7 +1151,7 @@ Expect<void> WasmToIRBuilder::visitBinary(OpCode Op) {
   case OpCode::I32__rem_u: {
     // IR MOD_U32 requires U32 operands; stack has I32. Call helper (same bits).
     ir_ref Proto = ir_proto_2(ctx, IR_FASTCALL_FUNC, IR_I32, IR_I32, IR_I32);
-    ir_ref Func = ir_const_func_addr(ctx, (uintptr_t)&wasm_i32_rem_u, Proto);
+    ir_ref Func = ir_const_func(ctx, ir_str(ctx, "wasm_i32_rem_u"), Proto);
     Result = ir_CALL_2(IR_I32, Func, Left, Right);
     break;
   }
@@ -1029,7 +1195,7 @@ Expect<void> WasmToIRBuilder::visitBinary(OpCode Op) {
     break;
   case OpCode::I64__div_u: {
     ir_ref Proto = ir_proto_2(ctx, IR_FASTCALL_FUNC, IR_I64, IR_I64, IR_I64);
-    ir_ref Func = ir_const_func_addr(ctx, (uintptr_t)&wasm_i64_div_u, Proto);
+    ir_ref Func = ir_const_func(ctx, ir_str(ctx, "wasm_i64_div_u"), Proto);
     Result = ir_CALL_2(IR_I64, Func, Left, Right);
     break;
   }
@@ -1038,7 +1204,7 @@ Expect<void> WasmToIRBuilder::visitBinary(OpCode Op) {
     break;
   case OpCode::I64__rem_u: {
     ir_ref Proto = ir_proto_2(ctx, IR_FASTCALL_FUNC, IR_I64, IR_I64, IR_I64);
-    ir_ref Func = ir_const_func_addr(ctx, (uintptr_t)&wasm_i64_rem_u, Proto);
+    ir_ref Func = ir_const_func(ctx, ir_str(ctx, "wasm_i64_rem_u"), Proto);
     Result = ir_CALL_2(IR_I64, Func, Left, Right);
     break;
   }
@@ -1088,7 +1254,7 @@ Expect<void> WasmToIRBuilder::visitBinary(OpCode Op) {
     break;
   case OpCode::F32__copysign: {
     ir_ref Proto = ir_proto_2(ctx, IR_FASTCALL_FUNC, IR_FLOAT, IR_FLOAT, IR_FLOAT);
-    ir_ref Func = ir_const_func_addr(ctx, (uintptr_t)&wasm_f32_copysign, Proto);
+    ir_ref Func = ir_const_func(ctx, ir_str(ctx, "wasm_f32_copysign"), Proto);
     Result = ir_CALL_2(IR_FLOAT, Func, Left, Right);
     break;
   }
@@ -1114,7 +1280,7 @@ Expect<void> WasmToIRBuilder::visitBinary(OpCode Op) {
     break;
   case OpCode::F64__copysign: {
     ir_ref Proto = ir_proto_2(ctx, IR_FASTCALL_FUNC, IR_DOUBLE, IR_DOUBLE, IR_DOUBLE);
-    ir_ref Func = ir_const_func_addr(ctx, (uintptr_t)&wasm_f64_copysign, Proto);
+    ir_ref Func = ir_const_func(ctx, ir_str(ctx, "wasm_f64_copysign"), Proto);
     Result = ir_CALL_2(IR_DOUBLE, Func, Left, Right);
     break;
   }
@@ -1656,7 +1822,7 @@ void WasmToIRBuilder::buildBoundsCheck(ir_ref Base, uint32_t Offset,
   uint8_t ProtoParams[4] = {IR_ADDR, IR_U32, IR_U32, IR_U32};
   ir_ref Proto =
       ir_proto(ctx, IR_FASTCALL_FUNC, IR_VOID, 4, ProtoParams);
-  ir_ref Fn = ir_const_func_addr(ctx, (uintptr_t)&jit_bounds_check, Proto);
+  ir_ref Fn = ir_const_func(ctx, ir_str(ctx, "jit_bounds_check"), Proto);
   ir_CALL_4(IR_VOID, Fn, EnvPtrVal, BaseU32,
             ir_CONST_I32(static_cast<int32_t>(Offset)),
             ir_CONST_I32(static_cast<int32_t>(AccessSize)));
@@ -1884,7 +2050,7 @@ Expect<void> WasmToIRBuilder::visitRefType(const AST::Instruction &Instr) {
         ir_ADD_A(EnvPtrVal, ir_CONST_ADDR(offsetof(JitExecEnv, RefResultBuf)));
     uint8_t ProtoParams[2] = {IR_ADDR, IR_U32};
     ir_ref Proto = ir_proto(ctx, IR_FASTCALL_FUNC, IR_VOID, 2, ProtoParams);
-    ir_ref Fn = ir_const_func_addr(ctx, (uintptr_t)&jit_ref_func, Proto);
+    ir_ref Fn = ir_const_func(ctx, ir_str(ctx, "jit_ref_func"), Proto);
     ir_CALL_2(IR_VOID, Fn, EnvPtrVal, ir_CONST_I32(static_cast<int32_t>(funcIdx)));
     ir_ref TypePart = ir_LOAD_I64(ResultBuf);
     ir_ref PtrPart =
@@ -1911,7 +2077,7 @@ Expect<void> WasmToIRBuilder::visitTable(const AST::Instruction &Instr) {
     ir_ref Idx = ensureValidRef(pop(), IR_I32);
     uint8_t ProtoParams[3] = {IR_ADDR, IR_U32, IR_U32};
     ir_ref Proto = ir_proto(ctx, IR_FASTCALL_FUNC, IR_VOID, 3, ProtoParams);
-    ir_ref Fn = ir_const_func_addr(ctx, (uintptr_t)&jit_table_get, Proto);
+    ir_ref Fn = ir_const_func(ctx, ir_str(ctx, "jit_table_get"), Proto);
     ir_CALL_3(IR_VOID, Fn, EnvPtrVal, ir_CONST_I32(static_cast<int32_t>(tableIdx)),
               coerceToType(Idx, IR_U32));
     pushRef(ir_LOAD_I64(ResultBuf),
@@ -1926,7 +2092,7 @@ Expect<void> WasmToIRBuilder::visitTable(const AST::Instruction &Instr) {
     ir_STORE(ir_ADD_A(ResultBuf, ir_CONST_ADDR(sizeof(uint64_t))), PtrRef);
     uint8_t ProtoParams[4] = {IR_ADDR, IR_U32, IR_U32, IR_ADDR};
     ir_ref Proto = ir_proto(ctx, IR_FASTCALL_FUNC, IR_VOID, 4, ProtoParams);
-    ir_ref Fn = ir_const_func_addr(ctx, (uintptr_t)&jit_table_set, Proto);
+    ir_ref Fn = ir_const_func(ctx, ir_str(ctx, "jit_table_set"), Proto);
     ir_CALL_4(IR_VOID, Fn, EnvPtrVal,
               ir_CONST_I32(static_cast<int32_t>(tableIdx)), coerceToType(Idx, IR_U32),
               ResultBuf);
@@ -1935,7 +2101,7 @@ Expect<void> WasmToIRBuilder::visitTable(const AST::Instruction &Instr) {
   case OpCode::Table__size: {
     uint8_t ProtoParams[2] = {IR_ADDR, IR_U32};
     ir_ref Proto = ir_proto(ctx, IR_FASTCALL_FUNC, IR_I32, 2, ProtoParams);
-    ir_ref Fn = ir_const_func_addr(ctx, (uintptr_t)&jit_table_size, Proto);
+    ir_ref Fn = ir_const_func(ctx, ir_str(ctx, "jit_table_size"), Proto);
     ir_ref Result = ir_CALL_2(IR_I32, Fn, EnvPtrVal,
                               ir_CONST_I32(static_cast<int32_t>(tableIdx)));
     push(Result);
@@ -1948,7 +2114,7 @@ Expect<void> WasmToIRBuilder::visitTable(const AST::Instruction &Instr) {
     ir_STORE(ir_ADD_A(ResultBuf, ir_CONST_ADDR(sizeof(uint64_t))), PtrRef);
     uint8_t ProtoParams[4] = {IR_ADDR, IR_U32, IR_U32, IR_ADDR};
     ir_ref Proto = ir_proto(ctx, IR_FASTCALL_FUNC, IR_I32, 4, ProtoParams);
-    ir_ref Fn = ir_const_func_addr(ctx, (uintptr_t)&jit_table_grow, Proto);
+    ir_ref Fn = ir_const_func(ctx, ir_str(ctx, "jit_table_grow"), Proto);
     ir_ref Result = ir_CALL_4(IR_I32, Fn, EnvPtrVal,
                               ir_CONST_I32(static_cast<int32_t>(tableIdx)),
                               coerceToType(N, IR_U32), ResultBuf);
@@ -1963,7 +2129,7 @@ Expect<void> WasmToIRBuilder::visitTable(const AST::Instruction &Instr) {
     ir_STORE(ir_ADD_A(ResultBuf, ir_CONST_ADDR(sizeof(uint64_t))), PtrRef);
     uint8_t ProtoParams[5] = {IR_ADDR, IR_U32, IR_U32, IR_U32, IR_ADDR};
     ir_ref Proto = ir_proto(ctx, IR_FASTCALL_FUNC, IR_VOID, 5, ProtoParams);
-    ir_ref Fn = ir_const_func_addr(ctx, (uintptr_t)&jit_table_fill, Proto);
+    ir_ref Fn = ir_const_func(ctx, ir_str(ctx, "jit_table_fill"), Proto);
     ir_CALL_5(IR_VOID, Fn, EnvPtrVal,
               ir_CONST_I32(static_cast<int32_t>(tableIdx)), coerceToType(Off, IR_U32),
               coerceToType(Len, IR_U32), ResultBuf);
@@ -1977,7 +2143,7 @@ Expect<void> WasmToIRBuilder::visitTable(const AST::Instruction &Instr) {
     ir_ref Dst = ensureValidRef(pop(), IR_I32);
     uint8_t ProtoParams[6] = {IR_ADDR, IR_U32, IR_U32, IR_U32, IR_U32, IR_U32};
     ir_ref Proto = ir_proto(ctx, IR_FASTCALL_FUNC, IR_VOID, 6, ProtoParams);
-    ir_ref Fn = ir_const_func_addr(ctx, (uintptr_t)&jit_table_copy, Proto);
+    ir_ref Fn = ir_const_func(ctx, ir_str(ctx, "jit_table_copy"), Proto);
     ir_CALL_6(IR_VOID, Fn, EnvPtrVal,
               ir_CONST_I32(static_cast<int32_t>(dstTableIdx)),
               ir_CONST_I32(static_cast<int32_t>(srcTableIdx)),
@@ -1991,7 +2157,7 @@ Expect<void> WasmToIRBuilder::visitTable(const AST::Instruction &Instr) {
     ir_ref Dst = ensureValidRef(pop(), IR_I32);
     uint8_t ProtoParams[6] = {IR_ADDR, IR_U32, IR_U32, IR_U32, IR_U32, IR_U32};
     ir_ref Proto = ir_proto(ctx, IR_FASTCALL_FUNC, IR_VOID, 6, ProtoParams);
-    ir_ref Fn = ir_const_func_addr(ctx, (uintptr_t)&jit_table_init, Proto);
+    ir_ref Fn = ir_const_func(ctx, ir_str(ctx, "jit_table_init"), Proto);
     ir_CALL_6(IR_VOID, Fn, EnvPtrVal,
               ir_CONST_I32(static_cast<int32_t>(tableIdx)),
               ir_CONST_I32(static_cast<int32_t>(elemIdx)),
@@ -2002,7 +2168,7 @@ Expect<void> WasmToIRBuilder::visitTable(const AST::Instruction &Instr) {
   case OpCode::Elem__drop: {
     uint8_t ProtoParams[2] = {IR_ADDR, IR_U32};
     ir_ref Proto = ir_proto(ctx, IR_FASTCALL_FUNC, IR_VOID, 2, ProtoParams);
-    ir_ref Fn = ir_const_func_addr(ctx, (uintptr_t)&jit_elem_drop, Proto);
+    ir_ref Fn = ir_const_func(ctx, ir_str(ctx, "jit_elem_drop"), Proto);
     ir_CALL_2(IR_VOID, Fn, EnvPtrVal,
               ir_CONST_I32(static_cast<int32_t>(Instr.getTargetIndex())));
     return {};
@@ -2923,6 +3089,12 @@ Expect<void> WasmToIRBuilder::visitCall(const AST::Instruction &Instr) {
 
 } // namespace VM
 } // namespace WasmEdge
+
+const std::unordered_map<std::string, void *> &
+WasmEdge::VM::getJitSymbolRegistry() {
+  ensureSymbolsRegistered();
+  return getSymbolRegistry();
+}
 
 #endif // WASMEDGE_BUILD_IR_JIT
 

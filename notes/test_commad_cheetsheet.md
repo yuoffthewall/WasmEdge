@@ -1,7 +1,7 @@
 # Build Wasmedge (use Debug for GDB visibility; -j32 for parallel)
 
 ```shell
-cd /home/tommy/Desktop/wasmedge/build
+cd build
 cmake -DCMAKE_BUILD_TYPE=Debug \
       -DWASMEDGE_BUILD_IR_JIT=ON \
       -DWASMEDGE_BUILD_TESTS=ON \
@@ -44,13 +44,13 @@ export WASMEDGE_SIGHTGLASS_QUICK=0
 # One-shot: single kernel, IR JIT O2
 
 ```shell
-cd ~/Desktop/wasmedge/build && WASMEDGE_SIGHTGLASS_MODE=IR_JIT WASMEDGE_IR_JIT_OPT_LEVEL=2 WASMEDGE_SIGHTGLASS_KERNEL=quicksort timeout 30 ./test/ir/wasmedgeIRBenchmarkTests --gtest_filter='*SightglassSuite*'
+cd build && WASMEDGE_SIGHTGLASS_MODE=IR_JIT WASMEDGE_IR_JIT_OPT_LEVEL=2 WASMEDGE_SIGHTGLASS_KERNEL=quicksort timeout 30 ./test/ir/wasmedgeIRBenchmarkTests --gtest_filter='*SightglassSuite*'
 ```
 
 # Test all sightglass .wasm kernel using IR JIT
 
 ```shell
-cd /home/tommy/Desktop/wasmedge/build && \
+cd build && \
 for wasm in ../test/ir/testdata/sightglass/*.wasm; do
   kernel="$(basename "$wasm" .wasm)"
   echo "Testing $kernel:"
@@ -68,7 +68,7 @@ done | tee /tmp/wasm-test.log
 Run a single kernel (e.g. quicksort) under GDB from the build dir. Use a Debug build for symbols and JIT unwind.
 
 ```shell
-cd ~/Desktop/wasmedge/build
+cd build
 WASMEDGE_SIGHTGLASS_MODE=IR_JIT WASMEDGE_SIGHTGLASS_KERNEL=quicksort WASMEDGE_IR_JIT_OPT_LEVEL=2 gdb --args ./test/ir/wasmedgeIRBenchmarkTests --gtest_filter='*SightglassSuite*'
 ```
 

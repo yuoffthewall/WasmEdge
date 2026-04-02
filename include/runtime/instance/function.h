@@ -24,6 +24,12 @@
 #include <vector>
 
 #ifdef WASMEDGE_BUILD_IR_JIT
+struct _ir_ctx; // Forward declare ir_ctx (typedef'd in ir.h)
+typedef struct _ir_ctx ir_ctx;
+extern "C" void ir_free(ir_ctx *ctx);
+#endif
+
+#ifdef WASMEDGE_BUILD_IR_JIT
 // Forward declare IR types
 struct _ir_ctx;
 typedef struct _ir_ctx ir_ctx;
@@ -203,7 +209,14 @@ private:
         : NativeFunc(Func), CodeSize(Size), IRGraph(Graph) {}
 
     ~IRJitFunction() noexcept {
-      // Cleanup is handled by IRJitEngine
+      // Native code cleanup is handled by IRJitEngine.
+      // Free the detached IR graph if preserved for tier-2.
+      if (IRGraph) {
+        ir_free(IRGraph);
+        // IRGraph was heap-allocated with operator new in detachIRContext().
+        ::operator delete(IRGraph);
+        IRGraph = nullptr;
+      }
     }
   };
 #endif
