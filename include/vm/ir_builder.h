@@ -65,6 +65,12 @@ public:
   /// and call to them will go through the host call trampoline.
   void setImportFuncNum(uint32_t Num) noexcept { ImportFuncNum = Num; }
 
+  /// Set which functions are skipped (not JIT-compiled). Calls to these must
+  /// go through the host call trampoline instead of direct inline calls.
+  void setSkippedFunctions(const std::vector<bool> &Skip) {
+    SkippedFunctions = Skip;
+  }
+
   /// Set the max number of call arguments across all calls in the function.
   /// Used to pre-allocate a shared args buffer in the function prologue.
   void setMaxCallArgs(uint32_t N) noexcept { MaxCallArgs = N; }
@@ -250,6 +256,7 @@ private:
   std::vector<const AST::FunctionType *> ModuleFuncTypes;  // Function types indexed by module function index
   std::vector<const AST::FunctionType *> ModuleTypeSection; // Function types indexed by type index
   uint32_t ImportFuncNum = 0;  // Number of imported functions
+  std::vector<bool> SkippedFunctions;  // Functions skipped during JIT compilation
   
   // Pre-allocated args buffer for call instructions (avoids per-call ir_ALLOCA)
   uint32_t MaxCallArgs = 0;    // Max parameter count across all calls in function

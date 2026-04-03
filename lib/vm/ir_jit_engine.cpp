@@ -24,6 +24,8 @@ extern "C" {
 
 namespace {
 static thread_local jmp_buf g_termination_buf;
+static thread_local WasmEdge::ErrCode g_callee_error{
+    WasmEdge::ErrCode::Value::Success};
 
 /// SIGSEGV guard for ir_jit_compile: the IR library can segfault on certain
 /// complex IR patterns (e.g. nested loops with many PHIs). We install a
@@ -96,6 +98,9 @@ extern "C" void jit_oob_trap(void) {
 namespace WasmEdge {
 namespace VM {
 
+void wasmedge_ir_jit_set_callee_error(ErrCode Err) { g_callee_error = Err; }
+ErrCode wasmedge_ir_jit_get_callee_error() { return g_callee_error; }
+
 IRJitEngine::IRJitEngine() noexcept {}
 
 IRJitEngine::~IRJitEngine() noexcept {
@@ -132,6 +137,7 @@ IRJitEngine::compile(ir_ctx *Ctx) {
 
   static int func_id = 0;
   int cur_id = func_id++;
+
   bool dump = std::getenv("WASMEDGE_IR_JIT_DUMP") != nullptr;
   if (dump) {
     char fname[256];
@@ -211,6 +217,10 @@ Expect<void> IRJitEngine::invoke(void *NativeFunc,
     if (jmpVal == 2) {
       // OOB trap from jit_oob_trap (inline bounds check)
       return Unexpect(ErrCode::Value::MemoryOutOfBounds);
+    }
+    if (jmpVal == 3) {
+      // Callee function trapped (e.g. unreachable, OOB in callee).
+      return Unexpect(wasmedge_ir_jit_get_callee_error());
     }
     if (jmpVal != 0) {
       // Termination (e.g. proc_exit via jit_host_call)

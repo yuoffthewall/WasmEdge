@@ -200,6 +200,18 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
     // through jit_host_call and call_indirect through the same trampoline,
     // so functions that call imports or use call_indirect can be JIT-compiled.
 
+    // Pre-pass: apply WASMEDGE_IR_JIT_SKIP env var so all callers know
+    // which functions are skipped BEFORE any IR is built.
+    if (const char *skipEnv = std::getenv("WASMEDGE_IR_JIT_SKIP")) {
+      unsigned sStart = 0, sEnd = 0;
+      if (sscanf(skipEnv, "%u-%u", &sStart, &sEnd) == 2) {
+        for (unsigned fi = sStart; fi <= sEnd && fi < SkipJit.size(); fi++) {
+          SkipJit[fi] = true;
+          spdlog::info("IR JIT: env-skip func {}", fi);
+        }
+      }
+    }
+
     // Log skip summary.
     {
       uint32_t SkipCount = 0;
@@ -231,7 +243,7 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
       }
 
       // Skip functions marked by the pre-pass (imports, trap stubs,
-      // or functions that transitively call non-JIT targets).
+      // env-skip, or functions that transitively call non-JIT targets).
       if (SkipJit[FuncIdx]) {
         spdlog::info("IR JIT: skip func {} (non-JIT call target)", FuncIdx);
         CodeIdx++;
@@ -248,7 +260,7 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
         continue;
       }
       const AST::FunctionType &FuncType = (*TypeRes)->getCompositeType().getFuncType();
-      
+
       // Get locals and instructions from AST code segment (not FuncInst)
       auto Locals = CodeSeg.getLocals();
       auto Instrs = CodeSeg.getExpr().getInstrs();
@@ -272,6 +284,7 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
         IRBuilder.setModuleTypes(TypeSection);
         IRBuilder.setModuleGlobals(GlobalTypes);
         IRBuilder.setImportFuncNum(ImportFuncNum);
+        IRBuilder.setSkippedFunctions(SkipJit);
         
         // Pre-scan to find max call args for buffer-based calls only.
         // Direct calls (funcIdx >= ImportFuncNum) use register-based ABI
@@ -282,8 +295,9 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
             auto IOp = I.getOpCode();
             if (IOp == OpCode::Call) {
               uint32_t Idx = I.getTargetIndex();
-              // Only host calls (imports) use the buffer path.
-              if (Idx < ImportFuncNum && Idx < FuncTypes.size()) {
+              // Host calls (imports) and skipped functions use the buffer path.
+              if ((Idx < ImportFuncNum || (Idx < SkipJit.size() && SkipJit[Idx]))
+                  && Idx < FuncTypes.size()) {
                 auto N = static_cast<uint32_t>(FuncTypes[Idx]->getParamTypes().size());
                 if (N > MaxArgs) MaxArgs = N;
               }

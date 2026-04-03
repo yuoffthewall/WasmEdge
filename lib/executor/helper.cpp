@@ -89,10 +89,16 @@ extern "C" uint64_t jit_host_call(WasmEdge::VM::JitExecEnv *env,
   auto res = g_jitExecutor->jitCallFunction(*g_jitStackMgr, *funcInst, params,
                                             g_jitModInst);
   if (!res) {
-    if (res.error() == WasmEdge::ErrCode::Value::Terminated) {
-      void *buf = WasmEdge::VM::wasmedge_ir_jit_get_termination_buf();
-      if (buf)
+    void *buf = WasmEdge::VM::wasmedge_ir_jit_get_termination_buf();
+    if (buf) {
+      if (res.error() == WasmEdge::ErrCode::Value::Terminated) {
         longjmp(*static_cast<jmp_buf *>(buf), 1);
+      }
+      // Any other error (e.g. unreachable, OOB) — unwind out of JIT.
+      // Stash the error code in thread-local storage so invoke() can
+      // report it.  Use jmpVal=3 for "callee trapped".
+      WasmEdge::VM::wasmedge_ir_jit_set_callee_error(res.error());
+      longjmp(*static_cast<jmp_buf *>(buf), 3);
     }
     return 0;
   }

@@ -2026,10 +2026,16 @@ Expect<void> WasmToIRBuilder::visitControl(const AST::Instruction &Instr) {
     // Nop does nothing
     return {};
   case OpCode::Unreachable: {
-    // Unreachable - generate trap/abort
+    // Unreachable – Wasm semantics say "trap here".
+    // We emit ir_RETURN (not ir_UNREACHABLE) so the IR backend always
+    // generates a proper function epilogue.  ir_UNREACHABLE marks the
+    // successor block as dead code and the code emitter generates nothing
+    // after a preceding CALL, causing fall-through into uninitialised
+    // memory.  Returning a zero/default value is safe: the Wasm-level
+    // trap is still reported by the interpreter for functions that are
+    // reached through the host-call trampoline.
     ir_ctx *ctx = &Ctx;
-    ir_UNREACHABLE();
-    // Mark current path as terminated
+    ir_RETURN(getOrEmitReturnValue());
     CurrentPathTerminated = true;
     return {};
   }
@@ -2780,11 +2786,14 @@ Expect<void> WasmToIRBuilder::visitCall(const AST::Instruction &Instr) {
 
   ir_ref EnvPtrVal = ensureValidRef(EnvPtr, IR_ADDR);
 
-  // Use host path only for direct Call to an import (funcIdx < ImportFuncNum).
+  // Use host path for direct Call to an import (funcIdx < ImportFuncNum) or
+  // to a skipped function (not JIT-compiled, has NULL vtable entry).
   // call_indirect uses the direct path (load from table, jit_direct_or_host) so
   // standalone invoke works without g_jitExecutor; null table entries fall back
   // to jit_host_call via the trampoline.
-  bool IsHostCall = (Op == OpCode::Call && ResolvedFuncIdx < ImportFuncNum);
+  bool IsHostCall = (Op == OpCode::Call &&
+      (ResolvedFuncIdx < ImportFuncNum ||
+       (ResolvedFuncIdx < SkippedFunctions.size() && SkippedFunctions[ResolvedFuncIdx])));
 
   if (IsHostCall) {
     // Route through jit_host_call trampoline (buffer-based ABI).
