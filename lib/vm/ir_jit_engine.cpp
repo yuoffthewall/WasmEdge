@@ -141,9 +141,14 @@ IRJitEngine::compile(ir_ctx *Ctx) {
 
   // Snapshot IR text and ret_type BEFORE ir_jit_compile (which mutates the context).
   // Tier-2 reloads this text into a fresh ir_ctx for LLVM emission.
+  // Only serialize when tier-2 is enabled — ir_save is expensive for large functions.
   uint8_t RetType = Ctx->ret_type;
   std::string IRText;
-  {
+  static const bool Tier2Enabled = [] {
+    const char *E = std::getenv("WASMEDGE_TIER2_ENABLE");
+    return E && E[0] == '1' && E[1] == '\0';
+  }();
+  if (Tier2Enabled) {
     char *buf = nullptr;
     size_t len = 0;
     FILE *memf = open_memstream(&buf, &len);

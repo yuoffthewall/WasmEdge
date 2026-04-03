@@ -348,11 +348,11 @@ Expect<void> WasmToIRBuilder::initialize(
   MemoryGrowFnPtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, MemoryGrowFn))));
   MemorySizeFnPtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, MemorySizeFn))));
   CallIndirectFnPtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, CallIndirectFn))));
-  CallCountersPtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, CallCounters))));
-  TierUpNotifyFnPtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, TierUpNotifyFn))));
 
   // Tier-2 profiling: increment call counter and conditionally notify.
   if (TierUpThreshold > 0) {
+    CallCountersPtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, CallCounters))));
+    TierUpNotifyFnPtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, TierUpNotifyFn))));
     // counterAddr = CallCounters + FuncIdx * sizeof(uint32_t)
     ir_ref CounterAddr = ir_ADD_A(CallCountersPtr,
         ir_CONST_ADDR(static_cast<uintptr_t>(FuncIdx) * sizeof(uint32_t)));
