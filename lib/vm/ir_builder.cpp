@@ -298,12 +298,14 @@ Expect<void> WasmToIRBuilder::initialize(
   if (ir_opt_level > 1) {
     ir_flags |= IR_OPT_INLINE;
   }
-  // Use a generous initial constant-pool size (256) instead of the minimum (4).
+  // Use a generous initial constant-pool size instead of the minimum (4).
   // The SCCP optimization pass in the IR library has a latent bug: it holds
   // a raw pointer into the instruction buffer while calling ir_const(), which
   // can trigger ir_grow_bottom() → realloc, invalidating the pointer.
   // Pre-allocating avoids the realloc during optimization.
-  ir_init(&Ctx, ir_flags, 256, IR_INSNS_LIMIT_MIN);
+  // 8192 covers the largest observed function (5170 constants in
+  // rust-compression) plus SCCP overhead and PLT FUNC_ADDR constants.
+  ir_init(&Ctx, ir_flags, 8192, IR_INSNS_LIMIT_MIN);
   Initialized = true;
 
   // Register named symbols and attach the loader so ir_jit_compile can
@@ -3043,16 +3045,7 @@ Expect<void> WasmToIRBuilder::visitCall(const AST::Instruction &Instr) {
       }
     }
   } else {
-    // Direct call: load callee from FuncTable and call it directly.
-    // For local functions (funcIdx >= ImportFuncNum), the FuncTable entry is
-    // always non-null (set by the JIT engine after compilation).  Functions
-    // that failed to compile are routed through jit_host_call at a higher
-    // level, so we can safely skip the null check here.
-    ir_ref ValidFT = ensureValidRef(FuncTablePtr, IR_ADDR);
-    ir_ref FuncPtr = ir_LOAD_A(ir_ADD_A(
-        ValidFT,
-        ir_CONST_ADDR(static_cast<uintptr_t>(ResolvedFuncIdx) * sizeof(void *))));
-
+    // Direct call to a local (non-import) function.
     // Build prototype for direct JIT call: ret func(JitExecEnv*, uint64_t*)
     // Always declare I64 return even for void callees: the unused rax value is
     // harmless, and IR_VOID triggers an assertion in the IR x86 backend's
@@ -3070,8 +3063,26 @@ Expect<void> WasmToIRBuilder::visitCall(const AST::Instruction &Instr) {
 
     ir_ref DirectProto = ir_proto(ctx, IR_FASTCALL_FUNC, DirectRetType, 2,
                                   DirectProtoParams);
-    ir_ref TypedFuncPtr =
-        ir_emit2(ctx, IR_OPT(IR_PROTO, IR_ADDR), FuncPtr, DirectProto);
+    ir_ref TypedFuncPtr;
+
+    // Use PLT stub if available — emits a direct call to a known address.
+    // The stub loads FuncTable[i] at runtime and tail-jumps, so tier-2
+    // hot-swap still works (stubs always read FuncTable).
+    if (StubAddresses && ResolvedFuncIdx < StubCount &&
+        StubAddresses[ResolvedFuncIdx] != nullptr) {
+      char stubName[32];
+      std::snprintf(stubName, sizeof(stubName), "wasm_plt_%u",
+                    ResolvedFuncIdx);
+      TypedFuncPtr = ir_const_func(ctx, ir_str(ctx, stubName), DirectProto);
+    } else {
+      // Fallback: indirect load from FuncTable (original path).
+      ir_ref ValidFT = ensureValidRef(FuncTablePtr, IR_ADDR);
+      ir_ref FuncPtr = ir_LOAD_A(ir_ADD_A(
+          ValidFT,
+          ir_CONST_ADDR(static_cast<uintptr_t>(ResolvedFuncIdx) * sizeof(void *))));
+      TypedFuncPtr =
+          ir_emit2(ctx, IR_OPT(IR_PROTO, IR_ADDR), FuncPtr, DirectProto);
+    }
 
     ir_ref DirectArgs[2] = {EnvPtrVal, CalleeArgs};
     ir_ref CallResult = ir_CALL_N(DirectRetType, TypedFuncPtr, 2, DirectArgs);
@@ -3094,6 +3105,10 @@ const std::unordered_map<std::string, void *> &
 WasmEdge::VM::getJitSymbolRegistry() {
   ensureSymbolsRegistered();
   return getSymbolRegistry();
+}
+
+void WasmEdge::VM::registerJitSymbol(const char *Name, void *Addr) {
+  registerSymbol(Name, Addr);
 }
 
 #endif // WASMEDGE_BUILD_IR_JIT

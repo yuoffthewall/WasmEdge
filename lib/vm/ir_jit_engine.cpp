@@ -20,6 +20,7 @@ extern "C" {
 #include <cstdlib>
 #include <cstring>
 #include <sys/mman.h>
+#include <unistd.h>
 
 namespace {
 static thread_local jmp_buf g_termination_buf;
@@ -348,6 +349,82 @@ ValVariant IRJitEngine::rawToValVariant(uint64_t Raw,
   } else {
     return ValVariant(static_cast<uint64_t>(0));
   }
+}
+
+// ---------------------------------------------------------------------------
+// PltStubTable — pre-allocated PLT stubs for direct JIT-to-JIT calls.
+// ---------------------------------------------------------------------------
+
+PltStubTable::~PltStubTable() noexcept {
+  if (Base_ && Size_ > 0)
+    munmap(Base_, Size_);
+}
+
+bool PltStubTable::allocate(uint32_t count) {
+#if !defined(__x86_64__)
+  // PLT stubs are x86-64 only for now.
+  (void)count;
+  return false;
+#else
+  if (count == 0)
+    return true;
+  Count_ = count;
+  size_t raw = static_cast<size_t>(count) * StubSize;
+  size_t pageSize = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+  Size_ = (raw + pageSize - 1) & ~(pageSize - 1);
+
+  Base_ = mmap(nullptr, Size_, PROT_READ | PROT_WRITE,
+               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (Base_ == MAP_FAILED) {
+    Base_ = nullptr;
+    return false;
+  }
+
+  // Emit x86-64 stub for each function index i (16 bytes per stub):
+  //   mov rax, [rdi]          ; 48 8b 07        (3B) load env->FuncTable (offset 0)
+  //   mov rax, [rax + i*8]    ; 48 8b 80 <d32>  (7B) load FuncTable[i]
+  //   jmp rax                 ; ff e0           (2B) tail-jump to callee
+  //   nop (4-byte pad)        ; 0f 1f 40 00     (4B) align to 16
+  // rdi = JitExecEnv* and rsi = uint64_t* args are preserved for the callee.
+  uint8_t *p = static_cast<uint8_t *>(Base_);
+  for (uint32_t i = 0; i < count; ++i) {
+    uint8_t *s = p + static_cast<size_t>(i) * StubSize;
+    int32_t off = static_cast<int32_t>(static_cast<uint64_t>(i) * 8);
+    // mov rax, [rdi]
+    s[0] = 0x48; s[1] = 0x8b; s[2] = 0x07;
+    // mov rax, [rax + off]
+    s[3] = 0x48; s[4] = 0x8b; s[5] = 0x80;
+    std::memcpy(&s[6], &off, 4);
+    // jmp rax
+    s[10] = 0xff; s[11] = 0xe0;
+    // 4-byte NOP
+    s[12] = 0x0f; s[13] = 0x1f; s[14] = 0x40; s[15] = 0x00;
+  }
+
+  // W^X: flip to read+execute.
+  if (mprotect(Base_, Size_, PROT_READ | PROT_EXEC) != 0) {
+    munmap(Base_, Size_);
+    Base_ = nullptr;
+    return false;
+  }
+
+  spdlog::debug("PLT stub table: {} stubs at {}", count, Base_);
+  return true;
+#endif
+}
+
+void *PltStubTable::getStub(uint32_t i) const noexcept {
+  if (!Base_ || i >= Count_)
+    return nullptr;
+  return static_cast<uint8_t *>(Base_) + static_cast<size_t>(i) * StubSize;
+}
+
+PltStubTable *IRJitEngine::createStubTable(uint32_t funcCount) {
+  auto tbl = std::make_unique<PltStubTable>();
+  if (!tbl->allocate(funcCount))
+    return nullptr;
+  StubTables_.push_back(std::move(tbl));
+  return StubTables_.back().get();
 }
 
 } // namespace VM

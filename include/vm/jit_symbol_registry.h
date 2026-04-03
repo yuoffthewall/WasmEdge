@@ -26,6 +26,9 @@ namespace WasmEdge::VM {
 /// Populated by ir_builder.cpp on first use via ensureSymbolsRegistered().
 const std::unordered_map<std::string, void *> &getJitSymbolRegistry();
 
+/// Register a symbol in the global JIT symbol registry.
+void registerJitSymbol(const char *Name, void *Addr);
+
 } // namespace WasmEdge::VM
 
 #endif // WASMEDGE_BUILD_IR_JIT

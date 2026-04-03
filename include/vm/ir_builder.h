@@ -75,6 +75,13 @@ public:
   /// Set the tier-up call count threshold. 0 disables counter instrumentation.
   void setTierUpThreshold(uint32_t T) noexcept { TierUpThreshold = T; }
 
+  /// Set PLT stub addresses. When set, direct calls to local functions
+  /// use ir_const_func_addr(stub) instead of loading from FuncTable.
+  void setStubTable(void *const *stubs, uint32_t count) noexcept {
+    StubAddresses = stubs;
+    StubCount = count;
+  }
+
   /// After buildFromInstructions(), returns true if the function contains loops.
   bool hasLoop() const noexcept { return HasLoop; }
 
@@ -271,6 +278,10 @@ private:
   
   // Module-level information for globals
   std::vector<ValType> ModuleGlobalTypes;  // Types of all module globals
+
+  // PLT stub table for direct calls (module-level, survives reset)
+  void *const *StubAddresses = nullptr;  // Stub code addresses indexed by func idx
+  uint32_t StubCount = 0;
 
   // Tier-2 profiling
   uint32_t FuncIdx = 0;           // Module function index (for counter offset)

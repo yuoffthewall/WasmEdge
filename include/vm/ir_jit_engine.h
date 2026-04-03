@@ -141,6 +141,31 @@ extern "C" void jit_data_drop(JitExecEnv *env, uint32_t dataIdx);
 extern "C" void jit_tier_up_notify(JitExecEnv *env, uint32_t funcIdx,
                                    uint32_t counterVal);
 
+/// PLT-style stub table for direct JIT-to-JIT calls.
+/// Each stub loads FuncTable[i] from JitExecEnv* (rdi) and tail-jumps.
+/// Stub addresses are stable and known before IR compilation, enabling
+/// ir_const_func_addr -> direct `call rel32` in generated code.
+/// Tier-2 hot-swap works unchanged because stubs read FuncTable at runtime.
+class PltStubTable {
+public:
+  PltStubTable() noexcept = default;
+  ~PltStubTable() noexcept;
+  PltStubTable(const PltStubTable &) = delete;
+  PltStubTable &operator=(const PltStubTable &) = delete;
+
+  /// Allocate and emit stubs for `count` functions. x86-64 only.
+  bool allocate(uint32_t count);
+  /// Stub code address for function i (nullptr if out of range).
+  void *getStub(uint32_t i) const noexcept;
+  uint32_t count() const noexcept { return Count_; }
+
+private:
+  void *Base_ = nullptr;
+  size_t Size_ = 0;
+  uint32_t Count_ = 0;
+  static constexpr uint32_t StubSize = 16; // bytes per stub, aligned
+};
+
 /// IR JIT Engine - compiles and executes IR code
 class IRJitEngine {
 public:
@@ -174,6 +199,9 @@ public:
   /// Release compiled code
   void release(void *NativeFunc, size_t CodeSize) noexcept;
 
+  /// Create a new PLT stub table for `funcCount` functions.
+  /// Ownership retained by the engine (lives until engine destruction).
+  PltStubTable *createStubTable(uint32_t funcCount);
 
 private:
   /// Code buffer management
@@ -199,6 +227,8 @@ private:
   std::vector<CodeBuffer> CodeBuffers; // Track allocated code buffers
   /// Reusable buffer for marshalling args in invoke() (avoids per-call allocation)
   mutable std::vector<uint64_t> ArgsBuffer_;
+  /// PLT stub tables (one per module; kept alive for compiled code lifetime).
+  std::vector<std::unique_ptr<PltStubTable>> StubTables_;
 };
 
 } // namespace VM

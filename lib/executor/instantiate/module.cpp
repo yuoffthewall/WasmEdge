@@ -9,6 +9,7 @@
 #ifdef WASMEDGE_BUILD_IR_JIT
 #include "vm/ir_builder.h"
 #include "vm/ir_jit_engine.h"
+#include "vm/jit_symbol_registry.h"
 #endif
 
 #include <cstdint>
@@ -230,6 +231,27 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
       }
     }
 
+    // Allocate PLT stub table for direct JIT-to-JIT calls.
+    // Each stub loads FuncTable[i] at runtime and tail-jumps, enabling the
+    // IR builder to emit direct `call stub_addr` instead of indirect calls.
+    uint32_t TotalFuncs = ImportFuncNum + TotalDefined;
+    std::vector<void *> StubAddresses(TotalFuncs, nullptr);
+#if defined(__x86_64__)
+    VM::PltStubTable *StubTablePtr = IREngine.createStubTable(TotalFuncs);
+    if (StubTablePtr) {
+      for (uint32_t i = ImportFuncNum; i < TotalFuncs; ++i) {
+        if (!SkipJit[i]) {
+          void *stub = StubTablePtr->getStub(i);
+          StubAddresses[i] = stub;
+          // Register stub as named symbol so ir_const_func can resolve it.
+          char stubName[32];
+          std::snprintf(stubName, sizeof(stubName), "wasm_plt_%u", i);
+          VM::registerJitSymbol(stubName, stub);
+        }
+      }
+    }
+#endif
+
     // Compile each defined (non-imported) wasm function
     // We use code segments from AST directly since FuncInst may already be
     // CompiledFunction (LLVM AOT) without accessible instructions.
@@ -304,7 +326,9 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
         IRBuilder.setModuleTypes(TypeSection);
         IRBuilder.setModuleGlobals(GlobalTypes);
         IRBuilder.setImportFuncNum(ImportFuncNum);
-        
+        IRBuilder.setStubTable(StubAddresses.data(),
+                               static_cast<uint32_t>(StubAddresses.size()));
+
         // Pre-scan to find max call args for shared buffer allocation
         {
           uint32_t MaxArgs = 0;
