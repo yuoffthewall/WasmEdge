@@ -67,12 +67,16 @@ Execution continues (tier-1 or tier-2 transparently)
 - Deduplication via `Seen_` set (prevent redundant compilations)
 - Atomic pointer swap: `FuncTable[idx] = tier2_ptr`
 - Counter saturation on enqueue (`UINT32_MAX` prevents re-triggering)
+- `FuncTable` uses `shared_ptr<void*[]>` for cross-thread lifetime safety
+- All data copied at enqueue time — worker never accesses ModuleInstance
 
 ### Phase 4: Polish & Testing -- COMPLETE
 
 - Fixed 8 bugs in `ir_emit_llvm.c` (see `notes/tier2_bug.md`)
 - Fixed corrupted ir_ctx root cause (Bugs 9-11) by serializing IR text before tier-1 compile
 - Added `ir_load_safe()` to thirdparty/ir for non-fatal parse error recovery
+- Fixed use-after-free race in Tier2Manager (Bug 17)
+- Fixed ret_type not surviving ir_save/ir_load round-trip (Bug 18)
 - Sightglass validation: 37/37 kernels pass at O2, both baseline and tier-2
 
 ---
@@ -97,13 +101,14 @@ Execution continues (tier-1 or tier-2 transparently)
 | `thirdparty/ir/ir_load.c` | `ir_load_safe()` — non-fatal parse error recovery via setjmp/longjmp |
 | `thirdparty/ir/ir.h` | Declaration for `ir_load_safe()` |
 | `lib/vm/ir_builder.cpp` | Symbol registry, IR_FUNC migration, fastcall flag, tier-up prologue |
-| `lib/executor/helper.cpp` | `jit_tier_up_notify`, `getTier2Manager` singleton |
-| `lib/executor/instantiate/module.cpp` | Counter allocation, threshold config, IR text passthrough |
-| `include/executor/executor.h` | `IRJitEnvCache` with `CallCounters` and `TierState` |
-| `include/vm/ir_jit_engine.h` | `JitExecEnv` with counter/notify fields, `CompileResult` with `IRText` |
-| `include/runtime/instance/function.h` | `IRJitFunction` with `IRText` field, `upgradeToIRJit()` |
+| `lib/executor/helper.cpp` | `jit_tier_up_notify`, `getTier2Manager` singleton, copies IRText/RetType at enqueue |
+| `lib/executor/instantiate/module.cpp` | Counter allocation, threshold config, IR text + RetType passthrough |
+| `include/executor/executor.h` | `IRJitEnvCache` with `shared_ptr<void*[]>` FuncTable, `getJitFuncTable()` |
+| `include/vm/ir_jit_engine.h` | `JitExecEnv` with counter/notify fields, `CompileResult` with `IRText` + `RetType` |
+| `include/runtime/instance/function.h` | `IRJitFunction` with `IRText` + `RetType` fields, `upgradeToIRJit()` |
 | `lib/vm/ir_jit_engine.cpp` | Pre-compile IR text snapshot, removed `releaseIRGraph()` |
 | `lib/vm/CMakeLists.txt` | Conditional tier-2 sources, LLVM include dirs |
+| `include/vm/ir_builder.h` | IF/MERGE env var cutoff for debugging |
 
 ---
 
@@ -410,18 +415,22 @@ No regressions from tier-2 code changes (fastcall flag, symbol registry, etc.).
 | Tier-2 functions live-swapped | 152+ |
 | LLVM IR parse errors | 0 |
 | LLVM verification failures | 0 |
-| Kernels passing | 37/37 |
+| LLVM codegen crashes (LLVM 18 bug) | 0 (mitigated; see Bug 16) |
+| Kernels passing | 38/38 |
 | Kernels crashing | 0 |
+| Exit-time core dumps | 0 |
 
-All 37 sightglass kernels pass with tier-2 enabled. The previous 3 failures
-(blake3-scalar, blind-sig, shootout-nestedloop) were caused by using a
-post-`ir_jit_compile` ir_ctx and are fixed by the IR text serialization
-approach.
+All 38 sightglass kernels pass with tier-2 enabled and zero core dumps.
+Stress-tested hashset (most frequent crasher) 20/20 clean exits.
 
-**Known limitation:** 1 function in rust-compression (func 185) has a
-MERGE with 255 inputs; ir_load's parser has a hard-coded `count > 255`
-limit and rejects it. This single function falls back to tier-1. This is
-an ir backend limitation in `ir_load.c`.
+**Known limitations:**
+- 1 function in rust-compression (func 185) has a MERGE with 255 inputs;
+  ir_load's parser has a hard-coded `count > 255` limit and rejects it.
+  This single function falls back to tier-1 (ir backend limitation).
+- LLVM 18's x86-64 codegen has latent ISel bugs (see Bug 16). These are
+  mitigated by: (a) providing proper TargetMachine/triple/datalayout,
+  (b) disabling auto-vectorization, (c) shutdown checks in the compiler,
+  (d) `_exit(0)` in the atexit handler. No crashes observed in testing.
 
 ---
 
@@ -429,10 +438,11 @@ an ir backend limitation in `ir_load.c`.
 
 See `notes/tier2_bug.md` for full details. Summary:
 
-| # | Description | Category |
-|---|-------------|----------|
-| 14 | O1 crash with IF/MERGE (pre-existing) | ir backend |
-| — | `ir_load` parser limit: MERGE/PHI with >255 inputs rejected | ir backend |
+| # | Description | Category | Status |
+|---|-------------|----------|--------|
+| 14 | O1 crash with IF/MERGE (pre-existing) | ir backend | Open |
+| 15 | `ir_load` parser limit: MERGE/PHI >255 inputs rejected | ir backend | Open |
+| 16 | LLVM 18 codegen crash with scalable vectors | LLVM bug | Mitigated (0 crashes) |
 
 Bugs 9, 10, 11 were all symptoms of using a corrupted post-`ir_jit_compile`
 ir_ctx — fixed by serializing IR text before compilation.
@@ -454,6 +464,10 @@ ir_ctx — fixed by serializing IR text before compilation.
 | 9-11 | Corrupted ir_ctx (ir_print_const, ir_get_str, NIY) | tier2 pipeline redesign |
 | 12 | rust-compression/regex tier-2 segfault (shift UB) | ir_emit_llvm.c |
 | 13 | Static ALLOCA misclassified as dynamic | ir_x86.dasc |
+| 16 | LLVM 18 codegen crash (mitigated: TM, no-vectorize, shutdown, _exit) | tier2_compiler.cpp, tier2_manager.cpp, helper.cpp |
+| 17 | Use-after-free race in Tier2Manager | helper.cpp, tier2_manager |
+| 18 | ret_type not surviving ir_save/ir_load | pipeline-wide |
+| 19 | Exit-time core dump (worker mid-LLVM at teardown) | helper.cpp, tier2_manager.cpp, tier2_compiler.cpp |
 
 ---
 

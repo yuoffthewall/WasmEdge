@@ -5,11 +5,8 @@
 
 #if defined(WASMEDGE_BUILD_IR_JIT) && defined(WASMEDGE_USE_LLVM)
 
-#include "runtime/instance/function.h"
-#include "runtime/instance/module.h"
 #include "vm/tier2_compiler.h"
 #include <fmt/format.h>
-#include <set>
 #include <spdlog/spdlog.h>
 
 namespace WasmEdge::VM {
@@ -19,32 +16,38 @@ Tier2Manager::Tier2Manager() noexcept {
 }
 
 Tier2Manager::~Tier2Manager() noexcept {
+  shutdown();
+  if (Worker_.joinable())
+    Worker_.join();
+}
+
+void Tier2Manager::shutdown() noexcept {
   {
     std::lock_guard<std::mutex> Lock(Mu_);
     Shutdown_.store(true, std::memory_order_release);
   }
   CV_.notify_one();
-  if (Worker_.joinable())
-    Worker_.join();
 }
 
-void Tier2Manager::enqueue(uint32_t FuncIdx,
-                           const Runtime::Instance::ModuleInstance *ModInst,
-                           void **FuncTable) noexcept {
+void Tier2Manager::enqueue(uint32_t FuncIdx, std::string IRText,
+                           uint8_t RetType,
+                           std::shared_ptr<void *[]> FuncTable) noexcept {
   {
     std::lock_guard<std::mutex> Lock(Mu_);
-    // Dedup: skip if already enqueued or compiled.
-    auto Key = std::make_pair(ModInst, FuncIdx);
+    // Dedup: skip if already enqueued or compiled for this FuncTable+FuncIdx.
+    auto Key = std::make_pair(reinterpret_cast<uintptr_t>(FuncTable.get()),
+                              FuncIdx);
     if (Seen_.count(Key))
       return;
     Seen_.insert(Key);
-    Queue_.push({FuncIdx, ModInst, FuncTable});
+    Queue_.push({FuncIdx, std::move(IRText), RetType, std::move(FuncTable)});
   }
   CV_.notify_one();
 }
 
 void Tier2Manager::workerLoop() {
   Tier2Compiler Compiler;
+  Compiler.setShutdownFlag(&Shutdown_);
 
   // Debug: limit number of tier-2 compilations via env var.
   uint32_t MaxCompilations = UINT32_MAX;
@@ -59,38 +62,32 @@ void Tier2Manager::workerLoop() {
       CV_.wait(Lock, [this] {
         return !Queue_.empty() || Shutdown_.load(std::memory_order_acquire);
       });
-      if (Shutdown_.load(std::memory_order_acquire) && Queue_.empty())
+      if (Shutdown_.load(std::memory_order_acquire)) {
+        WorkerDone_.store(true, std::memory_order_release);
         return;
-      Req = Queue_.front();
+      }
+      Req = std::move(Queue_.front());
       Queue_.pop();
     }
 
     if (CompileCount >= MaxCompilations)
       continue;
 
-    // Get the FunctionInstance for this funcIdx.
-    auto Funcs = Req.ModInst->getFunctionInstances();
-    if (Req.FuncIdx >= Funcs.size()) {
-      spdlog::warn("tier2: funcIdx {} out of range ({})", Req.FuncIdx,
-                    Funcs.size());
+    if (Req.IRText.empty()) {
+      spdlog::warn("tier2: func {} has empty IR text", Req.FuncIdx);
       continue;
     }
 
-    const auto *FuncInst = Funcs[Req.FuncIdx];
-    if (!FuncInst || !FuncInst->isIRJitFunction()) {
-      spdlog::warn("tier2: func {} is not an IR JIT function", Req.FuncIdx);
-      continue;
-    }
-
-    const auto &JitFunc = FuncInst->getIRJitFunc();
-    if (JitFunc.IRText.empty()) {
-      spdlog::warn("tier2: func {} has no preserved IR text", Req.FuncIdx);
-      continue;
+    // Check shutdown again before starting a potentially-crashing compilation.
+    if (Shutdown_.load(std::memory_order_acquire)) {
+      WorkerDone_.store(true, std::memory_order_release);
+      return;
     }
 
     // Load IR text → ir_ctx → LLVM IR → optimize → native code.
     std::string FuncName = fmt::format("wasm_tier2_{:03d}", Req.FuncIdx);
-    auto Result = Compiler.compile(JitFunc.IRText, FuncName, 2);
+    spdlog::info("tier2: starting compile for func {} ({})", Req.FuncIdx, FuncName);
+    auto Result = Compiler.compile(Req.IRText, FuncName, Req.RetType, 2);
     if (!Result) {
       spdlog::warn("tier2: compilation failed for func {} ({})", Req.FuncIdx,
                     FuncName);
@@ -100,7 +97,7 @@ void Tier2Manager::workerLoop() {
     // Swap the FuncTable pointer. This is a single pointer store which is
     // naturally atomic on x86-64/aarch64. The old tier-1 code stays alive
     // (owned by FunctionInstance) so in-flight calls complete safely.
-    Req.FuncTable[Req.FuncIdx] = Result->NativeFunc;
+    Req.FuncTable.get()[Req.FuncIdx] = Result->NativeFunc;
     Tier2Count_.fetch_add(1, std::memory_order_relaxed);
     ++CompileCount;
 

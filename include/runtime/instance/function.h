@@ -75,10 +75,11 @@ public:
   /// Constructor for IR JIT compiled function.
   FunctionInstance(const ModuleInstance *Mod, const uint32_t TIdx,
                    const AST::FunctionType &Type, void *NativeFunc,
-                   size_t CodeSize, std::string IRText) noexcept
+                   size_t CodeSize, std::string IRText,
+                   uint8_t RetType = 0) noexcept
       : CompositeBase(Mod, TIdx), FuncType(Type),
         Data(std::in_place_type_t<IRJitFunction>(), NativeFunc, CodeSize,
-             std::move(IRText)) {
+             std::move(IRText), RetType) {
     assuming(ModInst);
   }
 #endif
@@ -161,11 +162,12 @@ public:
   /// Upgrade from WasmFunction to IR JIT compiled function.
   /// Returns true if successful, false if not a WasmFunction.
   bool upgradeToIRJit(void *NativeFunc, size_t CodeSize,
-                      std::string IRText) noexcept {
+                      std::string IRText, uint8_t RetType = 0) noexcept {
     if (!std::holds_alternative<WasmFunction>(Data)) {
       return false;
     }
-    Data.template emplace<IRJitFunction>(NativeFunc, CodeSize, std::move(IRText));
+    Data.template emplace<IRJitFunction>(NativeFunc, CodeSize,
+                                         std::move(IRText), RetType);
     return true;
   }
 #endif
@@ -194,9 +196,12 @@ private:
     void *NativeFunc;    // Pointer to JIT compiled code
     size_t CodeSize;     // Size of compiled code
     std::string IRText;  // Serialized IR text (preserved for potential tier-up)
+    uint8_t RetType;     // ir_type of return value (IR_VOID=0 for void)
 
-    IRJitFunction(void *Func, size_t Size, std::string Text) noexcept
-        : NativeFunc(Func), CodeSize(Size), IRText(std::move(Text)) {}
+    IRJitFunction(void *Func, size_t Size, std::string Text,
+                  uint8_t Ret = 0) noexcept
+        : NativeFunc(Func), CodeSize(Size), IRText(std::move(Text)),
+          RetType(Ret) {}
   };
 #endif
 

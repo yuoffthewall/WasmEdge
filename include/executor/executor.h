@@ -200,6 +200,17 @@ public:
   /// Getter of Configure
   const Configure &getConfigure() const { return Conf; }
 
+#ifdef WASMEDGE_BUILD_IR_JIT
+  /// Get shared FuncTable for tier-2 background compilation.
+  std::shared_ptr<void *[]> getJitFuncTable(
+      const Runtime::Instance::ModuleInstance *ModInst) const {
+    auto It = IRJitEnvCache_.find(ModInst);
+    if (It != IRJitEnvCache_.end())
+      return It->second.FuncTable;
+    return nullptr;
+  }
+#endif
+
   /// Instantiate a WASM Module into an anonymous module instance.
   Expect<std::unique_ptr<Runtime::Instance::ModuleInstance>>
   instantiateModule(Runtime::StoreManager &StoreMgr, const AST::Module &Mod);
@@ -1206,7 +1217,10 @@ private:
 #ifdef WASMEDGE_BUILD_IR_JIT
   /// Per-module cache for JIT env (FuncTable, GlobalBase, MemoryBase).
   struct IRJitEnvCache {
-    std::vector<void *> FuncTable;
+    /// FuncTable is shared_ptr so the tier-2 background worker can safely
+    /// write to it even if the Executor/Cache is destroyed first.
+    std::shared_ptr<void *[]> FuncTable;
+    uint32_t FuncTableSize = 0;
     std::vector<ValVariant *> GlobalPtrs;
     void *MemoryBase = nullptr;
     /// Tier-2 profiling: per-function call counters.

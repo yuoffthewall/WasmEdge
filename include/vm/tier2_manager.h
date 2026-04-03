@@ -24,18 +24,12 @@
 #include <mutex>
 #include <queue>
 #include <set>
+#include <string>
 #include <thread>
 #include <utility>
 
 namespace WasmEdge {
-
-namespace Runtime::Instance {
-class ModuleInstance;
-} // namespace Runtime::Instance
-
 namespace VM {
-
-struct JitExecEnv;
 
 class Tier2Manager {
 public:
@@ -45,14 +39,18 @@ public:
   Tier2Manager(const Tier2Manager &) = delete;
   Tier2Manager &operator=(const Tier2Manager &) = delete;
 
+  /// Signal the worker to stop (non-blocking). Used by atexit handler
+  /// before _exit(0) to give the worker a chance to check Shutdown_.
+  void shutdown() noexcept;
+
   /// Enqueue a function for tier-2 recompilation.
   /// Called from jit_tier_up_notify (JIT code context).
   /// \param FuncIdx   Module function index.
-  /// \param ModInst   The module instance (to access FunctionInstance + FuncTable).
-  /// \param FuncTable Pointer to the FuncTable array (for live code swap).
-  void enqueue(uint32_t FuncIdx,
-               const Runtime::Instance::ModuleInstance *ModInst,
-               void **FuncTable) noexcept;
+  /// \param IRText    Serialized IR text for the function.
+  /// \param RetType   ir_type of the function's return value.
+  /// \param FuncTable Shared pointer to the FuncTable array (for live code swap).
+  void enqueue(uint32_t FuncIdx, std::string IRText, uint8_t RetType,
+               std::shared_ptr<void *[]> FuncTable) noexcept;
 
   /// Number of functions successfully recompiled to tier-2.
   uint32_t tier2Count() const noexcept {
@@ -62,8 +60,9 @@ public:
 private:
   struct Request {
     uint32_t FuncIdx;
-    const Runtime::Instance::ModuleInstance *ModInst;
-    void **FuncTable;
+    std::string IRText;
+    uint8_t RetType;
+    std::shared_ptr<void *[]> FuncTable;
   };
 
   void workerLoop();
@@ -72,9 +71,9 @@ private:
   std::mutex Mu_;
   std::condition_variable CV_;
   std::queue<Request> Queue_;
-  std::set<std::pair<const Runtime::Instance::ModuleInstance *, uint32_t>>
-      Seen_;
+  std::set<std::pair<uintptr_t, uint32_t>> Seen_;
   std::atomic<bool> Shutdown_{false};
+  std::atomic<bool> WorkerDone_{false};
   std::atomic<uint32_t> Tier2Count_{0};
 };
 

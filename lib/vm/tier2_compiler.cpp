@@ -26,16 +26,39 @@ extern "C" {
 
 #include <cstdio>
 #include <string>
-#include <vector>
 
 namespace WasmEdge::VM {
 
-struct Tier2Compiler::Impl {};
+struct Tier2Compiler::Impl {
+  LLVMTargetMachineRef TM = nullptr;
+  char *Triple = nullptr;
+
+  ~Impl() {
+    if (TM)
+      LLVMDisposeTargetMachine(TM);
+    if (Triple)
+      LLVMDisposeMessage(Triple);
+  }
+};
 
 Tier2Compiler::Tier2Compiler() noexcept : P(std::make_unique<Impl>()) {
   LLVMInitializeNativeTarget();
   LLVMInitializeNativeAsmPrinter();
   LLVMInitializeNativeAsmParser();
+
+  // Create a native TargetMachine for optimization passes and codegen.
+  P->Triple = LLVMGetDefaultTargetTriple();
+  LLVMTargetRef Target = nullptr;
+  char *Err = nullptr;
+  if (!LLVMGetTargetFromTriple(P->Triple, &Target, &Err)) {
+    P->TM = LLVMCreateTargetMachine(Target, P->Triple, "generic", "",
+                                     LLVMCodeGenLevelDefault,
+                                     LLVMRelocPIC, LLVMCodeModelJITDefault);
+  } else {
+    spdlog::error("tier2: failed to get target for {}: {}", P->Triple,
+                  Err ? Err : "(null)");
+    LLVMDisposeMessage(Err);
+  }
 }
 Tier2Compiler::~Tier2Compiler() noexcept = default;
 
@@ -47,6 +70,7 @@ Tier2Compiler::~Tier2Compiler() noexcept = default;
 struct Tier2Loader {
   ir_loader Base;
   ir_ctx *Result; // Set by func_process — the caller must ir_free + delete.
+  uint8_t RetType; // ir_type from tier-1 (ir_save doesn't encode it).
 };
 
 static bool tier2_func_init(ir_loader *loader, ir_ctx *ctx, const char *) {
@@ -60,15 +84,9 @@ static bool tier2_func_process(ir_loader *loader, ir_ctx *ctx, const char *) {
   auto *L = reinterpret_cast<Tier2Loader *>(loader);
 
   // ir_save doesn't encode ret_type; ir_load sets it to -1 (unset).
-  // Infer it from the RETURN instruction's operand type.
+  // Use the ret_type captured from tier-1's ir_ctx before ir_jit_compile.
   if (ctx->ret_type == static_cast<ir_type>(-1)) {
-    for (ir_ref i = 1; i < ctx->insns_count; i++) {
-      ir_insn *insn = &ctx->ir_base[i];
-      if (insn->op == IR_RETURN && insn->op2) {
-        ctx->ret_type = static_cast<ir_type>(ctx->ir_base[insn->op2].type);
-        break;
-      }
-    }
+    ctx->ret_type = static_cast<ir_type>(L->RetType);
   }
 
   // Shallow-copy the ctx so that ir_load's subsequent ir_free(&ctx) doesn't
@@ -95,7 +113,7 @@ static bool tier2_external_sym_dcl(ir_loader *, const char *, uint32_t) {
 
 /// Load serialized IR text into a fresh ir_ctx.  Caller owns the returned
 /// ir_ctx and must ir_free + delete it.
-static ir_ctx *loadIRText(const std::string &IRText) {
+static ir_ctx *loadIRText(const std::string &IRText, uint8_t RetType) {
   ir_loader_init();
 
   Tier2Loader L{};
@@ -105,6 +123,7 @@ static ir_ctx *loadIRText(const std::string &IRText) {
   L.Base.external_func_dcl = tier2_external_func_dcl;
   L.Base.external_sym_dcl = tier2_external_sym_dcl;
   L.Result = nullptr;
+  L.RetType = RetType;
 
   FILE *F = fmemopen(const_cast<char *>(IRText.data()), IRText.size(), "r");
   if (!F) {
@@ -194,6 +213,7 @@ static void registerSymbolsWithLLJIT(LLVMOrcLLJITRef J) {
 // ---------------------------------------------------------------------------
 Expect<Tier2CompileResult> Tier2Compiler::compile(const std::string &IRTextIn,
                                                    const std::string &FuncName,
+                                                   uint8_t RetType,
                                                    unsigned OptLevel) {
   if (IRTextIn.empty()) {
     spdlog::warn("tier2: empty IR text for {}", FuncName);
@@ -201,7 +221,7 @@ Expect<Tier2CompileResult> Tier2Compiler::compile(const std::string &IRTextIn,
   }
 
   // 1. Reload IR text into a fresh ir_ctx, then emit LLVM IR from it.
-  ir_ctx *Ctx = loadIRText(IRTextIn);
+  ir_ctx *Ctx = loadIRText(IRTextIn, RetType);
   if (!Ctx) {
     spdlog::warn("tier2: failed to reload IR text for {}", FuncName);
     return Unexpect(ErrCode::Value::RuntimeError);
@@ -217,6 +237,12 @@ Expect<Tier2CompileResult> Tier2Compiler::compile(const std::string &IRTextIn,
   }
 
   if (std::getenv("WASMEDGE_TIER2_DUMP_IR")) {
+    // Also dump the raw serialized IR text for debugging.
+    std::string RawPath = "/tmp/tier2_" + FuncName + ".ir";
+    if (FILE *F = fopen(RawPath.c_str(), "w")) {
+      fwrite(IRTextIn.data(), 1, IRTextIn.size(), F);
+      fclose(F);
+    }
     std::string DumpPath = "/tmp/tier2_" + FuncName + ".ll";
     if (FILE *F = fopen(DumpPath.c_str(), "w")) {
       fwrite(IRText.data(), 1, IRText.size(), F);
@@ -236,6 +262,7 @@ Expect<Tier2CompileResult> Tier2Compiler::compile(const std::string &IRTextIn,
   LLVMModuleRef Mod = nullptr;
   char *ErrMsg = nullptr;
   if (LLVMParseIRInContext(LLCtx, MemBuf, &Mod, &ErrMsg)) {
+
     spdlog::error("tier2: LLVMParseIRInContext failed for {}: {}", FuncName,
                   ErrMsg ? ErrMsg : "(null)");
     LLVMDisposeMessage(ErrMsg);
@@ -243,11 +270,20 @@ Expect<Tier2CompileResult> Tier2Compiler::compile(const std::string &IRTextIn,
     return Unexpect(ErrCode::Value::RuntimeError);
   }
 
+  // 2a. Set target triple and data layout so optimization passes work correctly.
+  if (P->TM) {
+    LLVMSetTarget(Mod, P->Triple);
+    auto *DL = LLVMCreateTargetDataLayout(P->TM);
+    LLVMSetModuleDataLayout(Mod, DL);
+    LLVMDisposeTargetData(DL);
+  }
+
   // 2b. Verify the LLVM IR module. ir_emit_llvm can produce domination errors
   //     or other invalid IR that would crash LLVM's codegen.
   {
     char *VerifyMsg = nullptr;
     if (LLVMVerifyModule(Mod, LLVMReturnStatusAction, &VerifyMsg)) {
+  
       spdlog::warn("tier2: LLVM verification failed for {}: {}", FuncName,
                     VerifyMsg ? VerifyMsg : "(null)");
       LLVMDisposeMessage(VerifyMsg);
@@ -258,6 +294,13 @@ Expect<Tier2CompileResult> Tier2Compiler::compile(const std::string &IRTextIn,
     LLVMDisposeMessage(VerifyMsg);
   }
 
+  // Bail out if shutdown was signaled (avoid entering long LLVM calls).
+  if (isShutdown()) {
+    LLVMDisposeModule(Mod);
+    LLVMOrcDisposeThreadSafeContext(TSCtx);
+    return Unexpect(ErrCode::Value::RuntimeError);
+  }
+
   // 3. Run LLVM optimization passes.
   {
     char PassStr[32];
@@ -265,7 +308,12 @@ Expect<Tier2CompileResult> Tier2Compiler::compile(const std::string &IRTextIn,
                   OptLevel > 3 ? 3u : OptLevel);
 
     LLVMPassBuilderOptionsRef PBO = LLVMCreatePassBuilderOptions();
-    if (auto Err = LLVMRunPasses(Mod, PassStr, nullptr, PBO)) {
+    // Disable auto-vectorization: wasm JIT functions are typically small and
+    // don't benefit from it. Also avoids LLVM 18 ISel bugs with scalable
+    // vector types on x86-64 (report_fatal_error in EVT::getSizeInBits).
+    LLVMPassBuilderOptionsSetLoopVectorization(PBO, 0);
+    LLVMPassBuilderOptionsSetSLPVectorization(PBO, 0);
+    if (auto Err = LLVMRunPasses(Mod, PassStr, P->TM, PBO)) {
       auto Msg = LLVMGetErrorMessage(Err);
       spdlog::warn("tier2: LLVMRunPasses warning for {}: {}", FuncName, Msg);
       LLVMDisposeErrorMessage(Msg);
@@ -273,9 +321,17 @@ Expect<Tier2CompileResult> Tier2Compiler::compile(const std::string &IRTextIn,
     LLVMDisposePassBuilderOptions(PBO);
   }
 
+  // Bail out if shutdown was signaled (avoid ISel codegen which can crash).
+  if (isShutdown()) {
+    LLVMDisposeModule(Mod);
+    LLVMOrcDisposeThreadSafeContext(TSCtx);
+    return Unexpect(ErrCode::Value::RuntimeError);
+  }
+
   // 4. Create an ORC LLJIT and add the module.
   LLVMOrcLLJITRef J = nullptr;
   if (auto Err = LLVMOrcCreateLLJIT(&J, nullptr)) {
+
     auto Msg = LLVMGetErrorMessage(Err);
     spdlog::error("tier2: LLVMOrcCreateLLJIT failed: {}", Msg);
     LLVMDisposeErrorMessage(Msg);
@@ -295,6 +351,7 @@ Expect<Tier2CompileResult> Tier2Compiler::compile(const std::string &IRTextIn,
 
     auto MainJD = LLVMOrcLLJITGetMainJITDylib(J);
     if (auto Err = LLVMOrcLLJITAddLLVMIRModule(J, MainJD, TSMod)) {
+  
       auto Msg = LLVMGetErrorMessage(Err);
       spdlog::error("tier2: addLLVMIRModule failed for {}: {}", FuncName, Msg);
       LLVMDisposeErrorMessage(Msg);
@@ -306,9 +363,17 @@ Expect<Tier2CompileResult> Tier2Compiler::compile(const std::string &IRTextIn,
     // On success, LLJIT owns TSMod.
   }
 
-  // 5. Look up the compiled function.
+  // Last chance to bail out before codegen (ISel is where LLVM 18 bugs crash).
+  if (isShutdown()) {
+    LLVMOrcDisposeThreadSafeContext(TSCtx);
+    LLVMOrcDisposeLLJIT(J);
+    return Unexpect(ErrCode::Value::RuntimeError);
+  }
+
+  // 5. Look up the compiled function (triggers LLJIT codegen).
   LLVMOrcJITTargetAddress FuncAddr = 0;
   if (auto Err = LLVMOrcLLJITLookup(J, &FuncAddr, FuncName.c_str())) {
+
     auto Msg = LLVMGetErrorMessage(Err);
     spdlog::error("tier2: lookup failed for {}: {}", FuncName, Msg);
     LLVMDisposeErrorMessage(Msg);

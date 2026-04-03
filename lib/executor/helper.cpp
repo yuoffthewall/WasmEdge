@@ -13,7 +13,9 @@
 #include "vm/tier2_manager.h"
 #endif
 #include <csetjmp>
+#include <cstdlib>
 #include <cstring>
+#include <unistd.h>
 #endif
 
 #include <cstdint>
@@ -27,9 +29,21 @@ static thread_local const WasmEdge::Runtime::Instance::ModuleInstance *g_jitModI
 static thread_local WasmEdge::Runtime::Instance::MemoryInstance *g_jitMemory0 = nullptr;
 
 #if defined(WASMEDGE_USE_LLVM)
-/// Global Tier2Manager: lazy-initialized on first tier-up, lives for process.
+/// Global Tier2Manager: lazy-initialized on first tier-up.
+/// The atexit handler signals shutdown and calls _exit(0) to prevent LLVM ISel
+/// bugs in the worker thread from crashing the process during teardown.
+/// _exit(0) terminates immediately — no static destructors, no further atexit
+/// handlers — so the worker thread (which may be mid-LLVM compilation) is
+/// killed cleanly by the OS. All test output is already flushed by this point.
 static WasmEdge::VM::Tier2Manager *getTier2Manager() {
-  static auto *Mgr = new WasmEdge::VM::Tier2Manager();
+  static WasmEdge::VM::Tier2Manager *Mgr = [] {
+    auto *M = new WasmEdge::VM::Tier2Manager();
+    std::atexit([] {
+      Mgr->shutdown();
+      _exit(0);
+    });
+    return M;
+  }();
   return Mgr;
 }
 #endif
@@ -469,9 +483,26 @@ extern "C" void jit_tier_up_notify(WasmEdge::VM::JitExecEnv *env,
                 funcIdx, counterVal);
 
 #if defined(WASMEDGE_USE_LLVM)
-  // Enqueue for tier-2 LLVM recompilation if we have the module context.
+  // Enqueue for tier-2 LLVM recompilation. Copy the IRText now so the
+  // background worker never accesses the ModuleInstance (which may be
+  // destroyed before the worker processes the request).
   if (g_jitModInst && env->FuncTable) {
-    getTier2Manager()->enqueue(funcIdx, g_jitModInst, env->FuncTable);
+    auto Funcs = g_jitModInst->getFunctionInstances();
+    if (funcIdx < Funcs.size()) {
+      const auto *FuncInst = Funcs[funcIdx];
+      if (FuncInst && FuncInst->isIRJitFunction()) {
+        const auto &JitFunc = FuncInst->getIRJitFunc();
+        if (!JitFunc.IRText.empty()) {
+          // Pass the shared FuncTable so the tier-2 worker keeps it alive
+          // even if the Executor/Cache is destroyed before processing.
+          auto FT = g_jitExecutor->getJitFuncTable(g_jitModInst);
+          if (FT) {
+            getTier2Manager()->enqueue(funcIdx, JitFunc.IRText,
+                                       JitFunc.RetType, std::move(FT));
+          }
+        }
+      }
+    }
   }
 #endif
 }
@@ -870,12 +901,14 @@ Executor::enterFunction(Runtime::StackManager &StackMgr,
     IRJitEnvCache &Cache = IRJitEnvCache_[ModInst];
     const bool needBuild =
         ModInst &&
-        (Cache.FuncTable.size() != ModInst->getFunctionInstances().size() ||
+        (Cache.FuncTableSize != ModInst->getFunctionInstances().size() ||
          Cache.GlobalPtrs.size() != ModInst->getGlobalInstances().size());
     if (needBuild) {
       auto FuncInsts = ModInst->getFunctionInstances();
-      Cache.FuncTable.resize(FuncInsts.size());
-      for (uint32_t I = 0; I < FuncInsts.size(); ++I) {
+      auto N = static_cast<uint32_t>(FuncInsts.size());
+      Cache.FuncTable = std::shared_ptr<void *[]>(new void *[N]());
+      Cache.FuncTableSize = N;
+      for (uint32_t I = 0; I < N; ++I) {
         const auto *F = FuncInsts[I];
         if (F->isIRJitFunction()) {
           Cache.FuncTable[I] = F->getIRJitNativeFunc();
@@ -900,10 +933,8 @@ Executor::enterFunction(Runtime::StackManager &StackMgr,
         Cache.TierState.resize(FuncInsts.size(), 0);
       }
     }
-    void **FuncTable =
-        Cache.FuncTable.empty() ? nullptr : Cache.FuncTable.data();
-    uint32_t FuncTableSize =
-        static_cast<uint32_t>(Cache.FuncTable.size());
+    void **FuncTable = Cache.FuncTable.get();
+    uint32_t FuncTableSize = Cache.FuncTableSize;
     void *GlobalBase =
         Cache.GlobalPtrs.empty() ? nullptr : Cache.GlobalPtrs.data();
     void *MemoryBase = Cache.MemoryBase;

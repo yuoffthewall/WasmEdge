@@ -139,8 +139,9 @@ IRJitEngine::compile(ir_ctx *Ctx) {
     if (f) { ir_save(Ctx, 0, f); fclose(f); }
   }
 
-  // Snapshot IR text BEFORE ir_jit_compile (which mutates the context).
+  // Snapshot IR text and ret_type BEFORE ir_jit_compile (which mutates the context).
   // Tier-2 reloads this text into a fresh ir_ctx for LLVM emission.
+  uint8_t RetType = Ctx->ret_type;
   std::string IRText;
   {
     char *buf = nullptr;
@@ -185,6 +186,7 @@ IRJitEngine::compile(ir_ctx *Ctx) {
   Result.NativeFunc = NativeCode;
   Result.CodeSize = CodeSize;
   Result.IRText = std::move(IRText);
+  Result.RetType = RetType;
 
   return Result;
 }

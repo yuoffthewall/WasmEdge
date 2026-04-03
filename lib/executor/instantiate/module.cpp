@@ -350,7 +350,8 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
         // Upgrade function to IR JIT.
         // Pass serialized IR text for potential tier-2 LLVM recompilation.
         FuncInst->upgradeToIRJit(CompRes->NativeFunc, CompRes->CodeSize,
-                                 std::move(CompRes->IRText));
+                                 std::move(CompRes->IRText),
+                                 CompRes->RetType);
         SuccessCount++;
       }
       CodeIdx++;
