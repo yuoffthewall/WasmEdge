@@ -193,3 +193,64 @@ call.
 The `IR_OPT_INLINE` pass should correctly handle IF/THEN/ELSE patterns
 with indirect calls and PHI merges.  Likely a bug in how the pass
 handles memory effects of calls in diamond control flow.
+
+---
+
+## Bug 5: Empty-block cycle in ir_emit causes infinite loop at O0
+
+**Syndrome**:
+The `shootout-base64` sightglass kernel hangs indefinitely during JIT
+**compilation** (never reaches execution) at O0.  The hang is in
+`_ir_skip_empty_blocks()` (`ir_cfg.c:1296`), which loops forever through
+a cycle of two empty blocks.  O1 and O2 are unaffected because optimizer
+passes (SCCP, DCE) transform or eliminate the pattern before code
+emission.
+
+**Reproducer**:
+```
+WASMEDGE_SIGHTGLASS_KERNEL=shootout-base64 WASMEDGE_SIGHTGLASS_MODE=IR_JIT \
+WASMEDGE_IR_JIT_OPT_LEVEL=0 \
+./test/ir/wasmedgeIRBenchmarkTests --gtest_filter='*SightglassSuite*'
+```
+
+**Root cause**:
+The Wasm module contains an empty infinite loop — the IR equivalent of
+`(loop $L (br $L))` — which the WasmEdge IR builder correctly translates
+to:
+```
+LOOP_BEGIN(entry_edge, back_edge)   // block 9
+END                                  // block 9
+BEGIN                                // block 10
+LOOP_END                             // block 10  → successor = block 9
+```
+
+During code emission (`ir_emit.c`, the instruction-matching phase), each
+block is checked for emptiness: if a block contains only a start and end
+instruction (no computation), and its sole successor is not itself, it is
+marked `IR_BB_EMPTY`.  The self-loop guard
+(`ctx->cfg_edges[bb->successors] != b`) only catches the trivial case of
+a block whose successor is itself.  It does **not** detect multi-block
+cycles: block 9 points to block 10 (9 ≠ 10, passes the check), and
+block 10 points back to block 9 (10 ≠ 9, also passes).  Both blocks are
+marked `IR_BB_EMPTY`.
+
+Later, when emitting an `IF` instruction whose true branch leads through
+a chain of empty blocks into this cycle, `ir_get_true_false_blocks()`
+calls `ir_skip_empty_target_blocks()` → `_ir_skip_empty_blocks()`, which
+follows the successor chain: block 3 (empty) → block 8 (empty) → block 9
+(empty) → block 10 (empty) → block 9 → … — infinite loop.
+
+**Fix** (applied to `thirdparty/ir`):
+
+1. **`ir_emit.c` (primary):** Before marking a block as `IR_BB_EMPTY`,
+   follow its successor chain through already-marked-empty blocks.  If
+   the chain leads back to the current block, skip the `IR_BB_EMPTY`
+   marking.  The un-marked block retains its label in the emission phase
+   and emits its `END`/`LOOP_END` as a jump, correctly generating the
+   empty infinite loop in machine code (a `jmp` back to itself through
+   the empty chain).
+
+2. **`ir_cfg.c` (safety fallback):** Added an iteration counter to
+   `_ir_skip_empty_blocks()` bounded by `cfg_blocks_count`.  If
+   exceeded, asserts (debug builds) and returns the current block to
+   prevent hangs from any unforeseen empty-block cycle.
