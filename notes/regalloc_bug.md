@@ -11,6 +11,7 @@ fixed. One remains open.
 | #1 — stk_tmp clobbers register arg (O0) | O0 | ir_x86.dasc | Fixed |
 | #2 — prev_use_ref skips spill-reload for duplicate args | O2 | ir_ra.c | Fixed |
 | #3 — ir_UNREACHABLE drops function epilogue | O0–O2 | ir_builder.cpp, helper.cpp, ir_jit_engine.cpp | Fixed |
+| #4 — Dead load skips spill reload, stale register on alt CFG path | O1 | ir_ra.c | Fixed |
 | rust-compression O2 regression | O2 | thirdparty/ir (upstream) | Open |
 
 ---
@@ -232,6 +233,127 @@ skipped functions crashed by jumping to NULL. Fixed by:
    `ir_builder.cpp`)
 3. Including skipped functions in the `MaxCallArgs` pre-scan (since they now
    use the buffer path)
+
+---
+
+## Bug #4 — Dead Load Skips Spill Reload, Stale Register on Alternate CFG Path
+
+### Symptom
+
+At O1, three Sightglass kernels crashed with SIGSEGV: `blind-sig`,
+`pulldown-cmark`, `regex`. A callee-saved register (`rbp`) holding a wasm
+memory base pointer contained a stale function-parameter value instead of the
+correct spilled value, causing invalid memory accesses. All three passed at O0
+and O2.
+
+### How to Reproduce
+
+```shell
+cd build
+WASMEDGE_SIGHTGLASS_MODE=IR_JIT WASMEDGE_SIGHTGLASS_SKIP_INTERP=1 \
+  WASMEDGE_IR_JIT_OPT_LEVEL=1 WASMEDGE_SIGHTGLASS_KERNEL=blind-sig \
+  ./test/ir/wasmedgeIRBenchmarkTests --gtest_filter='*SightglassSuite*'
+```
+
+Standalone reproduction with the `ir` tool:
+
+```shell
+cd thirdparty/ir
+./ir -O1 -S /tmp/blind_sig_082_O1_before.ir   # produces asm with missing reload
+```
+
+### Root Cause
+
+**File:** `thirdparty/ir/ir_ra.c`, functions `assign_regs()` and
+`ir_emit_load_int()` in `ir_emit_x86.h`.
+
+The linear scan register allocator's `assign_regs()` function tracks which
+basic blocks have an "available" copy of a spilled register (i.e., the register
+was reloaded from the spill slot in that block). When a `SPILL_LOAD` is
+assigned to a use, the containing block is marked available in a bitset.
+Subsequent uses on paths through that block skip the reload
+(`needs_spill_reload()` returns false).
+
+The emitter has a "dead load" optimization: `ir_emit_load_int()` (line 33356)
+returns immediately without emitting any code when `use_lists[def].count == 1`,
+meaning the LOAD's data output is unused (only the memory ordering token `l_N`
+feeds the next instruction). On x86, load-load ordering is guaranteed by TSO,
+so the load is unnecessary.
+
+The bug: when a SPILL_LOAD was assigned to an operand of such a dead LOAD
+(through a fused ADD address computation), the register allocator marked the
+block as available, but the emitter silently skipped the entire LOAD — including
+the spill reload. All downstream uses on that CFG path reused the register
+without reload, reading a stale value.
+
+**Concrete example** (blind-sig function 082, vreg 6 = `d_12`, register `rbp`,
+spill slot `0x10(%rsp)`):
+
+```
+IR in BB17:
+  d_155 = ADD(d_12, c_39);            // FUSED into d_156
+  d_156, l_156 = LOAD(l_154, d_155);  // d_156 unused! only l_156 feeds forward
+
+RA decisions for d_12's rbp sub-interval:
+  ref=54  bb=3  => SPILL_LOAD  (mark BB3 available)  ← reload emitted here
+  ref=57  bb=3  => REUSE       (BB3 available)
+  ...
+  ref=144 bb=13 => REUSE       (reachable from BB3)
+  ref=156 bb=17 => SPILL_LOAD  (mark BB17 available) ← reload NOT emitted!
+  ref=203 bb=27 => REUSE       (BB17 available)      ← stale rbp used → crash
+```
+
+The SPILL_LOAD at ref=156 was set on the fused ADD (instruction 155), but
+`ir_emit_load_int` returned early at the dead-load check for instruction 156,
+never processing the fused address operand or its spill reload.
+
+Assembly (before fix): only **one** `rbp` reload (BB3 path), none on the
+BB2→BB15→BB17→BB27 path:
+
+```asm
+movq 0x10(%rsp), %rbp   ; line 43: reload on BB3 path
+...
+.L13:                    ; BB27 path — NO reload
+  movb (%rdx, %rbp), %r8b  ; rbp = stale value → SIGSEGV
+```
+
+### Why O1-Only
+
+- **O0:** No register allocation (no spilling), so the bug cannot manifest.
+- **O1:** GCM + linear scan regalloc + scheduling. The specific pattern of a
+  dead LOAD with a spilled address operand on an alternate CFG path triggers the
+  bug.
+- **O2:** SCCP runs first and simplifies the IR enough (constant propagation,
+  dead code elimination) to avoid the dead-load-with-spill pattern entirely.
+
+### Fix
+
+**File:** `thirdparty/ir/ir_ra.c`
+
+Added `ir_is_dead_load()` helper that checks if an instruction is a
+LOAD/LOAD_v/VLOAD/VLOAD_v with `use_lists[ref].count == 1` — the exact
+condition the emitter uses to skip dead loads.
+
+In `assign_regs()`, the available-marking condition now checks:
+
+```c
+if (ir_ival_covers(ival, IR_SAVE_LIVE_POS_FROM_REF(ctx->cfg_blocks[use_b].end))
+ && !ir_is_dead_load(ctx, ref)) {
+    ir_bitset_incl(available, use_b);
+}
+```
+
+When the instruction at the use site is a dead load, the block is not marked
+available, forcing downstream uses to reload from the spill slot. This adds
+reloads only on paths that previously had missing reloads.
+
+Assembly (after fix): **three** `rbp` reloads — one per CFG path that uses it:
+
+```asm
+movq 0x10(%rsp), %rbp   ; line 43:  BB3 path (unchanged)
+movq 0x10(%rsp), %rbp   ; line 241: BB27 path via .L13 (NEW)
+movq 0x10(%rsp), %rbp   ; line 260: BB34 path via .L15 (NEW)
+```
 
 ---
 
