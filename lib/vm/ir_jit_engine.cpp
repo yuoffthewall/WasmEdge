@@ -228,28 +228,39 @@ Expect<void> IRJitEngine::invoke(void *NativeFunc,
     }
   }
 
-  // Register-based calling convention: dispatch through irJitInvokeNative
-  // which calls with native-typed args in SysV registers.
+  // Hybrid calling convention: register-based for ≤kRegCallMaxParams,
+  // buffer-based for higher arity.
+  bool useBuffer = (ParamTypes.size() > kRegCallMaxParams);
+
   if (RetTypes.empty()) {
-    detail::irJitInvokeNative(NativeFunc, &Env, FuncType, ArgsData);
+    if (useBuffer)
+      detail::irJitInvokeNativeBuffer(NativeFunc, &Env, FuncType, ArgsData);
+    else
+      detail::irJitInvokeNative(NativeFunc, &Env, FuncType, ArgsData);
   } else if (!Rets.empty()) {
+    uint64_t Raw;
+    if (useBuffer)
+      Raw = detail::irJitInvokeNativeBuffer(NativeFunc, &Env, FuncType, ArgsData);
+    else
+      Raw = detail::irJitInvokeNative(NativeFunc, &Env, FuncType, ArgsData);
+
     auto Code = RetTypes[0].getCode();
     if (Code == TypeCode::F32) {
-      uint64_t Raw = detail::irJitInvokeNative(NativeFunc, &Env, FuncType, ArgsData);
       float F;
       std::memcpy(&F, &Raw, sizeof(F));
       Rets[0] = ValVariant(F);
     } else if (Code == TypeCode::F64) {
-      uint64_t Raw = detail::irJitInvokeNative(NativeFunc, &Env, FuncType, ArgsData);
       double D;
       std::memcpy(&D, &Raw, sizeof(D));
       Rets[0] = ValVariant(D);
     } else {
-      uint64_t Raw = detail::irJitInvokeNative(NativeFunc, &Env, FuncType, ArgsData);
       Rets[0] = rawToValVariant(Raw, RetTypes[0]);
     }
   } else {
-    detail::irJitInvokeNative(NativeFunc, &Env, FuncType, ArgsData);
+    if (useBuffer)
+      detail::irJitInvokeNativeBuffer(NativeFunc, &Env, FuncType, ArgsData);
+    else
+      detail::irJitInvokeNative(NativeFunc, &Env, FuncType, ArgsData);
   }
 
   return {};

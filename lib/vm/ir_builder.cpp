@@ -9,6 +9,7 @@
 #include "ast/type.h"
 #include "common/errcode.h"
 #include "vm/ir_jit_engine.h"
+#include "vm/ir_jit_reg_invoke.h"
 
 // Include dstogov/ir headers
 extern "C" {
@@ -198,22 +199,45 @@ Expect<void> WasmToIRBuilder::initialize(
     LocalCount += Count;
   }
 
-  // Register-based calling convention: ret func(JitExecEnv*, arg0, arg1, ...)
-  // Each wasm parameter is declared as a separate ir_PARAM with its native type.
-  // The IR library assigns SysV ABI registers (rdi/rsi/rdx/rcx/r8/r9 for int,
-  // xmm0-7 for FP) and spills overflow params to the stack automatically.
+  // Hybrid calling convention based on parameter count:
+  // ≤kRegCallMaxParams: register-based — func(env, p0, p1, ...)
+  // >kRegCallMaxParams: buffer-based   — func(env, uint64_t *args)
+  // Buffer-based preserves callee-saved registers for the function body.
   EnvPtr = ir_PARAM(IR_ADDR, "exec_env", 1);
 
-  // Declare each wasm parameter as a native-typed ir_PARAM (param numbers 2..)
-  // Note: all ir_PARAM calls must be consecutive (IR library assertion).
-  for (uint32_t i = 0; i < ParamTypes.size(); ++i) {
-    ir_type irType = wasmTypeToIRType(ParamTypes[i]);
-    char name[32];
-    snprintf(name, sizeof(name), "p%u", i);
-    Locals[i] = ir_PARAM(irType, name, i + 2);
-    LocalTypes[i] = irType;
+  if (ParamTypes.size() <= kRegCallMaxParams) {
+    // Register-based: each wasm param as a native-typed ir_PARAM.
+    for (uint32_t i = 0; i < ParamTypes.size(); ++i) {
+      ir_type irType = wasmTypeToIRType(ParamTypes[i]);
+      char name[32];
+      snprintf(name, sizeof(name), "p%u", i);
+      Locals[i] = ir_PARAM(irType, name, i + 2);
+      LocalTypes[i] = irType;
+    }
+    ArgsPtr = IR_UNUSED;
+  } else {
+    // Buffer-based: second param is pointer to uint64_t[] args buffer.
+    ArgsPtr = ir_PARAM(IR_ADDR, "args", 2);
+    // Load each wasm param from the buffer.
+    for (uint32_t i = 0; i < ParamTypes.size(); ++i) {
+      ir_type irType = wasmTypeToIRType(ParamTypes[i]);
+      LocalTypes[i] = irType;
+      ir_ref SlotAddr =
+          ir_ADD_A(ArgsPtr, ir_CONST_ADDR(i * sizeof(uint64_t)));
+      // Load as I64 from buffer, then truncate/bitcast to native type.
+      if (irType == IR_I32) {
+        Locals[i] = ir_LOAD_I32(SlotAddr);
+      } else if (irType == IR_I64) {
+        Locals[i] = ir_LOAD_I64(SlotAddr);
+      } else if (irType == IR_FLOAT) {
+        Locals[i] = ir_LOAD_F(SlotAddr);
+      } else if (irType == IR_DOUBLE) {
+        Locals[i] = ir_LOAD_D(SlotAddr);
+      } else {
+        Locals[i] = ir_LOAD_I64(SlotAddr);
+      }
+    }
   }
-  ArgsPtr = IR_UNUSED;
 
   FuncTablePtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, FuncTable))));
   FuncTableSize = ir_LOAD_U32(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, FuncTableSize))));
@@ -251,19 +275,22 @@ Expect<void> WasmToIRBuilder::initialize(
 
 Expect<void>
 WasmToIRBuilder::buildFromInstructions(Span<const AST::Instruction> Instrs) {
-  // Pre-pass: compute max callee arity for buffer-based calls only.
-  // Direct calls (funcIdx >= ImportFuncNum) use register-based ABI and don't
-  // need SharedCallArgs. Only host calls and call_indirect use the buffer.
+  // Pre-pass: compute max callee arity for buffer-based calls.
+  // Buffer path is used for: host calls (imports), call_indirect, and
+  // direct JIT-to-JIT calls with >kRegCallMaxParams wasm parameters.
   uint32_t maxArity = 0;
   for (const auto &Instr : Instrs) {
     OpCode Op = Instr.getOpCode();
     if (Op == OpCode::Call) {
       uint32_t idx = Instr.getTargetIndex();
-      // Only host calls (import functions) use the buffer path.
-      if (idx < ImportFuncNum && idx < ModuleFuncTypes.size()) {
+      if (idx < ModuleFuncTypes.size()) {
         uint32_t n =
             static_cast<uint32_t>(ModuleFuncTypes[idx]->getParamTypes().size());
-        if (n > maxArity)
+        bool isHost = (idx < ImportFuncNum);
+        bool isSkipped = (idx < SkippedFunctions.size() && SkippedFunctions[idx]);
+        bool isHighArity = (n > kRegCallMaxParams);
+        // Buffer needed for host calls, skipped functions, or high-arity JIT calls.
+        if ((isHost || isSkipped || isHighArity) && n > maxArity)
           maxArity = n;
       }
     } else if (Op == OpCode::Call_indirect) {
@@ -2795,6 +2822,11 @@ Expect<void> WasmToIRBuilder::visitCall(const AST::Instruction &Instr) {
       (ResolvedFuncIdx < ImportFuncNum ||
        (ResolvedFuncIdx < SkippedFunctions.size() && SkippedFunctions[ResolvedFuncIdx])));
 
+  // High-arity direct JIT calls also use buffer-based ABI (but call the native
+  // function directly, not through jit_host_call).
+  bool IsHighArityJitCall = (Op == OpCode::Call && !IsHostCall &&
+      NumArgs > kRegCallMaxParams);
+
   if (IsHostCall) {
     // Route through jit_host_call trampoline (buffer-based ABI).
     // Marshal args into the pre-allocated shared buffer.
@@ -2905,9 +2937,48 @@ Expect<void> WasmToIRBuilder::visitCall(const AST::Instruction &Instr) {
         push(CallResult);
       }
     }
+  } else if (IsHighArityJitCall) {
+    // Direct JIT call with >kRegCallMaxParams params: buffer-based ABI.
+    // Marshal args into SharedCallArgs, call as func(env, args_buf).
+    ir_ref ValidFT = ensureValidRef(FuncTablePtr, IR_ADDR);
+    ir_ref FuncPtr = ir_LOAD_A(ir_ADD_A(
+        ValidFT,
+        ir_CONST_ADDR(static_cast<uintptr_t>(ResolvedFuncIdx) * sizeof(void *))));
+
+    ir_ref CalleeArgs = SharedCallArgs;
+    for (uint32_t i = 0; i < NumArgs; ++i) {
+      ir_ref SlotAddr =
+          ir_ADD_A(CalleeArgs, ir_CONST_ADDR(i * sizeof(uint64_t)));
+      ir_STORE(SlotAddr, WasmArgs[i]);
+    }
+
+    // Prototype: ret func(JitExecEnv*, uint64_t* args)
+    ir_type DirectRetType;
+    if (RetType == IR_FLOAT) {
+      DirectRetType = IR_FLOAT;
+    } else if (RetType == IR_DOUBLE) {
+      DirectRetType = IR_DOUBLE;
+    } else {
+      DirectRetType = IR_I64;
+    }
+    uint8_t BufProtoParams[2] = {IR_ADDR, IR_ADDR};
+    ir_ref BufProto = ir_proto(ctx, IR_FASTCALL_FUNC, DirectRetType,
+                               2, BufProtoParams);
+    ir_ref TypedFuncPtr =
+        ir_emit2(ctx, IR_OPT(IR_PROTO, IR_ADDR), FuncPtr, BufProto);
+
+    ir_ref BufArgs[2] = {EnvPtrVal, CalleeArgs};
+    ir_ref CallResult = ir_CALL_N(DirectRetType, TypedFuncPtr, 2, BufArgs);
+
+    if (!RetTypes.empty()) {
+      if (RetType == IR_I32)
+        push(ir_TRUNC_I32(CallResult));
+      else
+        push(CallResult);
+    }
   } else {
-    // Direct call: load callee from FuncTable and call it directly.
-    // Register-based calling convention: pass each wasm arg in its native type.
+    // Direct call with ≤kRegCallMaxParams: register-based ABI.
+    // Pass each wasm arg in its native type register.
     ir_ref ValidFT = ensureValidRef(FuncTablePtr, IR_ADDR);
     ir_ref FuncPtr = ir_LOAD_A(ir_ADD_A(
         ValidFT,

@@ -47,12 +47,15 @@ extern "C" uint64_t jit_host_call(WasmEdge::VM::JitExecEnv *env,
       return 0;
 
     // Fast path: if the target is a JIT function, call it directly
-    // using register-based calling convention (avoids deep stack recursion).
+    // (avoids deep stack recursion). Use buffer or register ABI based on arity.
     if (funcInst->isIRJitFunction()) {
       void *nativeFunc = funcInst->getIRJitNativeFunc();
       if (nativeFunc) {
         const auto &ft = funcInst->getFuncType();
-        return WasmEdge::VM::detail::irJitInvokeNative(nativeFunc, env, ft, args);
+        if (ft.getParamTypes().size() > WasmEdge::VM::kRegCallMaxParams)
+          return WasmEdge::VM::detail::irJitInvokeNativeBuffer(nativeFunc, env, ft, args);
+        else
+          return WasmEdge::VM::detail::irJitInvokeNative(nativeFunc, env, ft, args);
       }
     }
   } else {
@@ -128,12 +131,15 @@ extern "C" uint64_t jit_direct_or_host(WasmEdge::VM::JitExecEnv *env,
                                        uint64_t *args, uint32_t /*retTypeCode*/) {
   if (!funcPtr)
     return jit_host_call(env, funcIdx, args);
-  // Look up the FuncType from the module to dispatch with register ABI.
+  // Look up the FuncType from the module to dispatch with appropriate ABI.
   if (g_jitModInst) {
     auto funcs = g_jitModInst->getFunctionInstances();
     if (funcIdx < funcs.size() && funcs[funcIdx]) {
       const auto &ft = funcs[funcIdx]->getFuncType();
-      return WasmEdge::VM::detail::irJitInvokeNative(funcPtr, env, ft, args);
+      if (ft.getParamTypes().size() > WasmEdge::VM::kRegCallMaxParams)
+        return WasmEdge::VM::detail::irJitInvokeNativeBuffer(funcPtr, env, ft, args);
+      else
+        return WasmEdge::VM::detail::irJitInvokeNative(funcPtr, env, ft, args);
     }
   }
   // Fallback: no module context, dispatch via host call.
@@ -518,13 +524,15 @@ Expect<uint64_t> Executor::jitCallIndirect(
     return Unexpect(ErrCode::Value::IndirectCallTypeMismatch);
   }
 
-  // 5. Fast path: if the target is JIT-compiled, call native code directly
-  // using register-based calling convention.
+  // 5. Fast path: if the target is JIT-compiled, call native code directly.
   if (FuncInst->isIRJitFunction()) {
     void *NativeFunc = FuncInst->getIRJitNativeFunc();
     if (NativeFunc) {
       const auto &FT = FuncInst->getFuncType();
-      return VM::detail::irJitInvokeNative(NativeFunc, Env, FT, Args);
+      if (FT.getParamTypes().size() > VM::kRegCallMaxParams)
+        return VM::detail::irJitInvokeNativeBuffer(NativeFunc, Env, FT, Args);
+      else
+        return VM::detail::irJitInvokeNative(NativeFunc, Env, FT, Args);
     }
   }
 
