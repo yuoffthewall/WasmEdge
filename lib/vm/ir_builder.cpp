@@ -350,29 +350,42 @@ Expect<void> WasmToIRBuilder::initialize(
   CallIndirectFnPtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, CallIndirectFn))));
 
   // Tier-2 profiling: increment call counter and conditionally notify.
+  // Guard: skip increment+store once counter >= threshold to avoid wrapping
+  // past UINT32_MAX and re-triggering notify every `threshold` calls.
+  // Hot-path after tier-up: load + compare + branch-not-taken (no store).
   if (TierUpThreshold > 0) {
     CallCountersPtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, CallCounters))));
-    TierUpNotifyFnPtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, TierUpNotifyFn))));
     // counterAddr = CallCounters + FuncIdx * sizeof(uint32_t)
     ir_ref CounterAddr = ir_ADD_A(CallCountersPtr,
         ir_CONST_ADDR(static_cast<uintptr_t>(FuncIdx) * sizeof(uint32_t)));
     ir_ref CounterVal = ir_LOAD_U32(CounterAddr);
+
+    // Only increment and check if counter has not yet reached threshold.
+    ir_ref BelowThreshold = ir_ULT(CounterVal, ir_CONST_U32(TierUpThreshold));
+    ir_ref GuardIf = ir_IF(BelowThreshold);
+    ir_IF_TRUE(GuardIf);
+
     ir_ref Incremented = ir_ADD_U32(CounterVal, ir_CONST_U32(1));
     ir_STORE(CounterAddr, Incremented);
 
     ir_ref Cmp = ir_EQ(Incremented, ir_CONST_U32(TierUpThreshold));
-    ir_ref IfRef = ir_IF(Cmp);
-    ir_IF_TRUE(IfRef);
+    ir_ref NotifyIf = ir_IF(Cmp);
+    ir_IF_TRUE(NotifyIf);
 
     uint8_t NotifyParams[3] = {IR_ADDR, IR_U32, IR_U32};
     ir_ref NotifyProto = ir_proto(ctx, IR_FASTCALL_FUNC, IR_VOID, 3, NotifyParams);
     ir_ref NotifyFn = ir_const_func(ctx, ir_str(ctx, "jit_tier_up_notify"), NotifyProto);
     ir_CALL_3(IR_VOID, NotifyFn, EnvPtr, ir_CONST_U32(FuncIdx), Incremented);
 
-    ir_ref TrueEnd = ir_END();
-    ir_IF_FALSE(IfRef);
-    ir_ref FalseEnd = ir_END();
-    ir_MERGE_2(TrueEnd, FalseEnd);
+    ir_ref NotifyEnd = ir_END();
+    ir_IF_FALSE(NotifyIf);
+    ir_ref NoNotifyEnd = ir_END();
+    ir_MERGE_2(NotifyEnd, NoNotifyEnd);
+
+    ir_ref ActiveEnd = ir_END();
+    ir_IF_FALSE(GuardIf);
+    ir_ref SkipEnd = ir_END();
+    ir_MERGE_2(ActiveEnd, SkipEnd);
   }
 
   // Load wasm parameters from the args array. Each slot is sizeof(uint64_t).
