@@ -497,8 +497,30 @@ extern "C" void jit_tier_up_notify(WasmEdge::VM::JitExecEnv *env,
           // even if the Executor/Cache is destroyed before processing.
           auto FT = g_jitExecutor->getJitFuncTable(g_jitModInst);
           if (FT) {
+            // Build a shared snapshot of all module functions' IR data so
+            // the background worker can pull callees into a batch without
+            // touching the ModuleInstance.
+            static std::shared_ptr<WasmEdge::VM::Tier2Manager::ModuleFuncMap>
+                CachedModFuncs;
+            static const void *CachedModInst = nullptr;
+            if (CachedModInst != g_jitModInst) {
+              auto Map = std::make_shared<
+                  WasmEdge::VM::Tier2Manager::ModuleFuncMap>();
+              for (uint32_t i = 0; i < Funcs.size(); ++i) {
+                const auto *Fi = Funcs[i];
+                if (Fi && Fi->isIRJitFunction()) {
+                  const auto &Jf = Fi->getIRJitFunc();
+                  if (!Jf.IRText.empty()) {
+                    Map->emplace(i, std::make_pair(Jf.IRText, Jf.RetType));
+                  }
+                }
+              }
+              CachedModFuncs = std::move(Map);
+              CachedModInst = g_jitModInst;
+            }
             getTier2Manager()->enqueue(funcIdx, JitFunc.IRText,
-                                       JitFunc.RetType, std::move(FT));
+                                       JitFunc.RetType, std::move(FT),
+                                       CachedModFuncs);
           }
         }
       }

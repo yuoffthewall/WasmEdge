@@ -1,7 +1,7 @@
 # Tier-2 Hot Function Recompilation: Progress & Status
 
-**Date:** 2026-04-03
-**Branch:** `ir_jit`
+**Date:** 2026-04-06 (updated)
+**Branch:** `tier2`
 
 ---
 
@@ -25,16 +25,29 @@ ir_ctx* (tier-1, at instantiation via dstogov/ir)
   +--> [hot function detected at runtime]
   |      |
   |      v
-  |    ir_load_safe(IR text) --> fresh ir_ctx*
+  |    ModuleFuncMap snapshot (all functions' IRText+RetType, cached per module)
   |      |
   |      v
-  |    GCM + scheduling passes --> ir_emit_llvm() --> LLVM IR text
+  |    getCallees() --> extract direct callee funcIdx list from IR graph
   |      |
   |      v
-  |    LLVMParseIR --> LLVMVerifyModule --> LLVMRunPasses(O2) --> ORC LLJIT --> native code (tier-2)
+  |    Build batch: hot function + callees (depth 1, max 12)
   |      |
   |      v
-  |    FuncTable[idx] = tier2_ptr  (atomic pointer swap)
+  |    For each function in batch:
+  |      ir_load_safe(IR text) --> fresh ir_ctx*
+  |      GCM + scheduling --> ir_emit_llvm() --> LLVM IR text
+  |      (SharedEmitLoader deduplicates declare statements)
+  |      |
+  |      v
+  |    rewriteIntraBatchCalls(): indirect FuncTable calls --> direct @wasm_tier2_NNN
+  |      |
+  |      v
+  |    LLVMParseIR --> LLVMVerifyModule --> LLVMRunPasses(O2) --> ORC LLJIT
+  |      (LLVM inliner optimizes across function boundaries)
+  |      |
+  |      v
+  |    FuncTable[idx] = tier2_ptr  for each batch member (atomic pointer swap)
   |
   v
 Execution continues (tier-1 or tier-2 transparently)
@@ -210,7 +223,7 @@ for wasm in ../test/ir/testdata/sightglass/*.wasm; do
     --gtest_filter='*SightglassSuite*' 2>&1
 done | tee /tmp/wasm-test.log
 
-grep -E 'Assert|failed|dumped' /tmp/wasm-test.log || echo "All passed"
+grep -iE 'Assert|failed|dumped|error' /tmp/wasm-test.log || echo "All passed"
 ```
 
 ### Tier-2: single kernel
@@ -253,7 +266,7 @@ for wasm in ../test/ir/testdata/sightglass/*.wasm; do
     --gtest_filter='*SightglassSuite*' 2>&1
 done | tee /tmp/wasm-tier2-test.log
 
-grep -E 'Assert|failed|dumped' /tmp/wasm-tier2-test.log || echo "All passed"
+grep -iE 'Assert|failed|dumped|error' /tmp/wasm-tier2-test.log || echo "All passed"
 ```
 
 ### Tier-2: profiling overhead only (no recompilation)
@@ -471,17 +484,183 @@ ir_ctx — fixed by serializing IR text before compilation.
 
 ---
 
+## Phase 5: Cross-Function Inlining (Batch Compilation) -- COMPLETE
+
+When a hot function tiers up, its direct callees are pulled into a single
+LLVM module so that LLVM's inliner can optimize across function boundaries.
+This eliminates indirect call overhead and enables cross-function constant
+propagation, dead argument elimination, and loop optimizations that span
+caller/callee.
+
+### Architecture
+
+```
+jit_tier_up_notify (helper.cpp)
+  |
+  +-- Build ModuleFuncMap snapshot (funcIdx → IRText+RetType, cached per module)
+  |
+  +-- enqueue(funcIdx, IRText, RetType, FuncTable, ModFuncs)
+        |
+        v
+workerLoop (tier2_manager.cpp)
+  |
+  +-- getCallees(IRText) → extract callee funcIdx list from IR graph
+  |     (walks CALL → PROTO → LOAD → ADD(FuncTablePtr, CONST) chain)
+  |
+  +-- Build BatchEntry vector: hot function + direct callees (depth 1, max 12)
+  |
+  +-- compileBatch(Batch, O2)
+        |
+        v
+compileBatch (tier2_compiler.cpp)
+  |
+  +-- For each entry: loadIRText → scheduling passes → ir_emit_llvm
+  |     (SharedEmitLoader deduplicates `declare` statements across functions)
+  |
+  +-- Concatenate all LLVM IR into one text buffer
+  |
+  +-- rewriteIntraBatchCalls(): scan IR text, replace indirect FuncTable
+  |     calls to batch members with direct @wasm_tier2_NNN calls
+  |
+  +-- LLVMParseIR → LLVMVerifyModule → LLVMRunPasses("default<O2>")
+  |     (LLVM inliner sees direct calls and inlines across functions)
+  |
+  +-- LLVMOrcLLJIT → registerSymbols → lookup each function → native ptrs
+  |
+  +-- Return (funcIdx, nativePtr) pairs
+        |
+        v
+workerLoop: swap FuncTable[idx] for each batch member
+```
+
+### Call Rewriting (`rewriteIntraBatchCalls`)
+
+The rewriter operates on LLVM IR text (post-`ir_emit_llvm`, pre-parse) and
+converts indirect FuncTable calls to direct calls for functions within the
+batch. It tracks SSA names through the following pattern:
+
+```llvm
+; 1. Identify FuncTablePtr (always first load from env)
+%d4 = load ptr, ptr %d2                        ; FuncTablePtr
+
+; 2. Track ptrtoint of FuncTablePtr
+%t5 = ptrtoint ptr %d4 to i64
+
+; 3. Match add with batch-member offset (funcIdx * 8)
+%t6 = add i64 %t5, 248                         ; 248 = funcIdx 31 * 8
+
+; 4. Trace through inttoptr → load → optional bitcast
+%d7 = inttoptr i64 %t6 to ptr
+%d8 = load ptr, ptr %d7                         ; load FuncTable[31]
+
+; 5. Original indirect call (x86_fastcallcc, i64 return):
+%d9 = call x86_fastcallcc i64 %d8(ptr %d0, ptr %d1)
+
+; Rewritten to direct call (default CC, matching callee's return type):
+%d9_narrow = call i32 @wasm_tier2_031(ptr %d0, ptr %d1)
+%d9 = zext i32 %d9_narrow to i64
+```
+
+Key details:
+
+- **FuncTablePtr identification:** The rewriter identifies FuncTablePtr as
+  the first `load ptr, ptr %dN` in each function. It then tracks
+  `ptrtoint ptr %d4` results and only matches `add i64` instructions that
+  use those results, avoiding false positives from env-field loads at
+  similar offsets (e.g. `CallIndirectFnPtr` at env+64).
+
+- **Calling convention:** `ir_emit_llvm` emits `define` with default CC,
+  but indirect call sites use `x86_fastcallcc`. When rewriting to a direct
+  call, `x86_fastcallcc` must be stripped to match the callee's definition.
+  Failure to do this causes wrong results (LLVM adapts the calling
+  convention to the callee, putting arguments in wrong registers).
+
+- **Return type mismatch:** The uniform JIT ABI uses `i64` returns, but
+  callees define with their actual return type (`i32`, `void`). For
+  `i32`/`i16`/`i8` returns, the rewriter emits the call with the callee's
+  type and adds a `zext` to `i64`. Functions returning `void`, `float`, or
+  `double` are not rewritten (fallback to indirect call).
+
+- **SSA tracking resets** at each `define` boundary to prevent
+  cross-function name collisions.
+
+### Shared Emit Loader
+
+When emitting multiple functions to one LLVM IR buffer, duplicate `declare`
+statements would cause parse errors. The `SharedEmitLoader` struct provides
+`has_sym`/`add_sym` callbacks to `ir_emit_llvm`'s `ctx->loader` interface,
+tracking which external symbols have already been declared. Each function's
+`ir_ctx->loader` is temporarily set to the shared loader during emission,
+then cleared before `ir_free`.
+
+### ModuleFuncMap
+
+At tier-up time (`jit_tier_up_notify` in `helper.cpp`), a snapshot of all
+module functions' IR text and return types is built as a
+`shared_ptr<ModuleFuncMap>` (where `ModuleFuncMap = unordered_map<uint32_t,
+pair<string, uint8_t>>`). This is cached per module instance to avoid
+rebuilding on every tier-up. The snapshot is passed to `enqueue()` so the
+background worker can look up callee IR without touching the ModuleInstance.
+
+### Performance Results
+
+Benchmarked on all 33 sightglass kernels (excluding spidermonkey/tinygo):
+
+| Kernel | Improvement | Notes |
+|--------|-------------|-------|
+| shootout-sieve | **22%** (171ms → 140ms) | Tight loop with frequent cross-function calls |
+| quicksort | 4% | |
+| ed25519 | 3% | |
+| Others | Within noise | Short-running kernels show apparent regression due to compilation overhead |
+
+Batch sizes range from 1–9 functions. Up to 8 indirect→direct rewrites
+per batch across the kernel suite.
+
+### Limitations
+
+- **Batch depth limited to 1.** Only direct callees are pulled in.
+  Callees-of-callees would increase coverage but risk batch size explosion.
+- **Return type mismatch limits rewrites.** Most wasm functions return
+  `i32` but the uniform ABI uses `i64`. The `zext` workaround works but a
+  cleaner solution would make `ir_emit_llvm` emit `i64` returns for batch
+  functions.
+- **`void`/`float`/`double`-returning functions are not rewritten.** These
+  skip the rewrite and fall back to indirect calls.
+- **Batch size capped at 12 functions** (configurable in `workerLoop`).
+
+### Files Changed (Phase 5)
+
+| File | Changes |
+|------|---------|
+| `include/vm/tier2_compiler.h` | Added `BatchEntry`, `compileBatch()`, `getCallees()` |
+| `lib/vm/tier2_compiler.cpp` | `extractCallees()`, `rewriteIntraBatchCalls()`, `SharedEmitLoader`, `compileBatch()`, `getCallees()` |
+| `include/vm/tier2_manager.h` | Added `ModuleFuncMap` type alias, `ModFuncs` field in `Request`, extended `enqueue()` |
+| `lib/vm/tier2_manager.cpp` | Batch assembly in `workerLoop`: extract callees, build batch, call `compileBatch`, fallback to single |
+| `lib/executor/helper.cpp` | Builds `ModuleFuncMap` snapshot at tier-up time (cached per module), passes to `enqueue()` |
+
+---
+
 ## Next Steps
 
 1. **Memory management** — the current LLJIT instances are intentionally leaked.
    Implement proper lifetime management in `Tier2Manager` (track LLJIT
    instances, dispose on module unload).
 
-2. **Performance measurement** — compare tier-1 vs tier-2 execution time on
-   long-running sightglass kernels to quantify the optimization benefit.
-
-3. **Threshold tuning** — profile real workloads to find optimal call count
+2. **Threshold tuning** — profile real workloads to find optimal call count
    thresholds. Current defaults (10000/1000) are reasonable starting points.
 
-4. **ir_load parser limit** — contribute patch to dstogov/ir to raise the
+3. **ir_load parser limit** — contribute patch to dstogov/ir to raise the
    255-input limit for variable-operand instructions (MERGE/PHI).
+
+4. **Uniform i64 returns for batch functions** — make `ir_emit_llvm` emit
+   `i64` returns for all functions in batch mode, eliminating the zext
+   workaround and enabling rewrites for more call patterns.
+
+5. **Handle void-returning callees** — emit dummy `ret i64 0` or skip the
+   return value at the call site.
+
+6. **Deeper callee pulling** — depth > 1 for benchmarks with deep call
+   chains (with batch size limits to prevent explosion).
+
+7. **MemoryBase hoisting** — independent optimization (#3 from
+   `notes/improvements_todo.md`).

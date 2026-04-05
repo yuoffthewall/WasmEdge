@@ -24,6 +24,8 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace WasmEdge::VM {
 
@@ -50,6 +52,14 @@ public:
   /// and bails out early if set, avoiding long-running LLVM codegen calls.
   void setShutdownFlag(std::atomic<bool> *Flag) noexcept { ShutdownFlag_ = Flag; }
 
+  /// Entry in a batch compilation request.
+  struct BatchEntry {
+    uint32_t FuncIdx;
+    std::string IRText;
+    std::string FuncName;
+    uint8_t RetType;
+  };
+
   /// Compile a single function from its serialized dstogov/ir text.
   /// The text is loaded into a fresh ir_ctx, converted to LLVM IR via
   /// ir_emit_llvm, then optimized and compiled to native code.
@@ -62,6 +72,18 @@ public:
                                      const std::string &FuncName,
                                      uint8_t RetType,
                                      unsigned OptLevel = 2);
+
+  /// Compile a batch of functions into a single LLVM module, enabling
+  /// cross-function inlining. Returns (funcIdx, nativePtr) pairs.
+  /// \param Entries   Functions to compile together.
+  /// \param OptLevel  LLVM optimization level (0-3), default 2.
+  Expect<std::vector<std::pair<uint32_t, void *>>>
+  compileBatch(std::vector<BatchEntry> &Entries, unsigned OptLevel = 2);
+
+  /// Extract callee funcIdx values from a function's serialized IR text.
+  /// Used by the batch assembly logic to identify call targets.
+  static std::vector<uint32_t> getCallees(const std::string &IRText,
+                                          uint8_t RetType);
 
 private:
   bool isShutdown() const noexcept {
