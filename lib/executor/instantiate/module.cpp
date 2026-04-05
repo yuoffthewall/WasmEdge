@@ -284,9 +284,12 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
               break;
             }
           }
-          // Only instrument functions with loops — straight-line functions
-          // won't benefit from LLVM O2 (no unrolling/vectorization/LICM).
-          IRBuilder.setTierUpThreshold(FuncHasLoop ? Tier2LoopThreshold : 0);
+          // Instrument all functions: loop functions use a lower threshold
+          // (they benefit from LICM/unrolling), non-loop functions use a
+          // higher threshold (they benefit from cross-function inlining
+          // and indirect→direct call rewriting in tier-2 batches).
+          IRBuilder.setTierUpThreshold(FuncHasLoop ? Tier2LoopThreshold
+                                                   : Tier2Threshold);
         }
 
         auto InitRes = IRBuilder.initialize(FuncType, Locals);
