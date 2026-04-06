@@ -341,50 +341,70 @@ Expect<void> WasmToIRBuilder::initialize(
   EnvPtr = ir_PARAM(IR_ADDR, "exec_env", 1);
   ArgsPtr = ir_PARAM(IR_ADDR, "args", 2);
 
+  // Load wasm parameters from the args buffer BEFORE env fields.
+  for (uint32_t i = 0; i < ParamTypes.size(); ++i) {
+    ir_type irType = wasmTypeToIRType(ParamTypes[i]);
+    LocalTypes[i] = irType;
+    ir_ref SlotAddr = ir_ADD_A(ArgsPtr, ir_CONST_ADDR(i * sizeof(uint64_t)));
+    if (irType == IR_I32) {
+      Locals[i] = ir_LOAD_I32(SlotAddr);
+    } else if (irType == IR_I64) {
+      Locals[i] = ir_LOAD_I64(SlotAddr);
+    } else if (irType == IR_FLOAT) {
+      Locals[i] = ir_LOAD_F(SlotAddr);
+    } else if (irType == IR_DOUBLE) {
+      Locals[i] = ir_LOAD_D(SlotAddr);
+    } else {
+      Locals[i] = ir_LOAD_I64(SlotAddr);
+    }
+  }
+
   FuncTablePtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, FuncTable))));
   FuncTableSize = ir_LOAD_U32(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, FuncTableSize))));
   GlobalBasePtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, GlobalBase))));
   MemoryBase = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, MemoryBase))));
   HostCallFnPtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, HostCallFn))));
-  DirectOrHostFnPtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, DirectOrHostFn))));
   MemoryGrowFnPtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, MemoryGrowFn))));
   MemorySizeFnPtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, MemorySizeFn))));
   CallIndirectFnPtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, CallIndirectFn))));
 
   // Tier-2 profiling: increment call counter and conditionally notify.
+  // Guard: skip increment+store once counter >= threshold to avoid wrapping
+  // past UINT32_MAX and re-triggering notify every `threshold` calls.
+  // Hot-path after tier-up: load + compare + branch-not-taken (no store).
   if (TierUpThreshold > 0) {
     CallCountersPtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, CallCounters))));
-    TierUpNotifyFnPtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, TierUpNotifyFn))));
     // counterAddr = CallCounters + FuncIdx * sizeof(uint32_t)
     ir_ref CounterAddr = ir_ADD_A(CallCountersPtr,
         ir_CONST_ADDR(static_cast<uintptr_t>(FuncIdx) * sizeof(uint32_t)));
     ir_ref CounterVal = ir_LOAD_U32(CounterAddr);
+
+    // Only increment and check if counter has not yet reached threshold.
+    ir_ref BelowThreshold = ir_ULT(CounterVal, ir_CONST_U32(TierUpThreshold));
+    ir_ref GuardIf = ir_IF(BelowThreshold);
+    ir_IF_TRUE(GuardIf);
+
     ir_ref Incremented = ir_ADD_U32(CounterVal, ir_CONST_U32(1));
     ir_STORE(CounterAddr, Incremented);
 
     ir_ref Cmp = ir_EQ(Incremented, ir_CONST_U32(TierUpThreshold));
-    ir_ref IfRef = ir_IF(Cmp);
-    ir_IF_TRUE(IfRef);
+    ir_ref NotifyIf = ir_IF(Cmp);
+    ir_IF_TRUE(NotifyIf);
 
     uint8_t NotifyParams[3] = {IR_ADDR, IR_U32, IR_U32};
     ir_ref NotifyProto = ir_proto(ctx, IR_FASTCALL_FUNC, IR_VOID, 3, NotifyParams);
     ir_ref NotifyFn = ir_const_func(ctx, ir_str(ctx, "jit_tier_up_notify"), NotifyProto);
     ir_CALL_3(IR_VOID, NotifyFn, EnvPtr, ir_CONST_U32(FuncIdx), Incremented);
 
-    ir_ref TrueEnd = ir_END();
-    ir_IF_FALSE(IfRef);
-    ir_ref FalseEnd = ir_END();
-    ir_MERGE_2(TrueEnd, FalseEnd);
-  }
+    ir_ref NotifyEnd = ir_END();
+    ir_IF_FALSE(NotifyIf);
+    ir_ref NoNotifyEnd = ir_END();
+    ir_MERGE_2(NotifyEnd, NoNotifyEnd);
 
-  // Load wasm parameters from the args array. Each slot is sizeof(uint64_t).
-  // On little-endian (x86_64), loading a narrower type from the slot address
-  // reads the correct lower bytes.
-  for (uint32_t i = 0; i < ParamTypes.size(); ++i) {
-    ir_type irType = wasmTypeToIRType(ParamTypes[i]);
-    ir_ref SlotAddr = ir_ADD_A(ArgsPtr, ir_CONST_ADDR(i * sizeof(uint64_t)));
-    Locals[i] = ir_LOAD(irType, SlotAddr);
-    LocalTypes[i] = irType;
+    ir_ref ActiveEnd = ir_END();
+    ir_IF_FALSE(GuardIf);
+    ir_ref SkipEnd = ir_END();
+    ir_MERGE_2(ActiveEnd, SkipEnd);
   }
 
   // Initialize additional locals to zero
@@ -2933,19 +2953,7 @@ Expect<void> WasmToIRBuilder::visitCall(const AST::Instruction &Instr) {
     WasmArgs[i - 1] = ensureValidRef(pop(), T);
   }
 
-  // Marshal args into the pre-allocated shared buffer (or null for 0 args).
   uint32_t NumArgs = static_cast<uint32_t>(ParamTypes.size());
-  ir_ref CalleeArgs = IR_UNUSED;
-  if (NumArgs > 0) {
-    CalleeArgs = SharedCallArgs;
-    for (uint32_t i = 0; i < NumArgs; ++i) {
-      ir_ref SlotAddr =
-          ir_ADD_A(CalleeArgs, ir_CONST_ADDR(i * sizeof(uint64_t)));
-      ir_STORE(SlotAddr, WasmArgs[i]);
-    }
-  } else {
-    CalleeArgs = ir_CONST_ADDR(0);
-  }
 
   // Determine return type.
   ir_type RetType = IR_VOID;
@@ -2954,16 +2962,21 @@ Expect<void> WasmToIRBuilder::visitCall(const AST::Instruction &Instr) {
 
   ir_ref EnvPtrVal = ensureValidRef(EnvPtr, IR_ADDR);
 
-  // Use host path only for direct Call to an import (funcIdx < ImportFuncNum).
-  // call_indirect uses the direct path (load from table, jit_direct_or_host) so
-  // standalone invoke works without g_jitExecutor; null table entries fall back
-  // to jit_host_call via the trampoline.
   bool IsHostCall = (Op == OpCode::Call && ResolvedFuncIdx < ImportFuncNum);
 
   if (IsHostCall) {
-    // Route through jit_host_call trampoline.
-    // Prototype: uint64_t jit_host_call(JitExecEnv*, uint32_t funcIdx,
-    //                                   uint64_t* args)
+    ir_ref CalleeArgs = IR_UNUSED;
+    if (NumArgs > 0) {
+      CalleeArgs = SharedCallArgs;
+      for (uint32_t i = 0; i < NumArgs; ++i) {
+        ir_ref SlotAddr =
+            ir_ADD_A(CalleeArgs, ir_CONST_ADDR(i * sizeof(uint64_t)));
+        ir_STORE(SlotAddr, WasmArgs[i]);
+      }
+    } else {
+      CalleeArgs = ir_CONST_ADDR(0);
+    }
+
     ir_ref HCFn = ensureValidRef(HostCallFnPtr, IR_ADDR);
     uint8_t HCProtoParams[3] = {IR_ADDR, IR_I32, IR_ADDR};
     ir_ref HCProto =
@@ -2993,12 +3006,18 @@ Expect<void> WasmToIRBuilder::visitCall(const AST::Instruction &Instr) {
       }
     }
   } else if (Op == OpCode::Call_indirect) {
-    // call_indirect: dispatch through jit_call_indirect trampoline which
-    // resolves table[tableIdx][elemIdx], type-checks against typeIdx, then
-    // calls the target (JIT native or interpreter fallback).
-    // Prototype: uint64_t jit_call_indirect(JitExecEnv *env, uint32_t tableIdx,
-    //                uint32_t elemIdx, uint32_t typeIdx, uint64_t *args,
-    //                uint32_t retTypeCode)
+    ir_ref CalleeArgs = IR_UNUSED;
+    if (NumArgs > 0) {
+      CalleeArgs = SharedCallArgs;
+      for (uint32_t i = 0; i < NumArgs; ++i) {
+        ir_ref SlotAddr =
+            ir_ADD_A(CalleeArgs, ir_CONST_ADDR(i * sizeof(uint64_t)));
+        ir_STORE(SlotAddr, WasmArgs[i]);
+      }
+    } else {
+      CalleeArgs = ir_CONST_ADDR(0);
+    }
+
     uint32_t TableIdx = Instr.getSourceIndex();
     uint32_t TypeIdx = Instr.getTargetIndex();
 
@@ -3045,12 +3064,6 @@ Expect<void> WasmToIRBuilder::visitCall(const AST::Instruction &Instr) {
       }
     }
   } else {
-    // Direct call to a local (non-import) function.
-    // Build prototype for direct JIT call: ret func(JitExecEnv*, uint64_t*)
-    // Always declare I64 return even for void callees: the unused rax value is
-    // harmless, and IR_VOID triggers an assertion in the IR x86 backend's
-    // address-fusion pass at O2.  Float/double callees return in xmm0 so they
-    // need their native return type in the prototype.
     uint8_t DirectProtoParams[2] = {IR_ADDR, IR_ADDR};
     ir_type DirectRetType;
     if (RetType == IR_FLOAT) {
@@ -3082,6 +3095,19 @@ Expect<void> WasmToIRBuilder::visitCall(const AST::Instruction &Instr) {
           ir_CONST_ADDR(static_cast<uintptr_t>(ResolvedFuncIdx) * sizeof(void *))));
       TypedFuncPtr =
           ir_emit2(ctx, IR_OPT(IR_PROTO, IR_ADDR), FuncPtr, DirectProto);
+    }
+
+    // Marshal args into the pre-allocated shared buffer (per-branch).
+    ir_ref CalleeArgs = IR_UNUSED;
+    if (NumArgs > 0) {
+      CalleeArgs = SharedCallArgs;
+      for (uint32_t i = 0; i < NumArgs; ++i) {
+        ir_ref SlotAddr =
+            ir_ADD_A(CalleeArgs, ir_CONST_ADDR(i * sizeof(uint64_t)));
+        ir_STORE(SlotAddr, WasmArgs[i]);
+      }
+    } else {
+      CalleeArgs = ir_CONST_ADDR(0);
     }
 
     ir_ref DirectArgs[2] = {EnvPtrVal, CalleeArgs};

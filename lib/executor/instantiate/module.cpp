@@ -192,21 +192,22 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
 
     const auto &CodeSegs = CodeSec.getContent();
     // ----------------------------------------------------------------
-    // Pre-pass: determine which functions are safe to JIT-compile.
-    // A function is NOT safe to JIT if it directly calls an imported (host)
-    // function, because imported functions have nullptr in the JIT func table.
-    // Transitively, a function that calls a non-JIT function is also unsafe
-    // (the JIT code would call through nullptr and segfault).
+    // Pre-pass: mark wasm functions we skip when IR-JIT-compiling this module.
+    // SkipJit is indexed by module function index (imports, then defined bodies).
+    // - Import entries are marked true for a contiguous index space; this compile
+    //   loop only walks defined functions (FuncIdx >= ImportFuncNum).
+    // - A defined function is skipped if its body is non-empty and starts with
+    //   `unreachable` (trap stub); there is nothing useful to compile.
+    // Calls to imports and call_indirect use jit_host_call / trampolines, so we do
+    // not skip defined functions merely because they call host code.
     // ----------------------------------------------------------------
     uint32_t TotalDefined = static_cast<uint32_t>(CodeSegs.size());
     std::vector<bool> SkipJit(ImportFuncNum + TotalDefined, false);
 
-    // All imported functions are inherently non-JIT.
     for (uint32_t i = 0; i < ImportFuncNum; i++) {
       SkipJit[i] = true;
     }
 
-    // Mark functions that start with unreachable (trap stubs).
     for (uint32_t ci = 0; ci < TotalDefined; ci++) {
       auto Instrs = CodeSegs[ci].getExpr().getInstrs();
       if (!Instrs.empty() &&
@@ -215,18 +216,14 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
       }
     }
 
-    // Transitive skip removed: the IR builder now routes calls to imports
-    // through jit_host_call and call_indirect through the same trampoline,
-    // so functions that call imports or use call_indirect can be JIT-compiled.
-
-    // Log skip summary.
+    // Log skip summary (defined functions only; see loop below).
     {
       uint32_t SkipCount = 0;
       for (uint32_t ci = 0; ci < TotalDefined; ci++) {
         if (SkipJit[ImportFuncNum + ci]) SkipCount++;
       }
       if (SkipCount > 0) {
-        spdlog::info("IR JIT: skipping {}/{} funcs (call non-JIT targets)",
+        spdlog::info("IR JIT: skipping {}/{} defined funcs (unreachable trap stubs)",
                      SkipCount, TotalDefined);
       }
     }
@@ -269,10 +266,9 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
         continue;
       }
 
-      // Skip functions marked by the pre-pass (imports, trap stubs,
-      // or functions that transitively call non-JIT targets).
+      // Skip trap stubs (body starts with unreachable); see pre-pass above.
       if (SkipJit[FuncIdx]) {
-        spdlog::debug("IR JIT: skip func {} (non-JIT call target)", FuncIdx);
+        spdlog::debug("IR JIT: skip func {} (unreachable trap stub)", FuncIdx);
         CodeIdx++;
         FuncIdx++;
         continue;
@@ -310,8 +306,12 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
               break;
             }
           }
-          IRBuilder.setTierUpThreshold(
-              FuncHasLoop ? Tier2LoopThreshold : Tier2Threshold);
+          // Instrument all functions: loop functions use a lower threshold
+          // (they benefit from LICM/unrolling), non-loop functions use a
+          // higher threshold (they benefit from cross-function inlining
+          // and indirect→direct call rewriting in tier-2 batches).
+          IRBuilder.setTierUpThreshold(FuncHasLoop ? Tier2LoopThreshold
+                                                   : Tier2Threshold);
         }
 
         auto InitRes = IRBuilder.initialize(FuncType, Locals);

@@ -33,7 +33,8 @@ void Tier2Manager::shutdown() noexcept {
 
 void Tier2Manager::enqueue(uint32_t FuncIdx, std::string IRText,
                            uint8_t RetType,
-                           std::shared_ptr<void *[]> FuncTable) noexcept {
+                           std::shared_ptr<void *[]> FuncTable,
+                           std::shared_ptr<ModuleFuncMap> ModFuncs) noexcept {
   {
     std::lock_guard<std::mutex> Lock(Mu_);
     // Dedup: skip if already enqueued or compiled for this FuncTable+FuncIdx.
@@ -42,7 +43,8 @@ void Tier2Manager::enqueue(uint32_t FuncIdx, std::string IRText,
     if (Seen_.count(Key))
       return;
     Seen_.insert(Key);
-    Queue_.push({FuncIdx, std::move(IRText), RetType, std::move(FuncTable)});
+    Queue_.push({FuncIdx, std::move(IRText), RetType, std::move(FuncTable),
+                 std::move(ModFuncs)});
   }
   CV_.notify_one();
 }
@@ -94,9 +96,67 @@ void Tier2Manager::workerLoop() {
       return;
     }
 
-    // Load IR text → ir_ctx → LLVM IR → optimize → native code.
     std::string FuncName = fmt::format("wasm_tier2_{:03d}", Req.FuncIdx);
-    spdlog::info("tier2: starting compile for func {} ({})", Req.FuncIdx, FuncName);
+    auto FTKey = reinterpret_cast<uintptr_t>(Req.FuncTable.get());
+
+    // Try batch compilation if we have the module function map.
+    if (Req.ModFuncs && !Req.ModFuncs->empty()) {
+      // Extract callees from the hot function.
+      auto Callees = Tier2Compiler::getCallees(Req.IRText, Req.RetType);
+
+      // Build batch: hot function + its direct callees (depth 1).
+      std::vector<Tier2Compiler::BatchEntry> Batch;
+      Batch.push_back({Req.FuncIdx, Req.IRText, FuncName, Req.RetType});
+
+      constexpr size_t MaxBatchSize = 12;
+      for (uint32_t CalleeIdx : Callees) {
+        if (Batch.size() >= MaxBatchSize)
+          break;
+        // Skip if already compiled or enqueued.
+        auto Key = std::make_pair(FTKey, CalleeIdx);
+        if (Seen_.count(Key))
+          continue;
+        // Look up callee in module function map.
+        auto It = Req.ModFuncs->find(CalleeIdx);
+        if (It == Req.ModFuncs->end())
+          continue; // Import or no IR text.
+        const auto &[IRText, RetType] = It->second;
+        if (IRText.empty())
+          continue;
+
+        std::string CalleeName =
+            fmt::format("wasm_tier2_{:03d}", CalleeIdx);
+        Batch.push_back({CalleeIdx, IRText, CalleeName, RetType});
+      }
+
+      spdlog::info("tier2: starting batch compile for func {} ({}) with {} "
+                    "functions",
+                    Req.FuncIdx, FuncName, Batch.size());
+
+      auto BatchResult = Compiler.compileBatch(Batch, 2);
+      if (BatchResult) {
+        // Mark all batch members as seen and swap their FuncTable entries.
+        for (auto &[FIdx, NativePtr] : *BatchResult) {
+          {
+            std::lock_guard<std::mutex> Lock(Mu_);
+            Seen_.insert(std::make_pair(FTKey, FIdx));
+          }
+          Req.FuncTable.get()[FIdx] = NativePtr;
+          Tier2Count_.fetch_add(1, std::memory_order_relaxed);
+          ++CompileCount;
+          spdlog::info("tier2: upgraded func {} → tier-2 ({:#x})", FIdx,
+                       reinterpret_cast<uintptr_t>(NativePtr));
+        }
+        continue;
+      }
+      // Batch failed — fall through to single-function compilation.
+      spdlog::warn("tier2: batch compile failed, falling back to single for {}",
+                    FuncName);
+    }
+
+    // Single-function compilation (original path / fallback).
+    spdlog::info("tier2: starting compile for func {} ({})", Req.FuncIdx,
+                 FuncName);
     auto Result = Compiler.compile(Req.IRText, FuncName, Req.RetType, 2);
     if (!Result) {
       spdlog::warn("tier2: compilation failed for func {} ({})", Req.FuncIdx,

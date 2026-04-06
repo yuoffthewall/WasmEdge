@@ -26,6 +26,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 
 namespace WasmEdge {
@@ -43,14 +44,22 @@ public:
   /// before _exit(0) to give the worker a chance to check Shutdown_.
   void shutdown() noexcept;
 
+  /// Map of funcIdx -> (IRText, RetType) for all module functions.
+  /// Built once per module, shared across tier-up requests.
+  using ModuleFuncMap =
+      std::unordered_map<uint32_t, std::pair<std::string, uint8_t>>;
+
   /// Enqueue a function for tier-2 recompilation.
   /// Called from jit_tier_up_notify (JIT code context).
-  /// \param FuncIdx   Module function index.
-  /// \param IRText    Serialized IR text for the function.
-  /// \param RetType   ir_type of the function's return value.
-  /// \param FuncTable Shared pointer to the FuncTable array (for live code swap).
+  /// \param FuncIdx    Module function index.
+  /// \param IRText     Serialized IR text for the function.
+  /// \param RetType    ir_type of the function's return value.
+  /// \param FuncTable  Shared pointer to the FuncTable array (for live code swap).
+  /// \param ModFuncs   Shared snapshot of all module functions' IR data (for
+  ///                   callee-pulling batch compilation).
   void enqueue(uint32_t FuncIdx, std::string IRText, uint8_t RetType,
-               std::shared_ptr<void *[]> FuncTable) noexcept;
+               std::shared_ptr<void *[]> FuncTable,
+               std::shared_ptr<ModuleFuncMap> ModFuncs) noexcept;
 
   /// Number of functions successfully recompiled to tier-2.
   uint32_t tier2Count() const noexcept {
@@ -63,6 +72,7 @@ private:
     std::string IRText;
     uint8_t RetType;
     std::shared_ptr<void *[]> FuncTable;
+    std::shared_ptr<ModuleFuncMap> ModFuncs;
   };
 
   void workerLoop();
