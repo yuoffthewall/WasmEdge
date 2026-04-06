@@ -339,33 +339,6 @@ Expect<void> WasmToIRBuilder::initialize(
   EnvPtr = ir_PARAM(IR_ADDR, "exec_env", 1);
   ArgsPtr = ir_PARAM(IR_ADDR, "args", 2);
 
-  // Load wasm parameters from the args buffer BEFORE env fields.
-  for (uint32_t i = 0; i < ParamTypes.size(); ++i) {
-    ir_type irType = wasmTypeToIRType(ParamTypes[i]);
-    LocalTypes[i] = irType;
-    ir_ref SlotAddr = ir_ADD_A(ArgsPtr, ir_CONST_ADDR(i * sizeof(uint64_t)));
-    if (irType == IR_I32) {
-      Locals[i] = ir_LOAD_I32(SlotAddr);
-    } else if (irType == IR_I64) {
-      Locals[i] = ir_LOAD_I64(SlotAddr);
-    } else if (irType == IR_FLOAT) {
-      Locals[i] = ir_LOAD_F(SlotAddr);
-    } else if (irType == IR_DOUBLE) {
-      Locals[i] = ir_LOAD_D(SlotAddr);
-    } else {
-      Locals[i] = ir_LOAD_I64(SlotAddr);
-    }
-  }
-
-  FuncTablePtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, FuncTable))));
-  FuncTableSize = ir_LOAD_U32(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, FuncTableSize))));
-  GlobalBasePtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, GlobalBase))));
-  MemoryBase = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, MemoryBase))));
-  HostCallFnPtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, HostCallFn))));
-  MemoryGrowFnPtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, MemoryGrowFn))));
-  MemorySizeFnPtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, MemorySizeFn))));
-  CallIndirectFnPtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, CallIndirectFn))));
-
   // Tier-2 profiling: increment call counter and conditionally notify.
   // Guard: skip increment+store once counter >= threshold to avoid wrapping
   // past UINT32_MAX and re-triggering notify every `threshold` calls.
@@ -404,6 +377,38 @@ Expect<void> WasmToIRBuilder::initialize(
     ir_ref SkipEnd = ir_END();
     ir_MERGE_2(ActiveEnd, SkipEnd);
   }
+
+  // Load wasm parameters BEFORE env fields but AFTER the tier-up IF/MERGE.
+  // Params get lower SSA numbers than env fields, giving LSRA priority for
+  // callee-saved registers — a significant win on recursive/call-heavy
+  // functions (ackermann -16%, fib2 -13%). Placing them after the MERGE
+  // avoids the live-range-spanning miscompilation (see a5bdee6).
+  for (uint32_t i = 0; i < ParamTypes.size(); ++i) {
+    ir_type irType = wasmTypeToIRType(ParamTypes[i]);
+    LocalTypes[i] = irType;
+    ir_ref SlotAddr = ir_ADD_A(ArgsPtr, ir_CONST_ADDR(i * sizeof(uint64_t)));
+    if (irType == IR_I32) {
+      Locals[i] = ir_LOAD_I32(SlotAddr);
+    } else if (irType == IR_I64) {
+      Locals[i] = ir_LOAD_I64(SlotAddr);
+    } else if (irType == IR_FLOAT) {
+      Locals[i] = ir_LOAD_F(SlotAddr);
+    } else if (irType == IR_DOUBLE) {
+      Locals[i] = ir_LOAD_D(SlotAddr);
+    } else {
+      Locals[i] = ir_LOAD_I64(SlotAddr);
+    }
+  }
+
+  // Env field loads — after params so params keep lower SSA numbers.
+  FuncTablePtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, FuncTable))));
+  FuncTableSize = ir_LOAD_U32(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, FuncTableSize))));
+  GlobalBasePtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, GlobalBase))));
+  MemoryBase = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, MemoryBase))));
+  HostCallFnPtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, HostCallFn))));
+  MemoryGrowFnPtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, MemoryGrowFn))));
+  MemorySizeFnPtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, MemorySizeFn))));
+  CallIndirectFnPtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, CallIndirectFn))));
 
   // Initialize additional locals to zero
   uint32_t localIdx = static_cast<uint32_t>(ParamTypes.size());
