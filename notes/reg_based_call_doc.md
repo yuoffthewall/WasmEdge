@@ -406,6 +406,129 @@ retained in code for future use if the IR register allocator gains better
 
 ---
 
+## Prologue Reorder and Per-Branch Marshalling
+
+The AllBuf configuration outperformed BEFORE on recursive/call-heavy
+kernels (ackermann -18%, fib2 -13%, sieve -20%), despite both using
+identical buffer-based calling convention (`kRegCallMaxParams = 0`).
+Investigation isolated two structural IR changes that explain the full
+speedup. Both operate through the same mechanism: they alter SSA definition
+order, which changes how the IR LSRA assigns callee-saved registers.
+
+### Change 1: Prologue reorder (params before env fields)
+
+The `initialize()` prologue emits IR nodes for function parameters and
+`JitExecEnv` fields. The emission order determines SSA numbering, which
+determines LSRA priority for callee-saved registers.
+
+**Before** — env fields first, then params:
+```
+d_2  = PARAM("exec_env", 1)
+d_3  = PARAM("args", 2)
+d_4  = LOAD(env + 0x00)      ← FuncTablePtr     SSA #4
+d_6  = LOAD(env + 0x08)      ← GlobalBasePtr     SSA #6
+d_8  = LOAD(env + 0x10)      ← MemoryBase        SSA #8
+d_9  = LOAD(args[0])          ← wasm param 0      SSA #9
+d_11 = LOAD(args[1])          ← wasm param 1      SSA #11
+```
+
+**After** — params first, then env fields:
+```
+d_2  = PARAM("exec_env", 1)
+d_3  = PARAM("args", 2)
+d_4  = LOAD(args[0])          ← wasm param 0      SSA #4
+d_6  = LOAD(args[1])          ← wasm param 1      SSA #6
+d_8  = LOAD(args[2])          ← wasm param 2      SSA #8
+d_9  = LOAD(env + 0x00)      ← FuncTablePtr      SSA #9
+d_11 = LOAD(env + 0x08)      ← GlobalBasePtr      SSA #11
+```
+
+LSRA processes live intervals in start-point order. Values with earlier
+SSA numbers and long live ranges get first pick of callee-saved registers.
+In the "before" layout, env fields (FuncTablePtr, MemoryBase) consume
+callee-saved registers first, potentially pushing wasm params into caller-
+saved registers. In the "after" layout, wasm params get priority.
+
+**Why it matters for recursive functions:** When wasm params are in caller-
+saved registers, they must be spilled to stack before every CALL and
+reloaded after. Ackermann(3,12) makes ~500K recursive calls. With 2-3
+params each requiring a store+load pair per call (~2-4 cycles from L1
+cache), this adds millions of extra memory operations.
+
+**Isolated benchmark (prologue reorder only):** fib2 -12%, ackermann -9%.
+Does not help sieve.
+
+### Change 2: Per-branch arg marshalling
+
+The `visitCallOrCallIndirect()` method marshals wasm arguments into the
+`SharedCallArgs` buffer before each call instruction. The original code
+performed marshalling at the top of the method (before the host/indirect/
+direct dispatch), while the changed code moves marshalling into each
+dispatch branch.
+
+For direct JIT-to-JIT calls this changes the SSA emission order at each
+call site:
+
+**Before** — stores first, then FuncPtr load:
+```
+STORE(buf[0], arg0)             ← SSA #A   (marshal first)
+STORE(buf[1], arg1)             ← SSA #A+2
+FuncPtr = LOAD(FuncTable[idx])  ← SSA #A+4 (late)
+CALL(FuncPtr, env, buf)
+```
+
+**After** — FuncPtr load first, then stores:
+```
+FuncPtr = LOAD(FuncTable[idx])  ← SSA #A   (early)
+STORE(buf[0], arg0)             ← SSA #A+2
+STORE(buf[1], arg1)             ← SSA #A+4
+CALL(FuncPtr, env, buf)
+```
+
+This reorders SSA numbers at every call site, shifting subsequent node
+numbers throughout the function. For functions with multiple call sites
+(ackermann has 2, sieve has calls in a tight loop), these shifts compound
+and change LSRA eviction decisions for values live across the loop back-
+edge and across calls.
+
+**Isolated benchmark (per-branch marshalling only, without prologue
+reorder):** Not tested alone — identified after the combined test showed
+the prologue reorder was insufficient for ackermann and sieve.
+
+### Combined benchmark (all 33 kernels, 3 runs each, O2)
+
+| Kernel | Baseline (us) | Changed (us) | Change |
+|---|---|---|---|
+| shootout-sieve | 171.4K | **137.3K** | **-19.9%** |
+| shootout-ackermann | 649.5 | **545.0** | **-16.1%** |
+| shootout-fib2 | 641.7K | **556.0K** | **-13.3%** |
+| 28 other kernels | | | -3% to +3% (neutral) |
+
+3 faster, 28 neutral, 2 noise-level slower (sub-millisecond kernels).
+
+### Why only recursive/call-heavy kernels are affected
+
+1. **CALL instructions are the trigger.** Callee-saved vs caller-saved
+   only matters at call boundaries where caller-saved registers are
+   clobbered.
+2. **The calls must be in hot paths.** Prologue setup runs once, but
+   spill/reload at calls runs per-invocation.
+3. **Register pressure must be near the 6-register threshold.** If a
+   function uses <=6 long-lived values, all fit in callee-saved registers
+   regardless of order. When it uses 7+, emission order determines which
+   value gets evicted.
+
+### Additional cleanup
+
+- **`DirectOrHostFn` load removed.** Dead since commit c63e38f7 (inline
+  direct calls). Was consuming an IR node and a register slot in the
+  prologue.
+- **Type-specific loads.** Prologue now uses `ir_LOAD_I32`/`ir_LOAD_I64`/
+  `ir_LOAD_F`/`ir_LOAD_D` instead of generic `ir_LOAD(irType, ...)`,
+  matching the buffer-based calling convention path.
+
+---
+
 ## Known Limitations
 
 1. **`kRegCallMaxParams = 0`:** Register-based calling is fully implemented
@@ -421,9 +544,9 @@ retained in code for future use if the IR register allocator gains better
    Multi-value returns would require struct-return ABI or additional
    convention.
 
-4. **`DirectOrHostFn` in JitExecEnv:** Loaded in the prologue but no longer
-   used by inline direct calls.  Retained for ABI stability; can be removed
-   in a future cleanup.
+4. **`DirectOrHostFn` in JitExecEnv:** Field still exists in the struct but
+   the prologue load was removed (dead since c63e38f7 inline direct calls).
+   The struct field itself is retained for ABI stability.
 
 5. **Remaining O2 crash:** `rust-compression` crashes at O2 only (passes at
    O0 and O1). Root cause is a wasm memory corruption cascade from an
