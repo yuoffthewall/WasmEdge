@@ -63,11 +63,6 @@ rust-html-rewriter|${BASE_URL}/rust-html-rewriter/benchmark.wasm
 rust-json|${BASE_URL}/rust-json/benchmark.wasm
 rust-protobuf|${BASE_URL}/rust-protobuf/benchmark.wasm
 quicksort|${BASE_URL}/quicksort/benchmark.wasm
-spidermonkey-json|${BASE_URL}/spidermonkey/spidermonkey-json.wasm
-spidermonkey-markdown|${BASE_URL}/spidermonkey/spidermonkey-markdown.wasm
-spidermonkey-regex|${BASE_URL}/spidermonkey/spidermonkey-regex.wasm
-tinygo-json|${BASE_URL}/tinygo/tinygo-json.wasm
-tinygo-regex|${BASE_URL}/tinygo/tinygo-regex.wasm
 shootout-ackermann|${BASE_URL}/shootout/shootout-ackermann.wasm
 shootout-base64|${BASE_URL}/shootout/shootout-base64.wasm
 shootout-ctype|${BASE_URL}/shootout/shootout-ctype.wasm
@@ -107,8 +102,7 @@ rust-compression.default.input|${BASE_URL}/rust-compression/default.input
 rust-html-rewriter.default.input|${BASE_URL}/rust-html-rewriter/default.input
 pulldown-cmark.default.input.md|${BASE_URL}/pulldown-cmark/default.input.md
 default.input.md|${BASE_URL}/pulldown-cmark/default.input.md
-tinygo-json.input|${BASE_URL}/tinygo/tinygo-json.input
-tinygo-regex.input|${BASE_URL}/tinygo/tinygo-regex.input"
+"
 
 while IFS='|' read -r outname url; do
   [ -z "$outname" ] && continue
@@ -208,16 +202,7 @@ rust-html-rewriter.stdout.expected|rust-html-rewriter/benchmark.stdout.expected
 rust-html-rewriter.stderr.expected|rust-html-rewriter/benchmark.stderr.expected
 pulldown-cmark.stdout.expected|pulldown-cmark/benchmark.stdout.expected
 pulldown-cmark.stderr.expected|pulldown-cmark/benchmark.stderr.expected
-spidermonkey-json.stdout.expected|spidermonkey/spidermonkey-json.stdout.expected
-spidermonkey-json.stderr.expected|spidermonkey/spidermonkey-json.stderr.expected
-spidermonkey-markdown.stdout.expected|spidermonkey/spidermonkey-markdown.stdout.expected
-spidermonkey-markdown.stderr.expected|spidermonkey/spidermonkey-markdown.stderr.expected
-spidermonkey-regex.stdout.expected|spidermonkey/spidermonkey-regex.stdout.expected
-spidermonkey-regex.stderr.expected|spidermonkey/spidermonkey-regex.stderr.expected
-tinygo-json.stdout.expected|tinygo/tinygo-json.stdout.expected
-tinygo-json.stderr.expected|tinygo/tinygo-json.stderr.expected
-tinygo-regex.stdout.expected|tinygo/tinygo-regex.stdout.expected
-tinygo-regex.stderr.expected|tinygo/tinygo-regex.stderr.expected"
+"
 
 while IFS='|' read -r outname relpath; do
   outname="$(echo "$outname" | tr -d '\r\n' | xargs)"

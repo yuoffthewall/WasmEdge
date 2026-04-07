@@ -1313,15 +1313,27 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
   }
   std::sort(kernels.begin(), kernels.end());
 
-  // Optional: for fast CI / ctest, drop only the heaviest kernels (full list: WASMEDGE_SIGHTGLASS_QUICK=0).
-  const char *quickEnv = std::getenv("WASMEDGE_SIGHTGLASS_QUICK");
-  if (quickEnv && quickEnv[0] == '1') {
+  // Always skip spidermonkey and tinygo kernels (unsupported).
+  {
     std::vector<std::filesystem::path> filtered;
     for (const auto &p : kernels) {
       const std::string stem = p.stem().string();
       if (stem.compare(0, 13, "spidermonkey-") == 0)
         continue;
       if (stem.compare(0, 7, "tinygo-") == 0)
+        continue;
+      filtered.push_back(p);
+    }
+    kernels = std::move(filtered);
+  }
+
+  // Optional: for fast CI / ctest, drop additional heavy kernels.
+  const char *quickEnv = std::getenv("WASMEDGE_SIGHTGLASS_QUICK");
+  if (quickEnv && quickEnv[0] == '1') {
+    std::vector<std::filesystem::path> filtered;
+    for (const auto &p : kernels) {
+      const std::string stem = p.stem().string();
+      if (stem == "richards")
         continue;
       filtered.push_back(p);
     }
