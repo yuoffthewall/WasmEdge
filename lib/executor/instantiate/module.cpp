@@ -196,9 +196,9 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
     // - Import entries are marked true for a contiguous index space; this compile
     //   loop only walks defined functions (FuncIdx >= ImportFuncNum).
     // - A defined function is skipped if its body is non-empty and starts with
-    //   `unreachable` (trap stub); there is nothing useful to compile.
-    // Calls to imports and call_indirect use jit_host_call / trampolines, so we do
-    // not skip defined functions merely because they call host code.
+    //   `unreachable` (trap stub); these cannot be compiled by the IR backend.
+    // Calls to skipped functions are routed through jit_host_call which falls
+    // back to the interpreter.
     // ----------------------------------------------------------------
     uint32_t TotalDefined = static_cast<uint32_t>(CodeSegs.size());
     std::vector<bool> SkipJit(ImportFuncNum + TotalDefined, false);
@@ -219,7 +219,11 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
     {
       uint32_t SkipCount = 0;
       for (uint32_t ci = 0; ci < TotalDefined; ci++) {
-        if (SkipJit[ImportFuncNum + ci]) SkipCount++;
+        if (SkipJit[ImportFuncNum + ci]) {
+          SkipCount++;
+          spdlog::info("IR JIT: trap stub at FuncIdx={} (ImportFuncNum={}, ci={})",
+                       ImportFuncNum + ci, ImportFuncNum, ci);
+        }
       }
       if (SkipCount > 0) {
         spdlog::info("IR JIT: skipping {}/{} defined funcs (unreachable trap stubs)",
@@ -251,7 +255,7 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
         FuncIdx++;
         continue;
       }
-      
+
       // Get function type from the type section
       uint32_t TypeIdx = TypeIdxs[CodeIdx];
       auto TypeRes = ModInst->getType(TypeIdx);
