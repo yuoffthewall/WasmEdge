@@ -809,7 +809,8 @@ Executor::enterFunction(Runtime::StackManager &StackMgr,
         } else if (F->isCompiledFunction()) {
           Cache.FuncTable[I] = F->getSymbol().get();
         } else {
-          Cache.FuncTable[I] = nullptr;
+          Cache.FuncTable[I] =
+              reinterpret_cast<void *>(&WasmEdge::VM::jit_unreachable_trap);
         }
       }
       auto GlobInsts = ModInst->getGlobalInstances();

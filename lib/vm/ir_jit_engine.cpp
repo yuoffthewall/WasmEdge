@@ -95,6 +95,21 @@ extern "C" void jit_oob_trap(void) {
   std::abort();
 }
 
+/// Trap stub for uncompiled wasm functions (e.g. functions starting with
+/// `unreachable`).  Has the same signature as JIT-compiled functions so it
+/// can be placed in FuncTable.  Stashes Unreachable as the callee error and
+/// longjmps with value 3 so invoke() propagates it via
+/// wasmedge_ir_jit_get_callee_error().
+extern "C" int64_t jit_unreachable_trap(void * /*env*/, uint64_t * /*args*/) {
+  WasmEdge::VM::wasmedge_ir_jit_set_callee_error(
+      WasmEdge::ErrCode::Value::Unreachable);
+  void *buf = wasmedge_ir_jit_get_termination_buf();
+  if (buf) {
+    longjmp(*static_cast<jmp_buf *>(buf), 3);
+  }
+  std::abort();
+}
+
 namespace WasmEdge {
 namespace VM {
 
@@ -219,7 +234,8 @@ Expect<void> IRJitEngine::invoke(void *NativeFunc,
       return Unexpect(ErrCode::Value::MemoryOutOfBounds);
     }
     if (jmpVal == 3) {
-      // Callee function trapped (e.g. unreachable, OOB in callee).
+      // Callee function trapped (e.g. unreachable, OOB in callee, or an
+      // uncompiled trap stub routed through jit_unreachable_trap).
       return Unexpect(wasmedge_ir_jit_get_callee_error());
     }
     if (jmpVal != 0) {
