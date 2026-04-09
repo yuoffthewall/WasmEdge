@@ -92,6 +92,17 @@ extern "C" void jit_oob_trap(void) {
   std::abort();
 }
 
+/// Trap stub for uncompiled wasm functions (e.g. functions starting with
+/// `unreachable`).  Has the same signature as JIT-compiled functions so it
+/// can be placed in FuncTable.  Longjmps with value 3 (→ Unreachable).
+extern "C" int64_t jit_unreachable_trap(void * /*env*/, uint64_t * /*args*/) {
+  void *buf = wasmedge_ir_jit_get_termination_buf();
+  if (buf) {
+    longjmp(*static_cast<jmp_buf *>(buf), 3);
+  }
+  std::abort();
+}
+
 namespace WasmEdge {
 namespace VM {
 
@@ -131,6 +142,7 @@ IRJitEngine::compile(ir_ctx *Ctx) {
 
   static int _dbg_func_id = 0;
   int _dbg_cur_id = _dbg_func_id++;
+
   bool _dbg_dump = std::getenv("WASMEDGE_IR_JIT_DUMP") != nullptr;
   if (_dbg_dump) {
     char fname[256];
@@ -212,6 +224,10 @@ Expect<void> IRJitEngine::invoke(void *NativeFunc,
     if (jmpVal == 2) {
       // OOB trap from jit_oob_trap (inline bounds check)
       return Unexpect(ErrCode::Value::MemoryOutOfBounds);
+    }
+    if (jmpVal == 3) {
+      // Unreachable trap from jit_unreachable_trap (uncompiled trap stub)
+      return Unexpect(ErrCode::Value::Unreachable);
     }
     if (jmpVal != 0) {
       // Termination (e.g. proc_exit via jit_host_call)

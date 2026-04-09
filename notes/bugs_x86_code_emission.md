@@ -894,3 +894,93 @@ follows the successor chain: block 3 (empty) -> block 8 (empty) -> block 9
    `_ir_skip_empty_blocks()` bounded by `cfg_blocks_count`. If
    exceeded, asserts (debug builds) and returns the current block to
    prevent hangs from any unforeseen empty-block cycle.
+
+---
+
+## Bug 9: DESSA Parallel Copy Spill-Slot Aliasing (Lost Copy)
+
+**Status: FIXED**
+
+### Symptom
+
+The `rust-compression` sightglass kernel hits an `unreachable` trap (0x40a) at IR
+JIT O1. The crash is non-deterministic in *which* function traps, but deterministic
+in *which* function is miscompiled: compile index 63. The miscompiled function
+produces wrong values written to wasm linear memory, causing later functions to take
+wrong branches into trap stubs.
+
+O0 passes, O2 passes (SCCP changes IR enough to avoid the LSRA aliasing), O1 fails.
+
+### Bisection
+
+```
+WASMEDGE_IR_JIT_BISECT=63 → passes (func 63 compiled at O2)
+WASMEDGE_IR_JIT_BISECT=64 → fails  (func 63 compiled at O1)
+```
+
+At BISECT=64, func 63 is called once and makes 1830 calls to func 64 before
+crashing — the outer loop counter d_80 is stuck at 1, never incrementing. Expected
+call count is 55.
+
+### Root Cause
+
+The LSRA assigns two different vregs to the same spill slot:
+
+```
+d_78 = PHI(0, d_80)       R30, SPILL=0xcc
+d_80 = PHI(1, d_156)      R31, SPILL=0xd0
+d_156 = d_80 + 1           R58, SPILL=0xcc  ← SAME SLOT AS d_78
+```
+
+On BB4's loop back-edge, `ir_dessa_parallel_copy()` must emit the parallel
+assignment `{d_78 ← d_80, d_80 ← d_156}` as sequential moves. The algorithm
+tracks dependencies by **vreg ID** (R30, R31, R58), not by physical spill slot.
+It doesn't detect that writing R30 (d_78) to slot 0xcc clobbers R58 (d_156) at the
+same slot.
+
+The emitted asm:
+
+```asm
+mov 0xd0(%rsp), %edx    ; edx = d_80
+mov %edx, 0xcc(%rsp)    ; d_78 ← d_80  (OVERWRITES d_156 at 0xcc!)
+mov 0xcc(%rsp), %edx    ; edx = d_80    (was supposed to be d_156)
+mov %edx, 0xd0(%rsp)    ; d_80 ← d_80  (NO-OP — BUG)
+```
+
+Result: d_80 = PHI(1, d_156) always reads back d_80's own value. The loop variable
+never advances past 1. After ~183 "iterations" (1830 inner calls), the memory
+pointer walks past valid wasm memory, producing garbage values that cascade into the
+trap.
+
+### Fix
+
+Added a canonicalization pass in `ir_emit_dessa_moves()` (`ir_emit.c`), inserted
+after building the copy list and before calling `ir_dessa_parallel_copy()`.
+
+For every pair of copies, if copy[i].to is a spill-slot vreg and copy[j].from is a
+*different* spill-slot vreg at the **same physical slot**, replace copy[j].from with
+copy[i].to. This makes the physical aliasing visible to the parallel copy algorithm's
+dependency tracking, which then either reorders the moves or uses a temporary register
+to break the cycle.
+
+After canonicalization, any copies that became no-ops (from == to) are removed.
+
+The fix is O(n²) in the number of PHI copies per edge, which is small in practice
+(typically 2–15 copies).
+
+### Why O2 passes
+
+SCCP at O2 constant-folds branches and eliminates ~33 blocks. The simplified IR
+changes live ranges, and the LSRA no longer assigns d_78 and d_156 to the same
+spill slot.
+
+### Key evidence
+
+1. **Return-address tracing:** All 1830 F64 calls return to offset 0xcb7 (BB4 loop
+   body). The alternative code path (BB21+ loop) is never executed.
+2. **Per-call arg logging:** First outer iteration (d_80=1) produces correct 10
+   inner calls. All subsequent iterations have d_80=1 — the counter never advances.
+3. **RA debug dump:** R30 (d_78) SPILL=0xcc, R58 (d_156) SPILL=0xcc — confirmed
+   same slot.
+4. **Native code verification:** Disassembly at 0xb91–0xba6 shows the lost copy
+   sequence described above.

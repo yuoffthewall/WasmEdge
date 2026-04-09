@@ -6,81 +6,146 @@ Bugs in the dstogov/ir library's optimization passes (ir_sccp.c, ir.h).
 
 ## Bug 1: Induction Variable Promotion Breaks Wasm 32-bit Wrapping
 
-**Status: FIXED**
+**Status: FIXED (proper fix, pass re-enabled with a semantic guard)**
 
-### The Problem
-The Sightglass `quicksort` benchmark failed consistently under the `IR_JIT` backend, causing a crash due to an AddressSanitizer (ASan) SEGV fault. The crash reported an invalid memory access (`READ`) at an out-of-bounds address (e.g. `0x7b5659c05c7c`), effectively pointing approximately ~4GB out of bounds from the native Wasm memory boundary.
+### Syndrome
+The Sightglass `quicksort` benchmark failed consistently under `IR_JIT` at O2,
+crashing with an ASan SEGV on a load at an address roughly ~4 GB past the
+native Wasm memory boundary (e.g. `LOAD(MemoryBase + 0xFFFFFFFC)` extended out
+to an i64 address). O0/O1 runs were fine — the crash only appeared once the
+SCCP pipeline ran.
 
-### The Root Cause
-The root cause was a conflict between WebAssembly's 32-bit memory semantics and an aggressive induction variable optimization pass within the underlying `dstogov/ir` JIT engine.
+### Root cause
+`dstogov/ir`'s SCCP pass `ir_try_promote_induction_var_ext` walked patterns of
+the form
 
-1. **Wasm 32-bit Linear Memory Wrapping:** Wasm memory addresses are strictly computed as 32-bit integers. If a pointer traversing an array (like in `quicksort`) drops below zero, Wasm relies on 32-bit integer wrapping. For example, `base - 4` evaluates to `0xFFFFFFFC`. In a correct IR generation phase, this 32-bit value will eventually be zero-extended (`ir_ZEXT_A`) to a 64-bit native pointer size before being added to `MemoryBase`.
-2. **Aggressive Induction Variable Promotion:** During the JIT compiler's Sparse Conditional Constant Propagation (SCCP) phase, the optimization pass `ir_try_promote_induction_var_ext` noticed that a loop variable (our 32-bit Wasm memory index) was being zero-extended on each iteration. To "optimize" this, the compiler *hoisted* the zero-extension out of the loop and promoted the induction variable up to a 64-bit integer.
-3. **Broken Wrapping Semantics:** Because the induction variable arithmetic was now promoted and operating in a 64-bit domain *before* the math finished, Wasm's intrinsic 32-bit modulus semantics broke. Adding a negative offset such as `-4` (which represents the unsigned 32-bit constant `0xFFFFFFFC`) simply added `4,294,967,292` to a 64-bit base offset without wrapping cleanly at 32 bits.
-4. **The Crash:** The compiled native code would generate an instruction like `LOAD(MemoryBase + 4294967292)`, blasting far outside the Wasm memory allocation and causing an immediate hardware SEGV trap.
+    phi_i32 = PHI(init, add_i32)
+    add_i32 = ADD_I32(phi_i32, loop_invariant)
+    ...  zext_i64 = ZEXT(phi_i32)  (or of add_i32)
 
-### The Fix
-Since WebAssembly requires strict 32-bit modular arithmetic compliance for any values indexing linear memory, we modified the `dstogov/ir` backend to suppress this incompatible optimization path.
+and, when a ZEXT of the induction variable was found, promoted the PHI and
+its back-edge op to the wider type, then **dropped the ZEXT node entirely**,
+assuming the wider arithmetic would give the same value as `zext(i32 value)`.
 
-**Implementation Details:**
-- **Modified File:** `thirdparty/ir/ir_sccp.c`
-- **Change:** Early exit/ disabled `ir_try_promote_induction_var_ext`:
-  ```c
-  static bool ir_try_promote_induction_var_ext(ir_ctx *ctx, ir_ref ext_ref, ir_ref phi_ref, ir_ref op_ref, ir_bitqueue *worklist)
-  {
-      // FAST FAIL: Disable induction variable extension promotion.
-      // This optimization is unsafe for Wasm, because Wasm explicitly relies on 32-bit integer wrapping
-      // (e.g. pointer decrements crossing 0) which is broken if promoted to 64-bit without explicit masking.
-      return 0;
-      // ...
-  }
-  ```
+That assumption holds only while the loop stays inside `[0, 2^32)`. WebAssembly
+requires strict modulo-2^32 wrap on `i32.add` / `i32.sub`, and quicksort walks
+pointers downward through a slice; when the arithmetic momentarily crosses
+zero (e.g. a `-4` step), the two domains diverge:
 
-By disabling this pass, the IR preserves the original Wasm execution semantics: the arithmetic remains 32-bit, gracefully wraps, and is properly zero-extended to native width *right before* the memory load/store offsets are calculated.
+- i32 then ZEXT: `0 - 4 = 0xFFFFFFFC`, zero-extends to `0x00000000FFFFFFFC`
+- i64 promoted (ZEXT dropped): `0 - 4 = 0xFFFFFFFFFFFFFFFC`
 
-The resulting fix cleared all SEGV violations and the `quicksort` IR_JIT compiling target properly executed and finished successfully.
+The generated load then used the i64 value directly against `MemoryBase`,
+blowing past the allocation and trapping.
 
-### Why the Code Zero-Extends Every Iteration
+(An equivalent issue exists in principle for SEXT across i32 signed overflow,
+but nothing in the Sightglass suite currently exercises it.)
 
-WebAssembly linear memory is defined in terms of **32-bit** indices. On a 64-bit host, the real pointer is:
+### Why our lowering feeds ZEXT to every memory op
+WebAssembly linear memory is indexed by **32-bit** values; the host pointer
+is 64-bit, so the 32-bit index must be zero-extended before being added to
+`MemoryBase`. The WasmEdge IR builder keeps addresses as i32 on the stack and
+does the extension at each memory op in `buildMemoryAddress`
+(`lib/vm/ir_builder.cpp`):
 
-`effective_address = MemoryBase + offset`
-
-`MemoryBase` is 64-bit; the Wasm "offset" is 32-bit. So the 32-bit value must be **zero-extended to 64-bit** at the point where you form the pointer. That's a requirement of the ABI / memory model, not a choice.
-
-In the Wasm->IR lowering this is done in one place: **`buildMemoryAddress`** in `ir_builder.cpp`:
-
-```1522:1538:lib/vm/ir_builder.cpp
+```cpp
 ir_ref WasmToIRBuilder::buildMemoryAddress(ir_ref Base, uint32_t Offset) {
-  ir_ctx *ctx = &Ctx; // For IR macros
-  
-  // Compute Wasm effective address in I32 (base from stack is Wasm i32).
-  // Use I32 ops so ir_check does not see I32 vs U32 mismatch.
+  ir_ctx *ctx = &Ctx;
   ir_ref WasmAddr = Base;
   if (Offset != 0) {
     WasmAddr = ir_ADD_I32(Base, ir_CONST_I32(static_cast<int32_t>(Offset)));
   }
-  
-  // Zero-extend Wasm address (32-bit) to native address width
-  // Then add to memory base pointer
-  ir_ref WasmAddrExt = ir_ZEXT_A(WasmAddr);
-  ir_ref EffectiveAddr = ir_ADD_A(MemoryBase, WasmAddrExt);
-  
+  ir_ref WasmAddrExt = ir_ZEXT_A(WasmAddr);                 // 32-bit -> addr width
+  ir_ref EffectiveAddr = ir_ADD_A(MemoryBase, WasmAddrExt); // + MemoryBase
   return EffectiveAddr;
 }
 ```
 
-So:
+So every load/store emits a ZEXT of whatever i32 value is on the Wasm stack.
+Pointer arithmetic stays in i32 to preserve wrap semantics, and the ZEXT
+appears at the pointer-formation boundary — not as "an extra optimization
+opportunity" but as a correctness requirement. Hoisting the ZEXT out of the
+loop and widening the IV is precisely what breaks the contract.
 
-- Address arithmetic (e.g. `Base`, or `Base + Offset`) is kept in **I32** so 32-bit wrapping is correct.
-- Only when building the actual pointer do we do **ZEXT_A** (32-bit -> address width) then **ADD_A** with `MemoryBase`.
+### Previous workaround (now superseded)
+The earlier workaround was to `return 0` unconditionally at the top of
+`ir_try_promote_induction_var_ext`, disabling the pass. That was correct but
+coarse: every ZEXT-of-IV site across the module lost the optimization, even
+loops that would never wrap.
 
-The IR builder does **not** keep a single 64-bit "memory pointer" in the loop. It keeps the Wasm index as **32-bit** (on the stack / in phis / in locals). Every **load and store** calls `buildMemoryAddress` with whatever 32-bit value is on the stack at that moment.
+### Proper fix
 
-So the zero-extension appears **at every load/store**, i.e. "every iteration" (or more precisely, every memory operation in the loop). That's not an extra optimization; it's the direct result of:
+**File:** `thirdparty/ir/ir_sccp.c`, `ir_try_promote_induction_var_ext`.
 
-1. Representing addresses as 32-bit until the last moment.
-2. Building the real pointer only at each load/store via `buildMemoryAddress`.
+Instead of dropping the hoisted ZEXT, we replace it with an explicit
+`AND wide_src, 0xFFFFFFFF` mask. That preserves the
+`zext(low 32 bits of the promoted IV)` semantics for every ZEXT user:
+`(phi_i64) & 0xFFFFFFFF == zext(phi_i32)` regardless of whether the i64
+arithmetic wraps or underflows, so the promotion is now sound even for
+decrementing pointers.
+
+Key points of the change:
+
+1. **Gate the re-enable to `IR_ZEXT` from an i32 source.** SEXT and
+   narrower sources take the existing conservative `return 0` path
+   because they need a different mask / sign-extension and aren't
+   exercised by any regression in the suite.
+2. **Retype the PHI and back-edge op *before* constructing the mask.**
+   The newly-emitted AND inherits its operand's type, and if the AND is
+   emitted before `phi_insn->type = type`, the operand is still i32 and
+   the AND's i64 type is inconsistent with it. Doing the retype first
+   avoids the transient mismatch.
+3. **Emit the AND via `IR_OPTX(IR_AND, type, 2)`, not `IR_OPT(IR_AND, type)`.**
+   `IR_OPT` only encodes op+type in the low 16 bits of `optx` and leaves
+   the upper 16 bits (`inputs_count`) as garbage. GCM iterates operands
+   via `insn->inputs_count` in `ir_gcm_schedule_early`, so an uninitialised
+   count causes it to walk off the ends and trip the
+   "Early placement doesn't dominate the late" assertion at
+   `ir_gcm.c:536`. `IR_OPTX(..., 2)` is the same convention `ir_ext_ref`
+   uses when building 1-operand nodes (`ir_sccp.c:1974`).
+4. **Bookkeeping:** `ir_use_list_add(wide_src, and_ref)` to record the new
+   edge (constants aren't tracked), then `ir_bitqueue_grow` + `ir_bitqueue_add`
+   so SCCP reprocesses the AND, then `ir_iter_replace_insn(ext_ref, and_ref)`
+   to redirect former ZEXT users onto the AND and NOP the ZEXT. Both
+   `ext_ref` and the secondary `ext_ref_2` (when present) get the same
+   treatment.
+
+Shape of the replacement (see the function for the full code):
+
+```c
+ctx->ir_base[op_ref].type = type;
+phi_insn = &ctx->ir_base[phi_ref];
+phi_insn->type = type;
+/* ... extend phi's init-edge as before ... */
+
+ir_val mask_val; mask_val.u64 = 0xFFFFFFFFu;
+ir_ref mask_ref = ir_const(ctx, mask_val, type);
+
+ir_ref wide_src = ctx->ir_base[ext_ref].op1;
+ir_ref and_ref  = ir_emit2(ctx, IR_OPTX(IR_AND, type, 2), wide_src, mask_ref);
+ir_use_list_add(ctx, wide_src, and_ref);
+ir_bitqueue_grow(worklist, and_ref + 1);
+ir_bitqueue_add(worklist, and_ref);
+ir_iter_replace_insn(ctx, ext_ref, and_ref, worklist);
+/* same block for ext_ref_2 when set */
+```
+
+### Runtime cost
+`AND r64, 0xFFFFFFFF` lowers on x86-64 to a zero-extending 32-bit move,
+which is effectively a register rename on modern cores. In the inner loop
+we trade one `ZEXT` node for one `AND` node — no worse than the pre-
+promotion form — while the loop's arithmetic now runs in the wider type,
+which keeps the promotion's downstream benefits (register allocation, no
+separate narrow-phi) available. For ZEXTs of non-IV addresses (the bulk of
+the 15k ZEXT sites in rust-compression) the pass never fires, so this fix
+does not by itself close the broader "ZEXT+ADD on every memory op" gap
+called out in `notes/performance/rust-compression.md`; addressing-mode
+fusion in the x86 backend is the right lever for that.
+
+### Verification
+- `quicksort` Sightglass kernel at `IR_JIT` O2: passes.
+- Full Sightglass sweep (all kernels except `spidermonkey`/`tinygo`) at
+  `IR_JIT` O2: no hits for `dumped|failed|error|mismatch` in the run log.
 
 ---
 
