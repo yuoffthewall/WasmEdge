@@ -9,6 +9,7 @@
 
 #ifdef WASMEDGE_BUILD_IR_JIT
 #include "vm/ir_jit_engine.h"
+#include "vm/canonical_type_registry.h"
 #include <csetjmp>
 #include <cstring>
 #endif
@@ -22,6 +23,23 @@ static thread_local WasmEdge::Executor::Executor *g_jitExecutor = nullptr;
 static thread_local WasmEdge::Runtime::StackManager *g_jitStackMgr = nullptr;
 static thread_local const WasmEdge::Runtime::Instance::ModuleInstance *g_jitModInst = nullptr;
 static thread_local WasmEdge::Runtime::Instance::MemoryInstance *g_jitMemory0 = nullptr;
+
+/// Build a DispatchEntry from a RefVariant (for shadow dispatch table maintenance).
+static WasmEdge::VM::DispatchEntry
+makeDispatchEntry(const WasmEdge::RefVariant &Ref) {
+  if (Ref.isNull())
+    return {nullptr, 0, 0};
+  const auto *FuncInst = WasmEdge::retrieveFuncRef(Ref);
+  if (!FuncInst)
+    return {nullptr, 0, 0};
+  void *CodePtr = nullptr;
+  if (FuncInst->isIRJitFunction())
+    CodePtr = FuncInst->getIRJitNativeFunc();
+  uint32_t CanonId =
+      WasmEdge::VM::CanonicalTypeRegistry::instance().getOrAssign(
+          FuncInst->getFuncType());
+  return {CodePtr, CanonId, 0};
+}
 
 extern "C" uint64_t jit_host_call(WasmEdge::VM::JitExecEnv *env,
                                   uint32_t funcIdx, uint64_t *args) {
@@ -300,7 +318,6 @@ extern "C" void jit_table_get(WasmEdge::VM::JitExecEnv *env, uint32_t tableIdx,
 
 extern "C" void jit_table_set(WasmEdge::VM::JitExecEnv *env, uint32_t tableIdx,
                               uint32_t idx, const uint64_t *refPtr) {
-  (void)env;
   if (!refPtr || !g_jitExecutor || !g_jitStackMgr)
     return;
   auto *tab = g_jitExecutor->getTabInstByIdx(*g_jitStackMgr, tableIdx);
@@ -313,6 +330,11 @@ extern "C" void jit_table_set(WasmEdge::VM::JitExecEnv *env, uint32_t tableIdx,
   if (!tab->setRefAddr(idx, *refP)) {
     spdlog::error(WasmEdge::ErrCode::Value::TableOutOfBounds);
     WasmEdge::Fault::emitFault(WasmEdge::ErrCode::Value::TableOutOfBounds);
+  }
+  // Update shadow dispatch table for table 0
+  if (tableIdx == 0 && env->Table0Dispatch &&
+      idx < env->Table0DispatchSize) {
+    env->Table0Dispatch[idx] = makeDispatchEntry(*refP);
   }
 }
 
@@ -330,7 +352,6 @@ extern "C" uint32_t jit_table_size(WasmEdge::VM::JitExecEnv *env,
 extern "C" uint32_t jit_table_grow(WasmEdge::VM::JitExecEnv *env,
                                    uint32_t tableIdx, uint32_t n,
                                    const uint64_t *refPtr) {
-  (void)env;
   if (!g_jitExecutor || !g_jitStackMgr)
     return static_cast<uint32_t>(-1);
   auto *tab = g_jitExecutor->getTabInstByIdx(*g_jitStackMgr, tableIdx);
@@ -345,13 +366,17 @@ extern "C" uint32_t jit_table_grow(WasmEdge::VM::JitExecEnv *env,
   uint32_t oldSize = tab->getSize();
   if (!tab->growTable(n, ref))
     return static_cast<uint32_t>(-1);
+  // Invalidate shadow dispatch table for table 0 (conservative).
+  // All subsequent call_indirect will take the slow path until the next
+  // invoke() rebuilds the cache.
+  if (tableIdx == 0)
+    env->Table0DispatchSize = 0;
   return oldSize;
 }
 
 extern "C" void jit_table_fill(WasmEdge::VM::JitExecEnv *env, uint32_t tableIdx,
                                uint32_t offset, uint32_t len,
                                const uint64_t *refPtr) {
-  (void)env;
   if (!refPtr || !g_jitExecutor || !g_jitStackMgr)
     return;
   auto *tab = g_jitExecutor->getTabInstByIdx(*g_jitStackMgr, tableIdx);
@@ -365,12 +390,20 @@ extern "C" void jit_table_fill(WasmEdge::VM::JitExecEnv *env, uint32_t tableIdx,
     spdlog::error(WasmEdge::ErrCode::Value::TableOutOfBounds);
     WasmEdge::Fault::emitFault(WasmEdge::ErrCode::Value::TableOutOfBounds);
   }
+  // Update shadow dispatch table for table 0
+  if (tableIdx == 0 && env->Table0Dispatch) {
+    auto Entry = makeDispatchEntry(*refP);
+    uint32_t End = offset + len;
+    if (End > env->Table0DispatchSize)
+      End = env->Table0DispatchSize;
+    for (uint32_t I = offset; I < End; ++I)
+      env->Table0Dispatch[I] = Entry;
+  }
 }
 
 extern "C" void jit_table_copy(WasmEdge::VM::JitExecEnv *env,
                                uint32_t dstTableIdx, uint32_t srcTableIdx,
                                uint32_t dst, uint32_t src, uint32_t len) {
-  (void)env;
   if (!g_jitExecutor || !g_jitStackMgr)
     return;
   auto *tabDst = g_jitExecutor->getTabInstByIdx(*g_jitStackMgr, dstTableIdx);
@@ -388,12 +421,25 @@ extern "C" void jit_table_copy(WasmEdge::VM::JitExecEnv *env,
     spdlog::error(WasmEdge::ErrCode::Value::TableOutOfBounds);
     WasmEdge::Fault::emitFault(WasmEdge::ErrCode::Value::TableOutOfBounds);
   }
+  // Update shadow dispatch table when dst is table 0
+  if (dstTableIdx == 0 && env->Table0Dispatch) {
+    for (uint32_t I = 0; I < len; ++I) {
+      uint32_t DstIdx = dst + I;
+      uint32_t SrcIdx = src + I;
+      if (DstIdx >= env->Table0DispatchSize)
+        break;
+      auto RefRes = tabSrc->getRefAddr(SrcIdx);
+      if (RefRes)
+        env->Table0Dispatch[DstIdx] = makeDispatchEntry(*RefRes);
+      else
+        env->Table0Dispatch[DstIdx] = {nullptr, 0, 0};
+    }
+  }
 }
 
 extern "C" void jit_table_init(WasmEdge::VM::JitExecEnv *env, uint32_t tableIdx,
                                uint32_t elemIdx, uint32_t dst, uint32_t src,
                                uint32_t len) {
-  (void)env;
   if (!g_jitExecutor || !g_jitStackMgr)
     return;
   auto *tab = g_jitExecutor->getTabInstByIdx(*g_jitStackMgr, tableIdx);
@@ -405,6 +451,20 @@ extern "C" void jit_table_init(WasmEdge::VM::JitExecEnv *env, uint32_t tableIdx,
   if (!tab->setRefs(elem->getRefs(), dst, src, len)) {
     spdlog::error(WasmEdge::ErrCode::Value::TableOutOfBounds);
     WasmEdge::Fault::emitFault(WasmEdge::ErrCode::Value::TableOutOfBounds);
+  }
+  // Update shadow dispatch table when target is table 0
+  if (tableIdx == 0 && env->Table0Dispatch && elem) {
+    const auto &ElemRefs = elem->getRefs();
+    for (uint32_t I = 0; I < len; ++I) {
+      uint32_t DstIdx = dst + I;
+      uint32_t SrcIdx = src + I;
+      if (DstIdx >= env->Table0DispatchSize)
+        break;
+      if (SrcIdx < ElemRefs.size())
+        env->Table0Dispatch[DstIdx] = makeDispatchEntry(ElemRefs[SrcIdx]);
+      else
+        env->Table0Dispatch[DstIdx] = {nullptr, 0, 0};
+    }
   }
 }
 
@@ -865,6 +925,34 @@ Executor::enterFunction(Runtime::StackManager &StackMgr,
       auto MemInsts = ModInst->getMemoryInstances();
       Cache.MemoryBase =
           (!MemInsts.empty() && MemInsts[0]) ? MemInsts[0]->getDataPtr() : nullptr;
+
+      // Build shadow dispatch table for table 0 (inline call_indirect fast path)
+      auto TabRes = ModInst->getTable(0);
+      if (TabRes) {
+        auto *Tab0 = *TabRes;
+        uint32_t TabSize = Tab0->getSize();
+        Cache.Table0Dispatch.resize(TabSize);
+        auto &Registry = VM::CanonicalTypeRegistry::instance();
+        for (uint32_t I = 0; I < TabSize; ++I) {
+          auto RefRes = Tab0->getRefAddr(I);
+          if (!RefRes || (*RefRes).isNull()) {
+            Cache.Table0Dispatch[I] = {nullptr, 0, 0};
+            continue;
+          }
+          const auto *FuncInst = retrieveFuncRef(*RefRes);
+          if (!FuncInst) {
+            Cache.Table0Dispatch[I] = {nullptr, 0, 0};
+            continue;
+          }
+          void *CodePtr = nullptr;
+          if (FuncInst->isIRJitFunction())
+            CodePtr = FuncInst->getIRJitNativeFunc();
+          uint32_t CanonId = Registry.getOrAssign(FuncInst->getFuncType());
+          Cache.Table0Dispatch[I] = {CodePtr, CanonId, 0};
+        }
+      } else {
+        Cache.Table0Dispatch.clear();
+      }
     }
     void **FuncTable =
         Cache.FuncTable.empty() ? nullptr : Cache.FuncTable.data();
@@ -893,9 +981,13 @@ Executor::enterFunction(Runtime::StackManager &StackMgr,
         g_jitMemory0
             ? static_cast<uint64_t>(g_jitMemory0->getPageSize()) * UINT64_C(65536)
             : 0;
+    VM::DispatchEntry *DispTable =
+        Cache.Table0Dispatch.empty() ? nullptr : Cache.Table0Dispatch.data();
+    uint32_t DispSize = static_cast<uint32_t>(Cache.Table0Dispatch.size());
     auto Res = IREngine.invoke(Func.getIRJitNativeFunc(), FuncType, Args, Rets,
                                FuncTable, FuncTableSize, GlobalBase,
-                               MemoryBase, MemSizeBytes);
+                               MemoryBase, MemSizeBytes,
+                               DispTable, DispSize);
 
     if (!Res) {
       if (Res.error() != ErrCode::Value::Terminated) {

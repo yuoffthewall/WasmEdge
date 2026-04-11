@@ -81,6 +81,12 @@ public:
     ModuleGlobalTypes.assign(GlobalTypes.begin(), GlobalTypes.end());
   }
 
+  /// Set canonical type IDs for inline call_indirect fast path.
+  /// Indexed by type section index. ID 0 = invalid.
+  void setCanonicalTypeIds(Span<const uint32_t> Ids) noexcept {
+    CanonicalTypeIds.assign(Ids.begin(), Ids.end());
+  }
+
   /// Build IR from WebAssembly instruction sequence
   Expect<void> buildFromInstructions(Span<const AST::Instruction> Instrs);
 
@@ -257,6 +263,9 @@ private:
   
   // Module-level information for globals
   std::vector<ValType> ModuleGlobalTypes;  // Types of all module globals
+
+  // Canonical type IDs for inline call_indirect (indexed by type section index)
+  std::vector<uint32_t> CanonicalTypeIds;
 };
 
 } // namespace VM

@@ -1209,6 +1209,7 @@ private:
     std::vector<void *> FuncTable;
     std::vector<ValVariant *> GlobalPtrs;
     void *MemoryBase = nullptr;
+    std::vector<VM::DispatchEntry> Table0Dispatch;
   };
   mutable std::unordered_map<const Runtime::Instance::ModuleInstance *,
                              IRJitEnvCache>

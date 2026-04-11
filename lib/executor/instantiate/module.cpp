@@ -9,6 +9,7 @@
 #ifdef WASMEDGE_BUILD_IR_JIT
 #include "vm/ir_builder.h"
 #include "vm/ir_jit_engine.h"
+#include "vm/canonical_type_registry.h"
 #endif
 
 #include <cstdint>
@@ -163,7 +164,15 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
       TypeSection.push_back(
           &SubType.getCompositeType().getFuncType());
     }
-    
+
+    // Compute canonical type IDs for inline call_indirect fast path
+    std::vector<uint32_t> CanonicalTypeIds(TypeSection.size());
+    {
+      auto &Registry = VM::CanonicalTypeRegistry::instance();
+      for (size_t I = 0; I < TypeSection.size(); ++I)
+        CanonicalTypeIds[I] = Registry.getOrAssign(*TypeSection[I]);
+    }
+
     // Get number of imported functions (skip these - they're not wasm functions)
     uint32_t ImportFuncNum = 0;
     for (const auto &ImpDesc : Mod.getImportSection().getContent()) {
@@ -271,6 +280,7 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
         IRBuilder.setModuleTypes(TypeSection);
         IRBuilder.setModuleGlobals(GlobalTypes);
         IRBuilder.setImportFuncNum(ImportFuncNum);
+        IRBuilder.setCanonicalTypeIds(CanonicalTypeIds);
         
         // Pre-scan to find max call args for shared buffer allocation
         {

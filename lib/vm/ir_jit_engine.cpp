@@ -192,7 +192,9 @@ Expect<void> IRJitEngine::invoke(void *NativeFunc,
                                   Span<ValVariant> Rets,
                                   void **FuncTable, uint32_t FuncTableSize,
                                   void *GlobalBase,
-                                  void *MemoryBase, uint64_t MemorySize) {
+                                  void *MemoryBase, uint64_t MemorySize,
+                                  DispatchEntry *Table0Dispatch,
+                                  uint32_t Table0DispatchSize) {
   if (!NativeFunc) {
     return Unexpect(ErrCode::Value::RuntimeError);
   }
@@ -212,6 +214,9 @@ Expect<void> IRJitEngine::invoke(void *NativeFunc,
   Env.MemorySizeFn = reinterpret_cast<void *>(&jit_memory_size);
   Env.CallIndirectFn = reinterpret_cast<void *>(&jit_call_indirect);
   Env.MemorySizeBytes = static_cast<uint64_t>(MemorySize);
+  Env.Table0Dispatch = Table0Dispatch;
+  Env.Table0DispatchSize = Table0DispatchSize;
+  Env._pad2 = 0;
 
   ArgsBuffer_.resize(ParamTypes.size());
   for (size_t i = 0; i < ParamTypes.size(); ++i)

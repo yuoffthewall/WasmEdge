@@ -2851,35 +2851,194 @@ Expect<void> WasmToIRBuilder::visitCall(const AST::Instruction &Instr) {
       }
     }
 
-    ir_ref CIFn = ensureValidRef(CallIndirectFnPtr, IR_ADDR);
-    uint8_t CIProtoParams[6] = {IR_ADDR, IR_I32, IR_I32, IR_I32, IR_ADDR, IR_I32};
-    ir_ref CIProto =
-        ir_proto(ctx, IR_FASTCALL_FUNC, IR_I64, 6, CIProtoParams);
-    ir_ref TypedCI =
-        ir_emit2(ctx, IR_OPT(IR_PROTO, IR_ADDR), CIFn, CIProto);
-    ir_ref CIArgs[6] = {EnvPtrVal,
-                        ir_CONST_I32(static_cast<int32_t>(TableIdx)),
-                        TableIndex,
-                        ir_CONST_I32(static_cast<int32_t>(TypeIdx)),
-                        CalleeArgs,
-                        ir_CONST_I32(static_cast<int32_t>(retTypeCode))};
-    ir_ref CallResult = ir_CALL_N(IR_I64, TypedCI, 6, CIArgs);
+    // Check if we can use inline fast path (table 0 + canonical type ID)
+    bool UseInlineFastPath = (TableIdx == 0 &&
+                              TypeIdx < CanonicalTypeIds.size() &&
+                              CanonicalTypeIds[TypeIdx] != 0);
 
-    if (!RetTypes.empty()) {
-      if (RetType == IR_I32)
-        push(ir_TRUNC_I32(CallResult));
-      else if (RetType == IR_I64)
-        push(CallResult);
-      else if (RetType == IR_FLOAT) {
-        ir_ref tmp = ir_ALLOCA(ir_CONST_I32(8));
-        ir_STORE(tmp, CallResult);
-        push(ir_LOAD_F(tmp));
-      } else if (RetType == IR_DOUBLE) {
-        ir_ref tmp = ir_ALLOCA(ir_CONST_I32(8));
-        ir_STORE(tmp, CallResult);
-        push(ir_LOAD_D(tmp));
+    if (UseInlineFastPath) {
+      uint32_t ExpectedCanonId = CanonicalTypeIds[TypeIdx];
+
+      // Determine fast-path return type (same as direct call convention)
+      ir_type DirectRetType;
+      if (RetType == IR_FLOAT)
+        DirectRetType = IR_FLOAT;
+      else if (RetType == IR_DOUBLE)
+        DirectRetType = IR_DOUBLE;
+      else
+        DirectRetType = IR_I64;
+
+      // Load dispatch table fresh from env (NOT prologue-cached)
+      ir_ref DispBase = ir_LOAD_A(
+          ir_ADD_A(EnvPtrVal,
+                   ir_CONST_ADDR(offsetof(JitExecEnv, Table0Dispatch))));
+      ir_ref DispSize = ir_LOAD_U32(
+          ir_ADD_A(EnvPtrVal,
+                   ir_CONST_ADDR(offsetof(JitExecEnv, Table0DispatchSize))));
+
+      // Guard 1: bounds check (unsigned)
+      ir_ref BoundsOk = ir_ULT(TableIndex, DispSize);
+      ir_ref IfBounds = ir_IF(BoundsOk);
+      ir_IF_FALSE_cold(IfBounds);
+      ir_ref SlowEnd1 = ir_END();
+      ir_IF_TRUE(IfBounds);
+
+      // Load dispatch entry: base + zext(elemIdx) * 16
+      ir_ref ElemExt = ir_ZEXT_A(TableIndex);
+      ir_ref EntryAddr = ir_ADD_A(DispBase,
+          ir_MUL_A(ElemExt, ir_CONST_ADDR(sizeof(DispatchEntry))));
+      ir_ref CodePtr = ir_LOAD_A(EntryAddr);
+      ir_ref CanonId = ir_LOAD_U32(
+          ir_ADD_A(EntryAddr,
+                   ir_CONST_ADDR(offsetof(DispatchEntry, CanonicalTypeId))));
+
+      // Guard 2: type ID check
+      ir_ref TypeOk = ir_EQ(CanonId, ir_CONST_U32(ExpectedCanonId));
+      ir_ref IfType = ir_IF(TypeOk);
+      ir_IF_FALSE_cold(IfType);
+      ir_ref SlowEnd2 = ir_END();
+      ir_IF_TRUE(IfType);
+
+      // Guard 3: null check (code_ptr != null)
+      ir_ref NotNull = ir_NE(CodePtr, ir_CONST_ADDR(0));
+      ir_ref IfNull = ir_IF(NotNull);
+      ir_IF_FALSE_cold(IfNull);
+      ir_ref SlowEnd3 = ir_END();
+      ir_IF_TRUE(IfNull);
+
+      // === Fast path: typed direct call ===
+      uint8_t FastProtoParams[2] = {IR_ADDR, IR_ADDR};
+      ir_ref FastProto = ir_proto(ctx, IR_FASTCALL_FUNC, DirectRetType, 2,
+                                   FastProtoParams);
+      ir_ref TypedCodePtr =
+          ir_emit2(ctx, IR_OPT(IR_PROTO, IR_ADDR), CodePtr, FastProto);
+      ir_ref FastCallArgs[2] = {EnvPtrVal, CalleeArgs};
+
+      if (RetTypes.empty()) {
+        // Void return: no PHI needed
+        ir_CALL_N(DirectRetType, TypedCodePtr, 2, FastCallArgs);
+        ir_ref FastEnd = ir_END();
+
+        // Slow path: merge guard failures
+        ir_ref SlowEnds[3] = {SlowEnd1, SlowEnd2, SlowEnd3};
+        ir_MERGE_N(3, SlowEnds);
+
+        // Emit trampoline call (slow path)
+        ir_ref CIFn = ensureValidRef(CallIndirectFnPtr, IR_ADDR);
+        uint8_t CIProtoParams[6] = {IR_ADDR, IR_I32, IR_I32,
+                                     IR_I32, IR_ADDR, IR_I32};
+        ir_ref CIProto =
+            ir_proto(ctx, IR_FASTCALL_FUNC, IR_I64, 6, CIProtoParams);
+        ir_ref TypedCI =
+            ir_emit2(ctx, IR_OPT(IR_PROTO, IR_ADDR), CIFn, CIProto);
+        ir_ref CIArgs[6] = {
+            EnvPtrVal,
+            ir_CONST_I32(static_cast<int32_t>(TableIdx)),
+            TableIndex,
+            ir_CONST_I32(static_cast<int32_t>(TypeIdx)),
+            CalleeArgs,
+            ir_CONST_I32(static_cast<int32_t>(retTypeCode))};
+        ir_CALL_N(IR_I64, TypedCI, 6, CIArgs);
+        ir_ref SlowEnd = ir_END();
+
+        ir_MERGE_2(FastEnd, SlowEnd);
       } else {
-        push(CallResult);
+        // Non-void return: need PHI merge
+        ir_ref FastResult =
+            ir_CALL_N(DirectRetType, TypedCodePtr, 2, FastCallArgs);
+
+        // For i32/i64 returns, fast path already returns IR_I64.
+        // For float/double, fast path returns typed (IR_FLOAT/IR_DOUBLE).
+        // Normalize fast path to IR_I64 so PHI type matches slow path.
+        ir_ref FastNorm;
+        if (RetType == IR_FLOAT || RetType == IR_DOUBLE) {
+          ir_ref tmp = ir_ALLOCA(ir_CONST_I32(8));
+          if (RetType == IR_FLOAT)
+            ir_STORE(tmp, FastResult);
+          else
+            ir_STORE(tmp, FastResult);
+          FastNorm = ir_LOAD_I64(tmp);
+        } else {
+          FastNorm = FastResult;
+        }
+        ir_ref FastEnd = ir_END();
+
+        // Slow path: merge guard failures
+        ir_ref SlowEnds[3] = {SlowEnd1, SlowEnd2, SlowEnd3};
+        ir_MERGE_N(3, SlowEnds);
+
+        // Emit trampoline call (slow path)
+        ir_ref CIFn = ensureValidRef(CallIndirectFnPtr, IR_ADDR);
+        uint8_t CIProtoParams[6] = {IR_ADDR, IR_I32, IR_I32,
+                                     IR_I32, IR_ADDR, IR_I32};
+        ir_ref CIProto =
+            ir_proto(ctx, IR_FASTCALL_FUNC, IR_I64, 6, CIProtoParams);
+        ir_ref TypedCI =
+            ir_emit2(ctx, IR_OPT(IR_PROTO, IR_ADDR), CIFn, CIProto);
+        ir_ref CIArgs[6] = {
+            EnvPtrVal,
+            ir_CONST_I32(static_cast<int32_t>(TableIdx)),
+            TableIndex,
+            ir_CONST_I32(static_cast<int32_t>(TypeIdx)),
+            CalleeArgs,
+            ir_CONST_I32(static_cast<int32_t>(retTypeCode))};
+        ir_ref SlowResult = ir_CALL_N(IR_I64, TypedCI, 6, CIArgs);
+        ir_ref SlowEnd = ir_END();
+
+        // Merge fast and slow paths — PHI in IR_I64
+        ir_MERGE_2(FastEnd, SlowEnd);
+        ir_ref MergedResult = ir_PHI_2(IR_I64, FastNorm, SlowResult);
+
+        // Post-process return value (same as existing trampoline path)
+        if (RetType == IR_I32)
+          push(ir_TRUNC_I32(MergedResult));
+        else if (RetType == IR_I64)
+          push(MergedResult);
+        else if (RetType == IR_FLOAT) {
+          ir_ref tmp = ir_ALLOCA(ir_CONST_I32(8));
+          ir_STORE(tmp, MergedResult);
+          push(ir_LOAD_F(tmp));
+        } else if (RetType == IR_DOUBLE) {
+          ir_ref tmp = ir_ALLOCA(ir_CONST_I32(8));
+          ir_STORE(tmp, MergedResult);
+          push(ir_LOAD_D(tmp));
+        } else {
+          push(MergedResult);
+        }
+      }
+    } else {
+      // Fallback: existing trampoline call (non-table-0 or no canonical IDs)
+      ir_ref CIFn = ensureValidRef(CallIndirectFnPtr, IR_ADDR);
+      uint8_t CIProtoParams[6] = {IR_ADDR, IR_I32, IR_I32,
+                                   IR_I32, IR_ADDR, IR_I32};
+      ir_ref CIProto =
+          ir_proto(ctx, IR_FASTCALL_FUNC, IR_I64, 6, CIProtoParams);
+      ir_ref TypedCI =
+          ir_emit2(ctx, IR_OPT(IR_PROTO, IR_ADDR), CIFn, CIProto);
+      ir_ref CIArgs[6] = {EnvPtrVal,
+                          ir_CONST_I32(static_cast<int32_t>(TableIdx)),
+                          TableIndex,
+                          ir_CONST_I32(static_cast<int32_t>(TypeIdx)),
+                          CalleeArgs,
+                          ir_CONST_I32(static_cast<int32_t>(retTypeCode))};
+      ir_ref CallResult = ir_CALL_N(IR_I64, TypedCI, 6, CIArgs);
+
+      if (!RetTypes.empty()) {
+        if (RetType == IR_I32)
+          push(ir_TRUNC_I32(CallResult));
+        else if (RetType == IR_I64)
+          push(CallResult);
+        else if (RetType == IR_FLOAT) {
+          ir_ref tmp = ir_ALLOCA(ir_CONST_I32(8));
+          ir_STORE(tmp, CallResult);
+          push(ir_LOAD_F(tmp));
+        } else if (RetType == IR_DOUBLE) {
+          ir_ref tmp = ir_ALLOCA(ir_CONST_I32(8));
+          ir_STORE(tmp, CallResult);
+          push(ir_LOAD_D(tmp));
+        } else {
+          push(CallResult);
+        }
       }
     }
   } else {
