@@ -9,6 +9,7 @@ if(WASMEDGE_BUILD_IR_JIT)
   list(APPEND WASMEDGE_VM_SOURCES
     ir_builder.cpp
     ir_jit_engine.cpp
+    canonical_type_registry.cpp
   )
   if(WASMEDGE_USE_LLVM)
     list(APPEND WASMEDGE_VM_SOURCES

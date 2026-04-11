@@ -215,6 +215,8 @@ Expect<void> IRJitEngine::invoke(void *NativeFunc,
                                   void **FuncTable, uint32_t FuncTableSize,
                                   void *GlobalBase,
                                   void *MemoryBase, uint64_t MemorySize,
+                                  DispatchEntry *Table0Dispatch,
+                                  uint32_t Table0DispatchSize,
                                   uint32_t *CallCounters) {
   if (!NativeFunc) {
     return Unexpect(ErrCode::Value::RuntimeError);
@@ -235,6 +237,9 @@ Expect<void> IRJitEngine::invoke(void *NativeFunc,
   Env.MemorySizeFn = reinterpret_cast<void *>(&jit_memory_size);
   Env.CallIndirectFn = reinterpret_cast<void *>(&jit_call_indirect);
   Env.MemorySizeBytes = static_cast<uint64_t>(MemorySize);
+  Env.Table0Dispatch = Table0Dispatch;
+  Env.Table0DispatchSize = Table0DispatchSize;
+  Env._pad2 = 0;
   Env.CallCounters = CallCounters;
   Env.TierUpNotifyFn = reinterpret_cast<void *>(&jit_tier_up_notify);
 

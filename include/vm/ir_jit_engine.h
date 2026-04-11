@@ -43,6 +43,14 @@ namespace VM {
 
 class WasmToIRBuilder;
 
+/// Shadow dispatch table entry for inlined call_indirect fast path.
+/// 16 bytes, indexed by table element index (shift-by-4 indexing).
+struct DispatchEntry {
+  void *CodePtr;             // offset 0: JIT native func ptr (null if not JIT'd)
+  uint32_t CanonicalTypeId;  // offset 8: canonical type ID (0 = invalid)
+  uint32_t _pad;             // offset 12: alignment padding
+};
+
 /// Execution environment passed as the first argument to every JIT-compiled
 /// function. Used with the uniform signature ret func(JitExecEnv*, uint64_t*).
 /// O0 code emitter has a bug fusing LOAD(addr)->ADDR with ADD; use O2
@@ -61,6 +69,12 @@ struct JitExecEnv {
   uint64_t MemorySizeBytes; // Current linear memory size in bytes (for bounds checking)
   /// 16-byte buffer for ref-return helpers (jit_ref_func, jit_table_get).
   uint64_t RefResultBuf[2];
+  /// Shadow dispatch table for table 0 (inline call_indirect fast path).
+  /// Loaded fresh at each call_indirect site (not prologue-cached) because
+  /// table.grow can invalidate the pointer.
+  DispatchEntry *Table0Dispatch;
+  uint32_t Table0DispatchSize;
+  uint32_t _pad2;
   /// Tier-2 profiling: per-function call counters (indexed by func idx).
   uint32_t *CallCounters;
   /// Tier-2 profiling: pointer to tier_up_notify(JitExecEnv*, uint32_t funcIdx).
@@ -173,6 +187,8 @@ public:
                       void **FuncTable = nullptr, uint32_t FuncTableSize = 0,
                       void *GlobalBase = nullptr,
                       void *MemoryBase = nullptr, uint64_t MemorySize = 0,
+                      DispatchEntry *Table0Dispatch = nullptr,
+                      uint32_t Table0DispatchSize = 0,
                       uint32_t *CallCounters = nullptr);
 
   /// Release compiled code

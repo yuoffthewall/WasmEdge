@@ -1223,6 +1223,7 @@ private:
     uint32_t FuncTableSize = 0;
     std::vector<ValVariant *> GlobalPtrs;
     void *MemoryBase = nullptr;
+    std::vector<VM::DispatchEntry> Table0Dispatch;
     /// Tier-2 profiling: per-function call counters.
     std::vector<uint32_t> CallCounters;
     /// Tier-2 state: 0=tier1, 1=enqueued, 2=tier2.
