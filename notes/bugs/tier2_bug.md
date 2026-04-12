@@ -581,6 +581,80 @@ This is not an error handler — it's a shutdown strategy.
 
 ---
 
+## Bug 20: `ir_emit_llvm` emits integer `0` instead of `null` for IR_ADDR pointer comparisons — FIXED
+
+**Date:** 2026-04-12
+**Status:** Fixed
+**Location:** `thirdparty/ir/ir_emit_llvm.c`, 5 functions: `ir_emit_ref`, `ir_emit_if`, `ir_emit_guard`, `ir_emit_conditional_op`, `ir_emit_unary_not`
+**Category:** ir backend bug
+
+**Root cause:** Several LLVM emitter functions hardcode `, 0\n` when emitting
+truthiness/equality checks for non-boolean, non-FP types. When the IR type is
+`IR_ADDR` (pointer), LLVM IR requires `null` as the zero literal, not integer
+`0`. Two sub-issues:
+
+1. **`ir_emit_ref()`** checked `insn->op == IR_ADDR` to decide whether to emit a
+   pointer literal. But `IR_ADDR` is a *type* enum value, not an opcode — the
+   opcode for address constants is `IR_C_ADDR`. The correct check is
+   `insn->type == IR_ADDR`.
+
+2. **`ir_emit_if()`, `ir_emit_guard()`, `ir_emit_conditional_op()`,
+   `ir_emit_unary_not()`** all emit `icmp ne <type> %val, 0` or
+   `icmp eq <type> %val, 0` for truthiness checks. When `<type>` is `ptr`,
+   LLVM rejects `0` — it requires `null`.
+
+**Triggered by:** The inline `call_indirect` fast path (merged from `ir_jit`
+branch, commit `3c8adb49`) generates a null-pointer guard:
+```c
+ir_ref ne = ir_NE(Ctx, CodePtr, ir_CONST_ADDR(Ctx, 0));
+ir_ref if_ref = ir_IF(Ctx, ne);
+```
+At O2, SCCP folds the `NE` into the `IF`, producing `ir_IF(IR_ADDR, CodePtr)`.
+The `ir_emit_if()` handler then emits:
+```llvm
+%t110 = icmp ne ptr %d102, 0    ; <-- INVALID: should be null
+```
+This fails `LLVMParseIRInContext()` with: *"integer constant must have integer
+type"*.
+
+**Reproduction:**
+```
+WASMEDGE_SIGHTGLASS_KERNEL=quicksort WASMEDGE_TIER2_ENABLE=1 \
+WASMEDGE_TIER2_THRESHOLD=10 WASMEDGE_TIER2_LOOP_THRESHOLD=5 \
+WASMEDGE_TIER2_DUMP_IR=1 \
+WASMEDGE_SIGHTGLASS_MODE=IR_JIT WASMEDGE_IR_JIT_OPT_LEVEL=2 \
+WASMEDGE_SIGHTGLASS_SKIP_INTERP=1 WASMEDGE_SIGHTGLASS_QUICK=1 \
+./test/ir/wasmedgeIRBenchmarkTests --gtest_filter='*SightglassSuite*'
+```
+Check `/tmp/tier2_wasm_tier2_*.ll` for `icmp ne ptr %..., 0`.
+
+**Example (from tier2 LLVM dump):**
+```llvm
+%t110 = icmp ne ptr %d102, 0       ; <-- INVALID
+br i1 %t110, label %l19, label %l20
+```
+**Expected:**
+```llvm
+%t110 = icmp ne ptr %d102, null
+br i1 %t110, label %l19, label %l20
+```
+
+**Fix (5 locations in `ir_emit_llvm.c`):**
+- `ir_emit_ref()` (~line 283): Changed `insn->op == IR_ADDR` to `insn->type == IR_ADDR`; simplified else branch.
+- `ir_emit_if()` (~line 710): Changed `fprintf(f, ", 0\n")` to `fprintf(f, ", %s\n", type == IR_ADDR ? "null" : "0")`.
+- `ir_emit_guard()` (~line 732): Same pattern.
+- `ir_emit_conditional_op()` (~line 619): Same pattern.
+- `ir_emit_unary_not()` (~line 397): Same pattern for `icmp eq` case.
+
+**Commits:** `thirdparty/ir` 7b2e49e, parent repo 0d423db0.
+
+**Impact:** Any wasm function using `call_indirect` with the inline dispatch
+optimization would fail tier-2 LLVM recompilation. This covers most non-trivial
+wasm programs (vtable dispatch, function pointers). Tier-1 JIT was unaffected
+(uses native x86 backend, not LLVM).
+
+---
+
 ## Bug 14 (known, pre-existing): O1 crash with IF/MERGE in prologue
 
 **Date:** 2026-04-03
