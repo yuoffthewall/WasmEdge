@@ -389,23 +389,49 @@ See `notes/static_alloca_frame_pointer_bug.md` for full debugging methodology.
 
 ---
 
-## Bug 15: ir_load parser rejects MERGE/PHI with >255 inputs — OPEN
+## Bug 15: ir_load parser rejects MERGE/PHI with >255 inputs — FIXED
 
-**Date:** 2026-04-03
-**Status:** Open (ir backend limitation)
-**Location:** `thirdparty/ir/ir_load.c`, generated parser code (`count > 255` check)
+**Date:** 2026-04-03 (opened), 2026-04-13 (fixed)
+**Status:** Fixed
+**Location:** `thirdparty/ir/ir.g` line 594, `thirdparty/ir/ir_load.c` line 1783
 **Category:** ir backend bug
 
-**Root cause:** The ir_load parser has a hard-coded limit: variable-operand
-instructions (MERGE, PHI) with more than 255 inputs trigger a parse error.
-`ir_save` faithfully serializes MERGE/255 (255 predecessors), but when PHI
-adds 1 to the count (256 > 255), the parser rejects it.
+**Root cause:** The ir_load parser had a hard-coded limit: variable-operand
+instructions (MERGE, PHI) with more than 255 inputs triggered a parse error.
+`ir_save` faithfully serializes `PHI/255` for a PHI with 255 data inputs, but
+the loader adds 1 for the control edge (`if (op == IR_PHI) count.i32++;`),
+giving 256, which then trips the `count > 255` check.
 
-**Affected:** rust-compression func 185 (MERGE with 255 inputs). Only 1 of
-~637 functions; the function falls back to tier-1 silently via `ir_load_safe`.
+The 255 cap is arbitrary: `ir_emit_N` accepts up to 65535 (`count < 65536`),
+and `ir_insn::inputs_count` is a `uint16_t`. The optx encoding uses bits
+16-31 of a `uint32_t`, so the true hardware limit is 65535.
 
-**Impact:** Minimal — single function in one kernel. All other functions
-compile to tier-2 normally.
+**Affected:** rust-compression `wasm_tier2_185` (a PHI with 255 data inputs
+fed by a MERGE with 255 predecessors, from a giant `br_table` / jump-table
+lowering). Manifests as:
+```
+ERROR: bad number of operands at line 4195
+tier2-batch: failed to load IR for wasm_tier2_185
+tier2: compilation failed for func 185 (wasm_tier2_185)
+```
+Only 1 of ~637 functions; the function would silently fall back to tier-1
+via `ir_load_safe`.
+
+**Fix:** Relaxed the limit from 255 to 65535 in both the source grammar
+`ir.g` and the generated `ir_load.c`:
+```c
+if (count.i32 < 0 || count.i32 > 65535) yy_error("bad number of operands");
+```
+No other changes required — `ir_save` writes `/%d` with no cap, and
+`ir_emit_N` already supports up to 65535.
+
+**Verification:** `wasm_tier2_185` now compiles to tier-2 successfully. Full
+sightglass sweep (33 kernels) passes under tier-2 at both O0 and O2 with
+zero errors/warnings.
+
+**Impact:** Previously a silent fallback for one hot function; now promoted
+to tier-2 like all other functions. Removes the last known `ir_load_safe`
+failure path in the sightglass benchmark suite.
 
 ---
 
