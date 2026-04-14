@@ -1299,6 +1299,12 @@ TEST_F(IRBenchmarkTest, Benchmark_Quicksort) {
 TEST_F(IRBenchmarkTest, SightglassSuite) {
   auto TestDataPath = getTestDataPath();
   auto SightglassDir = TestDataPath / "sightglass";
+  if (const char *dirEnv = std::getenv("WASMEDGE_SIGHTGLASS_DIR");
+      dirEnv && dirEnv[0] != '\0') {
+    SightglassDir = std::filesystem::path(dirEnv);
+    if (!SightglassDir.is_absolute())
+      SightglassDir = TestDataPath / SightglassDir;
+  }
 
   if (!std::filesystem::exists(SightglassDir) ||
       !std::filesystem::is_directory(SightglassDir)) {

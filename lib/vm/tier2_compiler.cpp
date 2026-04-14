@@ -557,6 +557,7 @@ static void rewriteIntraBatchCalls(
   std::unordered_map<std::string, uint64_t> IntToPtrToOffset;
   std::unordered_map<std::string, std::string> PtrToFunc;
   std::string FuncTableSSA; // SSA name of FuncTablePtr (first load from env)
+  std::string EnvParamSSA;  // First parameter of current function (env ptr).
 
   std::string Result;
   Result.reserve(IR.size());
@@ -576,14 +577,39 @@ static void rewriteIntraBatchCalls(
       IntToPtrToOffset.clear();
       PtrToFunc.clear();
       FuncTableSSA.clear();
+      EnvParamSSA.clear();
+      // Parse first parameter SSA name from: "define TY @name(ptr %dN, ...)".
+      auto OpenParen = Line.find('(');
+      if (OpenParen != std::string::npos) {
+        size_t P = OpenParen + 1;
+        // Skip leading type "ptr " / "i32 " etc.
+        while (P < Line.size() && Line[P] != '%' && Line[P] != ')')
+          ++P;
+        if (P < Line.size() && Line[P] == '%') {
+          size_t E = P;
+          while (E < Line.size() && Line[E] != ',' && Line[E] != ')' &&
+                 Line[E] != ' ')
+            ++E;
+          EnvParamSSA = Line.substr(P, E - P);
+        }
+      }
     }
 
-    // Detect FuncTablePtr: first "load ptr, ptr %dN" after function start.
-    // In our IR, it's always "%d4 = load ptr, ptr %d2" (env pointer deref).
-    if (FuncTableSSA.empty() && Line.find("= load ptr, ptr ") != std::string::npos) {
-      std::string Dest = GetDest(Line);
-      if (!Dest.empty())
-        FuncTableSSA = Dest;
+    // Detect FuncTablePtr: the load of the FuncTable pointer from the env
+    // struct. FuncTable lives at offset 0, so the emitted IR is literally
+    // "%dN = load ptr, ptr %<env>". Matching on "load ptr, ptr <env-param>"
+    // avoids latching onto the tier-up counter-prologue load, which first
+    // goes through a ptrtoint/add/inttoptr chain (CallCounters offset).
+    if (FuncTableSSA.empty() && !EnvParamSSA.empty()) {
+      auto LP = Line.find("= load ptr, ptr ");
+      if (LP != std::string::npos) {
+        std::string Src = Trim(Line.substr(LP + 16));
+        if (Src == EnvParamSSA) {
+          std::string Dest = GetDest(Line);
+          if (!Dest.empty())
+            FuncTableSSA = Dest;
+        }
+      }
     }
 
     // Track ptrtoint of FuncTablePtr: "%tN_1 = ptrtoint ptr %d4 to i64"
