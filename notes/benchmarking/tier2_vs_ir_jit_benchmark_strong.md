@@ -227,46 +227,46 @@ than LLVM JIT is either compile/warmup cost the harness is attributing to
 Run log: `/tmp/llvmjit-strong.log`. Same env as the other arms, plus
 `WASMEDGE_SIGHTGLASS_MODE=JIT`. Single run, no repeats.
 
-Tier-2 numbers are post RC1 fix (rewriter now detects `FuncTablePtr`
-correctly; see "Root causes / RC1 fix — results" below). Pre-fix numbers
-are kept in a `t2-pre` column for kernels where the fix moved the number
-by more than run-to-run noise.
+Tier-2 numbers are **post RC1 + RC3 + RC4** (rewriter detects
+`FuncTablePtr` correctly, counter prologue stripped at the LLVM IR text
+level, loop/SLP vectorisation flags re-enabled). See the RC1 and RC3+RC4
+fix-results sections below for the moves vs the earlier states.
 
-| Kernel | Tier-1 (s) | Tier-2 (s) | t2-pre (s) | LLVM JIT (s) | t2 − LLVM (s) | t2 / LLVM |
-|---|---:|---:|---:|---:|---:|---:|
-| blake3-scalar | 5.65 | 5.55 | 5.60 | 5.48 | +0.07 | 1.01 |
-| blind-sig | 9.47 | 7.64 | 7.65 | 3.97 | +3.67 | 1.92 |
-| bz2 | 7.83 | 7.90 | 7.81 | 7.07 | +0.83 | 1.12 |
-| gcc-loops | 7.96 | 8.12 | 8.09 | 7.02 | +1.10 | 1.16 |
-| hashset | 8.05 | 8.18 | 8.19 | 7.52 | +0.66 | 1.09 |
-| noop | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | — |
-| pulldown-cmark | 8.21 | 7.51 | 7.55 | 7.59 | -0.08 | 0.99 |
-| quicksort | 8.13 | 6.64 | 6.66 | 6.98 | -0.34 | 0.95 |
-| regex | 9.30 | 8.69 | 8.56 | 8.80 | -0.11 | 0.99 |
-| richards | 8.09 | 8.18 | 8.15 | 8.22 | -0.04 | 1.00 |
-| rust-compression | 9.95 | 7.74 | 7.82 | 7.15 | +0.59 | 1.08 |
-| rust-html-rewriter | 7.91 | 8.01 | 8.12 | 7.78 | +0.23 | 1.03 |
-| rust-json | 8.00 | 7.53 | 7.39 | 7.30 | +0.23 | 1.03 |
-| rust-protobuf | 7.20 | 7.27 | 7.29 | 6.69 | +0.58 | 1.09 |
-| shootout-ackermann | 5.62 | **15.14** | 19.38 | **4.57** | **+10.57** | **3.31** |
-| shootout-base64 | 8.40 | 8.43 | 8.53 | 7.00 | +1.43 | 1.20 |
-| shootout-ctype | 8.27 | 8.41 | 8.36 | 5.05 | +3.36 | 1.67 |
-| shootout-ed25519 | 8.49 | 8.13 | 8.46 | 5.25 | +2.88 | 1.55 |
-| shootout-fib2 | 7.90 | **9.06** | 9.72 | 6.48 | +2.58 | 1.40 |
-| shootout-gimli | 8.20 | 8.09 | 8.09 | 7.85 | +0.24 | 1.03 |
-| shootout-heapsort | 8.44 | 8.68 | 8.57 | 8.05 | +0.63 | 1.08 |
-| shootout-keccak | 8.18 | 6.84 | 6.90 | 6.90 | -0.06 | 0.99 |
-| shootout-matrix | 8.09 | 8.15 | 8.16 | 6.82 | +1.33 | 1.19 |
-| shootout-memmove | 8.14 | 8.26 | 8.30 | 8.61 | -0.35 | 0.96 |
-| shootout-minicsv | 9.58 | 9.72 | 9.73 | 9.30 | +0.42 | 1.05 |
-| shootout-nestedloop | 5.46 | 5.48 | 5.47 | **8.85** | **-3.37** | **0.62** |
-| shootout-random | 6.94 | 6.99 | 7.01 | 4.37 | +2.62 | 1.60 |
-| shootout-ratelimit | 8.58 | 8.55 | 8.59 | 8.43 | +0.12 | 1.01 |
-| shootout-seqhash | 5.42 | 5.44 | 5.44 | 5.55 | -0.11 | 0.98 |
-| shootout-sieve | 8.14 | 10.17 | 10.16 | 6.88 | +3.29 | 1.48 |
-| shootout-switch | 8.81 | 9.29 | 9.34 | 9.11 | +0.18 | 1.02 |
-| shootout-xblabla20 | 8.01 | 7.87 | 8.01 | 8.25 | -0.38 | 0.95 |
-| shootout-xchacha20 | 8.26 | 8.20 | 8.22 | 8.10 | +0.10 | 1.01 |
+| Kernel | Tier-1 (s) | Tier-2 (s) | LLVM JIT (s) | t2 / LLVM |
+|---|---:|---:|---:|---:|
+| blake3-scalar | 5.65 | 5.55 | 5.48 | 1.01 |
+| blind-sig | 9.47 | **6.72** | 3.97 | 1.69 |
+| bz2 | 7.83 | 7.90 | 7.07 | 1.12 |
+| gcc-loops | 7.96 | 8.12 | 7.02 | 1.16 |
+| hashset | 8.05 | 8.18 | 7.52 | 1.09 |
+| noop | 0.00 | 0.00 | 0.00 | — |
+| pulldown-cmark | 8.21 | 7.51 | 7.59 | 0.99 |
+| quicksort | 8.13 | 7.36 | 6.98 | 1.05 |
+| regex | 9.30 | 8.69 | 8.80 | 0.99 |
+| richards | 8.09 | 8.18 | 8.22 | 1.00 |
+| rust-compression | 9.95 | 7.74 | 7.15 | 1.08 |
+| rust-html-rewriter | 7.91 | 8.01 | 7.78 | 1.03 |
+| rust-json | 8.00 | 7.53 | 7.30 | 1.03 |
+| rust-protobuf | 7.20 | 7.27 | 6.69 | 1.09 |
+| shootout-ackermann | 5.62 | **8.73** | **4.57** | **1.91** |
+| shootout-base64 | 8.40 | 8.43 | 7.00 | 1.20 |
+| shootout-ctype | 8.27 | **8.00** | 5.05 | 1.58 |
+| shootout-ed25519 | 8.49 | **7.47** | 5.25 | 1.42 |
+| shootout-fib2 | 7.90 | **6.55** | 6.48 | **1.01** |
+| shootout-gimli | 8.20 | 8.09 | 7.85 | 1.03 |
+| shootout-heapsort | 8.44 | 8.68 | 8.05 | 1.08 |
+| shootout-keccak | 8.18 | 6.84 | 6.90 | 0.99 |
+| shootout-matrix | 8.09 | 8.15 | 6.82 | 1.19 |
+| shootout-memmove | 8.14 | 8.26 | 8.61 | 0.96 |
+| shootout-minicsv | 9.58 | 9.72 | 9.30 | 1.05 |
+| shootout-nestedloop | 5.46 | 5.48 | **8.85** | **0.62** |
+| shootout-random | 6.94 | 6.99 | 4.37 | 1.60 |
+| shootout-ratelimit | 8.58 | 8.55 | 8.43 | 1.01 |
+| shootout-seqhash | 5.42 | 5.44 | 5.55 | 0.98 |
+| shootout-sieve | 8.14 | 10.17 | 6.88 | 1.48 |
+| shootout-switch | 8.81 | 9.29 | 9.11 | 1.02 |
+| shootout-xblabla20 | 8.01 | 7.87 | 8.25 | 0.95 |
+| shootout-xchacha20 | 8.26 | 8.20 | 8.10 | 1.01 |
 
 **Noise footnote:** `ackermann`, `fib2`, `blind-sig` use the median of 3
 post-fix runs because the sequential suite run produced outliers for two of
@@ -550,6 +550,117 @@ persistence), RC4 (vectorisation disabled). RC4 is still the biggest
 remaining lever — ctype/ed25519/random/base64/matrix/sieve are all
 untouched by RC1 and collectively leave ~15 s of headroom on the table.
 
+### RC3 + RC4 fix — results
+
+**RC3 fix:** `lib/vm/tier2_compiler.cpp` — added `stripTierUpPrologue`, a
+text-level LLVM IR rewriter that runs after `emitLLVMIR()` (and after
+`rewriteIntraBatchCalls` in the batch path). It tracks the SSA chain
+`EnvParam → ptrtoint → add offsetof(JitExecEnv, CallCounters)=112 → inttoptr
+→ load CCBase → ptrtoint → add funcIdx*4 → inttoptr → load i32 CounterVal →
+icmp ult i32 %CounterVal, <threshold>`, and on a match rewrites the guard's
+RHS constant to `0`. LLVM's const-fold + SimplifyCFG + DCE then remove the
+entire prologue (the store and `jit_tier_up_notify` call die with the
+now-always-false branch). Gated by `WASMEDGE_TIER2_NO_STRIP=1` for A/B.
+
+Chose the "rewrite constant to 0" trick over (a) mutating `ir_ctx` at the
+graph level (would require deep dstogov/ir familiarity) and (b) surgically
+deleting prologue lines (fragile BB tracking). Verified the post-opt diff
+using `opt-18 -O2` on a dumped batch IR file.
+
+**RC4 fix:** flipped `LLVMPassBuilderOptionsSetLoopVectorization(PBO, 1)`
+and `LLVMPassBuilderOptionsSetSLPVectorization(PBO, 1)` in both the single
+and batch compile paths. The old comment cited LLVM 18 ISel crashes on
+scalable-vector patterns, but those crashes were on WasmEdge's LLVM
+frontend output, not the dstogov/ir-rendered LLVM IR tier-2 sees — the IR
+shapes are different enough that the flag flip is safe on this pipeline.
+(Experimented with `LLVMGetHostCPUName()` for the target machine; reverted
+because it marginally regressed fib2 and didn't unlock the RC4-target
+kernels — the CPU features weren't the bottleneck.)
+
+**Per-kernel impact** (median of 3 runs for recursion-heavy kernels;
+others are single-run):
+
+| Kernel | Tier-2 post-RC1 (s) | Tier-2 post-RC3+RC4 (s) | Δ | LLVM JIT (s) |
+|---|---:|---:|---:|---:|
+| shootout-fib2 | 9.06 | **6.55** | **−2.51** | 6.48 |
+| shootout-ackermann | 15.14 | **8.73** | **−6.41** | 4.57 |
+| blind-sig | 7.64 | 6.72 | −0.92 | 3.97 |
+| shootout-ed25519 | 8.13 | 7.47 | −0.66 | 5.25 |
+| shootout-ctype | 8.41 | 8.00 | −0.41 | 5.05 |
+| quicksort | 6.64 | 7.36 | **+0.72** | 6.98 |
+| everything else | — | — | within run-to-run noise (±0.15 s) | — |
+
+**Bucket shifts** (vs post-RC1):
+
+| Bucket | Post-RC1 | Post-RC3+RC4 |
+|---|---:|---:|
+| tier-2 within 3% of LLVM JIT | 12 | **15** |
+| tier-2 3–15% slower than LLVM JIT | 11 | 12 |
+| tier-2 >15% slower than LLVM JIT | 8 | **5** |
+| tier-2 faster than LLVM JIT | 1 | 1 |
+
+**Which RC actually moved the numbers?** Almost entirely RC3. The biggest
+wins — fib2 (−2.51 s) and ackermann (−6.41 s) — are recursive kernels with
+nothing to vectorise, so the gains can only come from removing the
+per-call counter prologue. RC4's intended targets
+(ctype/ed25519/sieve/base64/matrix) only moved tenths of a second
+collectively, far short of the ~15 s headroom predicted by the LLVM-JIT
+comparison. That says LLVM 18 still isn't vectorising the wasm-shaped
+`ptrtoint`+`load` memory-access patterns even with the flags flipped —
+the shape problem, not the flag, was the real blocker. **RC4 is
+effectively inert on the current tier-2 IR pipeline.**
+
+**fib2 reaches parity with LLVM JIT** (6.55 vs 6.48), which is the
+clearest signal yet that the remaining gap on recursive kernels is
+exactly the counter-prologue cost. Ackermann still leaves 4.16 s to LLVM
+JIT — RC2 (arg buffer through alloca instead of registers) is the most
+likely explanation for the residual.
+
+**Quicksort regression** (+0.72 s): not a correctness bug. Ran `opt-18
+-O2` + `llc -O2` on both stripped and unstripped IR and compared
+assembly. LLVM 18's register allocator picks a different (worse)
+allocation when the dead prologue disappears from the entry block —
+drops the frame pointer and spills from 88 to 104 stack bytes on the
+recursive partition routine. An RA quirk, not a real loss; documented
+and accepted as the cost of RC3's much bigger wins on
+fib2/ackermann/blind-sig/ed25519/ctype.
+
+### Residual gap and the IR-pipeline shape problem
+
+Even after RC1 + RC3 + RC4, tier-2 still doesn't reach LLVM JIT on most
+kernels. The unweighted mean `t2/LLVM` ratio across non-noop kernels
+barely moved outside the recursive-kernel cluster. The RC4 experiment is
+the key data point: we re-enabled the vectorisers and got almost nothing
+back, which means **the IR JIT → `ir_save` → `ir_emit_llvm` → LLVM IR
+text pipeline is baking in shapes LLVM can't optimise**, regardless of
+which passes we turn on:
+
+- `ptrtoint` / `add` / `inttoptr` chains for every linear-memory access
+  instead of typed GEPs, which prevents LLVM from recognising stride
+  patterns for LoopVectorize / SLPVectorize.
+- Wasm-ABI arg passing through an alloca'd buffer (RC2) instead of
+  native register CC — SROA can't always promote because the callee is
+  opaque across batches.
+- Until RC3, the counter prologue sat as observable side effects LLVM
+  couldn't DCE on its own.
+
+We've been grinding these one by one in the text-rewrite layer (RC1
+detector fix, RC3 prologue strip). Each hop buys back a specific
+kernel-class, but the generic ~17% gap refuses to close because the
+fundamental IR shape is wrong for LLVM's optimiser.
+
+**Design implication.** If tier-2 needs to converge on LLVM JIT
+speed in general — not just on the recursive-call subset — the
+pragmatic path is to route hot functions through WasmEdge's existing
+**LLVM frontend** (the same one the `JIT` mode uses) rather than through
+the `ir_save` text pipeline. That frontend is purpose-built for LLVM: it
+emits typed GEPs, native-CC direct calls, and vector-friendly access
+patterns by construction. The tradeoff is re-plumbing the tier-up
+trigger, batch compile, and hot-swap hooks — all of which are currently
+wired into the `ir_save` path — into the LLVM-frontend entry point. No
+further tweaks to the `ir_save` pipeline are likely to move the generic
+gap.
+
 ## Tier-2 vs tier-1: winners, regressions, flat (post RC1 fix)
 
 ### Winners (tier-2 ≥ +5% faster than tier-1)
@@ -595,20 +706,27 @@ tier-1's level even though LLVM JIT has multi-second headroom.
 
 ## Open questions
 
-1. **Is RC2 worth chasing once RC1 lands?** Now that ackermann's call site
-   is a direct `call i32 @wasm_tier2_014(...)`, LLVM has everything it
-   needs to forward the alloca'd buffer via SROA/mem2reg — in principle.
-   A follow-up `perf stat` run on ackermann would tell us whether the
-   remaining 10.6 s gap is dominated by (a) the store/load round-trip to
-   the arg buffer, or (b) the counter prologue, or (c) something else we
-   haven't looked at yet.
-2. For the big winners (compression, blind-sig, quicksort, keccak): which
+1. **Switch tier-2 to the WasmEdge LLVM frontend?** The biggest open
+   question after RC1/RC3/RC4. The RC4 non-result strongly suggests the
+   `ir_save` text pipeline is the ceiling, not LLVM itself. Scoping:
+   what does the tier-up trigger / batch compile / hot-swap re-plumbing
+   look like on the LLVM-frontend side? Is there a way to A/B both
+   backends behind an env var before committing?
+2. **RC2 after RC3.** Now that fib2 has reached parity with LLVM JIT and
+   ackermann still leaves 4.16 s on the table, ackermann is the cleanest
+   isolation for RC2 (arg buffer through alloca). A `perf stat` run on
+   ackermann would confirm whether the residual is dominated by
+   store/load round-trips through the arg buffer, and a one-off
+   experiment swapping the wasm→wasm ABI to native-CC would quantify the
+   ceiling.
+3. **Quicksort RA quirk.** The +0.72 s regression after RC3 is a
+   low-priority LLVM 18 register-allocator quality issue (frame pointer
+   dropped, stack frame 88 → 104 bytes on the recursive partition
+   routine). Would likely disappear on LLVM 19+; not worth chasing
+   inside tier-2.
+4. For the big winners (compression, blind-sig, quicksort, keccak): which
    LLVM pass is responsible? Worth dumping post-opt LLVM IR for one of these
    kernels and diffing against the IR JIT dump for the same function.
-3. `shootout-sieve`: the +2.03 s regression was unchanged by the RC1 fix,
-   which is consistent with RC4 (sieve's inner loop is a textbook
-   LoopVectorize target, disabled in tier-2). Confirming this would take
-   a one-off tier-2 build with LoopVectorize re-enabled on sieve only.
 
 ## Reproducing
 

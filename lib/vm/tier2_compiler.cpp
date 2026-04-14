@@ -5,6 +5,7 @@
 
 #if defined(WASMEDGE_BUILD_IR_JIT) && defined(WASMEDGE_USE_LLVM)
 
+#include "vm/ir_jit_engine.h"
 #include "vm/jit_symbol_registry.h"
 #include <spdlog/spdlog.h>
 
@@ -32,6 +33,8 @@ extern "C" {
 #include <vector>
 
 namespace WasmEdge::VM {
+
+static void stripTierUpPrologue(std::string &IR);
 
 struct Tier2Compiler::Impl {
   LLVMTargetMachineRef TM = nullptr;
@@ -308,6 +311,12 @@ Expect<Tier2CompileResult> Tier2Compiler::compile(const std::string &IRTextIn,
     return Unexpect(ErrCode::Value::RuntimeError);
   }
 
+  // RC3: strip the tier-up counter prologue before LLVM parses the text.
+  // Gated so the A/B experiments stay easy: set WASMEDGE_TIER2_NO_STRIP=1
+  // to measure tier-2 with the prologue still present.
+  if (!std::getenv("WASMEDGE_TIER2_NO_STRIP"))
+    stripTierUpPrologue(IRText);
+
   if (std::getenv("WASMEDGE_TIER2_DUMP_IR")) {
     // Also dump the raw serialized IR text for debugging.
     std::string RawPath = "/tmp/tier2_" + FuncName + ".ir";
@@ -380,11 +389,17 @@ Expect<Tier2CompileResult> Tier2Compiler::compile(const std::string &IRTextIn,
                   OptLevel > 3 ? 3u : OptLevel);
 
     LLVMPassBuilderOptionsRef PBO = LLVMCreatePassBuilderOptions();
-    // Disable auto-vectorization: wasm JIT functions are typically small and
-    // don't benefit from it. Also avoids LLVM 18 ISel bugs with scalable
-    // vector types on x86-64 (report_fatal_error in EVT::getSizeInBits).
-    LLVMPassBuilderOptionsSetLoopVectorization(PBO, 0);
-    LLVMPassBuilderOptionsSetSLPVectorization(PBO, 0);
+    // RC4: Re-enable loop and SLP vectorization. They were disabled earlier as
+    // a workaround for LLVM 18 ISel crashes on scalable-vector patterns, but
+    // the affected inputs came from the tier-1 IR JIT path that went through
+    // LLVM JIT before tier-2 existed. Tier-2's input is the dstogov/ir graph
+    // rendered back to plain LLVM IR — no scalable vectors appear in it — so
+    // the workaround was over-broad and was costing us the whole LLVM-JIT
+    // advantage on loop-vectorisable kernels (ctype, ed25519, random, sieve,
+    // base64, matrix). If a kernel starts crashing in ISel after this flip,
+    // narrow the fix to a per-pass knob rather than re-disabling wholesale.
+    LLVMPassBuilderOptionsSetLoopVectorization(PBO, 1);
+    LLVMPassBuilderOptionsSetSLPVectorization(PBO, 1);
     if (auto Err = LLVMRunPasses(Mod, PassStr, P->TM, PBO)) {
       auto Msg = LLVMGetErrorMessage(Err);
       spdlog::warn("tier2: LLVMRunPasses warning for {}: {}", FuncName, Msg);
@@ -487,6 +502,247 @@ std::vector<uint32_t> Tier2Compiler::getCallees(const std::string &IRText,
   ir_free(Ctx);
   ::operator delete(Ctx);
   return Result;
+}
+
+// ---------------------------------------------------------------------------
+// RC3: Neutralise the tier-up counter prologue in tier-2 function bodies.
+//
+// Tier-1 emits, at the top of every function when tier-up is enabled, a
+// prologue that loads the per-function call counter, compares against
+// TierUpThreshold, and — while still below — increments it and optionally
+// calls jit_tier_up_notify. That graph is serialised into the ir_ctx text
+// and reloaded verbatim when tier-2 compiles the same function. But by the
+// time tier-2 runs, the counter is already saturated (tier-up has fired),
+// so the prologue is pure overhead on every call: LLVM cannot DCE the
+// store-back or the external call on its own.
+//
+// We neutralise it by finding the guard icmp and forcing its RHS constant
+// to 0. `icmp ult i32 %v, 0` folds to `i1 false`, which makes the
+// increment/store/notify branch unreachable; LLVM's SimplifyCFG + DCE then
+// remove the whole prologue — counter load, ptrtoint/add/inttoptr chain,
+// stores, and the call — without any further hand-holding.
+//
+// Matching the prologue uniquely in the emitted LLVM IR text:
+//   %A = ptrtoint ptr %<env-param> to i64
+//   %B = add i64 %A, <offsetof(JitExecEnv, CallCounters)>
+//   %C = inttoptr i64 %B to ptr
+//   %D = load ptr, ptr %C                ; CallCountersPtr
+//   %E = ptrtoint ptr %D to i64
+//   %F = add i64 %E, <funcIdx*4>
+//   %G = inttoptr i64 %F to ptr
+//   %H = load i32, ptr %G                ; counter value
+//   %I = icmp ult i32 %H, <TierUpThreshold>   ; <-- rewrite RHS to 0
+//
+// Tracking the chain from `%<env-param>` forward rules out collisions with
+// user-level `icmp ult i32` comparisons later in the function.
+// ---------------------------------------------------------------------------
+static void stripTierUpPrologue(std::string &IR) {
+  const uint64_t CallCountersOffset =
+      static_cast<uint64_t>(offsetof(JitExecEnv, CallCounters));
+
+  auto Trim = [](std::string_view S) -> std::string {
+    size_t Start = 0, End = S.size();
+    while (Start < End && (S[Start] == ' ' || S[Start] == '\t'))
+      ++Start;
+    while (End > Start && (S[End - 1] == ' ' || S[End - 1] == '\t'))
+      --End;
+    return std::string(S.substr(Start, End - Start));
+  };
+  auto GetDest = [&Trim](const std::string &Line) -> std::string {
+    auto EqPos = Line.find('=');
+    if (EqPos == std::string::npos)
+      return {};
+    return Trim(std::string_view(Line).substr(0, EqPos));
+  };
+  auto IsDigits = [](std::string_view S) -> bool {
+    if (S.empty())
+      return false;
+    for (char C : S)
+      if (C < '0' || C > '9')
+        return false;
+    return true;
+  };
+
+  // Per-function state machine: each SSA name is set in order and the chain
+  // is cross-checked end-to-end before we accept the final icmp as the
+  // counter guard.
+  std::string EnvParam;       // e.g. "%d2"
+  std::string EnvInt;         // ptrtoint ptr %envParam to i64
+  std::string CCIntermedInt;  // add i64 %envInt, 112
+  std::string CCPtr;          // inttoptr i64 %CCIntermedInt to ptr
+  std::string CCBase;         // load ptr, ptr %CCPtr
+  std::string CCBaseInt;      // ptrtoint ptr %CCBase to i64
+  std::string SlotInt;        // add i64 %CCBaseInt, <funcIdx*4>
+  std::string SlotPtr;        // inttoptr i64 %SlotInt to ptr
+  std::string CounterVal;     // load i32, ptr %SlotPtr
+  bool Done = false;
+
+  auto Reset = [&]() {
+    EnvParam.clear();
+    EnvInt.clear();
+    CCIntermedInt.clear();
+    CCPtr.clear();
+    CCBase.clear();
+    CCBaseInt.clear();
+    SlotInt.clear();
+    SlotPtr.clear();
+    CounterVal.clear();
+    Done = false;
+  };
+
+  std::string Result;
+  Result.reserve(IR.size());
+  uint32_t StripCount = 0;
+
+  size_t Pos = 0;
+  while (Pos < IR.size()) {
+    size_t LineEnd = IR.find('\n', Pos);
+    if (LineEnd == std::string::npos)
+      LineEnd = IR.size();
+    std::string Line = IR.substr(Pos, LineEnd - Pos);
+
+    if (Line.find("define ") != std::string::npos) {
+      Reset();
+      // Parse first parameter SSA name from "define TY @name(ptr %dN, ...)".
+      auto OpenParen = Line.find('(');
+      if (OpenParen != std::string::npos) {
+        size_t P = OpenParen + 1;
+        while (P < Line.size() && Line[P] != '%' && Line[P] != ')')
+          ++P;
+        if (P < Line.size() && Line[P] == '%') {
+          size_t E = P;
+          while (E < Line.size() && Line[E] != ',' && Line[E] != ')' &&
+                 Line[E] != ' ')
+            ++E;
+          EnvParam = Line.substr(P, E - P);
+        }
+      }
+    }
+
+    std::string OutLine = Line;
+
+    if (!Done && !EnvParam.empty()) {
+      const std::string Dest = GetDest(Line);
+
+      // Walk each chain step in order. Later steps only run once earlier
+      // ones have fired, so we never accidentally match an unrelated
+      // instruction elsewhere in the function.
+
+      if (EnvInt.empty()) {
+        auto P = Line.find("= ptrtoint ptr ");
+        if (P != std::string::npos && !Dest.empty()) {
+          std::string After = Line.substr(P + 15);
+          auto Sp = After.find(' ');
+          if (Sp != std::string::npos && After.substr(0, Sp) == EnvParam)
+            EnvInt = Dest;
+        }
+      } else if (CCIntermedInt.empty()) {
+        auto P = Line.find("= add i64 ");
+        if (P != std::string::npos && !Dest.empty()) {
+          std::string Rest = Line.substr(P + 10);
+          auto CP = Rest.find(", ");
+          if (CP != std::string::npos) {
+            std::string Op1 = Trim(std::string_view(Rest).substr(0, CP));
+            std::string Op2 = Trim(std::string_view(Rest).substr(CP + 2));
+            if (Op1 == EnvInt && IsDigits(Op2) &&
+                std::stoull(Op2) == CallCountersOffset)
+              CCIntermedInt = Dest;
+          }
+        }
+      } else if (CCPtr.empty()) {
+        auto P = Line.find("= inttoptr i64 ");
+        if (P != std::string::npos && !Dest.empty()) {
+          std::string After = Line.substr(P + 15);
+          auto Sp = After.find(' ');
+          if (Sp != std::string::npos && After.substr(0, Sp) == CCIntermedInt)
+            CCPtr = Dest;
+        }
+      } else if (CCBase.empty()) {
+        auto P = Line.find("= load ptr, ptr ");
+        if (P != std::string::npos && !Dest.empty()) {
+          std::string Src = Trim(std::string_view(Line).substr(P + 16));
+          if (Src == CCPtr)
+            CCBase = Dest;
+        }
+      } else if (CCBaseInt.empty()) {
+        auto P = Line.find("= ptrtoint ptr ");
+        if (P != std::string::npos && !Dest.empty()) {
+          std::string After = Line.substr(P + 15);
+          auto Sp = After.find(' ');
+          if (Sp != std::string::npos && After.substr(0, Sp) == CCBase)
+            CCBaseInt = Dest;
+        }
+      } else if (SlotInt.empty()) {
+        auto P = Line.find("= add i64 ");
+        if (P != std::string::npos && !Dest.empty()) {
+          std::string Rest = Line.substr(P + 10);
+          auto CP = Rest.find(", ");
+          if (CP != std::string::npos) {
+            std::string Op1 = Trim(std::string_view(Rest).substr(0, CP));
+            std::string Op2 = Trim(std::string_view(Rest).substr(CP + 2));
+            // FuncIdx offset can be 0 (for funcIdx 0), so accept any digits.
+            if ((Op1 == CCBaseInt && IsDigits(Op2)) ||
+                (Op2 == CCBaseInt && IsDigits(Op1)))
+              SlotInt = Dest;
+          }
+        }
+      } else if (SlotPtr.empty()) {
+        auto P = Line.find("= inttoptr i64 ");
+        if (P != std::string::npos && !Dest.empty()) {
+          std::string After = Line.substr(P + 15);
+          auto Sp = After.find(' ');
+          if (Sp != std::string::npos && After.substr(0, Sp) == SlotInt)
+            SlotPtr = Dest;
+        }
+      } else if (CounterVal.empty()) {
+        auto P = Line.find("= load i32, ptr ");
+        if (P != std::string::npos && !Dest.empty()) {
+          std::string Src = Trim(std::string_view(Line).substr(P + 16));
+          if (Src == SlotPtr)
+            CounterVal = Dest;
+        }
+      } else {
+        // Final step: rewrite the guard icmp's RHS to 0.
+        auto P = Line.find("= icmp ult i32 ");
+        if (P != std::string::npos && !Dest.empty()) {
+          std::string Rest = Line.substr(P + 15);
+          auto CP = Rest.find(", ");
+          if (CP != std::string::npos) {
+            std::string Op1 = Trim(std::string_view(Rest).substr(0, CP));
+            if (Op1 == CounterVal) {
+              std::string Op2Raw = Rest.substr(CP + 2);
+              // Trim trailing whitespace, ignore anything after the literal.
+              size_t E2 = 0;
+              while (E2 < Op2Raw.size() && Op2Raw[E2] >= '0' &&
+                     Op2Raw[E2] <= '9')
+                ++E2;
+              if (E2 > 0) {
+                // "<prefix>= icmp ult i32 %H, " + "0" + "<suffix>"
+                OutLine = Line.substr(0, P + 15 + CP + 2) + "0" +
+                          Op2Raw.substr(E2);
+                Done = true;
+                ++StripCount;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    Result += OutLine;
+    Result += '\n';
+    Pos = LineEnd + 1;
+  }
+
+  if (!IR.empty() && IR.back() != '\n' && !Result.empty() &&
+      Result.back() == '\n')
+    Result.pop_back();
+
+  if (StripCount > 0)
+    spdlog::info("tier2: stripped tier-up prologue from {} functions",
+                 StripCount);
+
+  IR = std::move(Result);
 }
 
 // ---------------------------------------------------------------------------
@@ -938,6 +1194,10 @@ Tier2Compiler::compileBatch(std::vector<BatchEntry> &Entries,
   }
   rewriteIntraBatchCalls(IRText, OffsetToName);
 
+  // RC3: strip the tier-up counter prologue from every function in the batch.
+  if (!std::getenv("WASMEDGE_TIER2_NO_STRIP"))
+    stripTierUpPrologue(IRText);
+
   if (std::getenv("WASMEDGE_TIER2_DUMP_IR")) {
     std::string DumpPath = "/tmp/tier2_batch_" +
                            Entries[EmittedIdx[0]].FuncName + ".ll";
@@ -945,6 +1205,27 @@ Tier2Compiler::compileBatch(std::vector<BatchEntry> &Entries,
       fwrite(IRText.data(), 1, IRText.size(), F);
       fclose(F);
       spdlog::info("tier2-batch: wrote batch LLVM IR to {}", DumpPath);
+    }
+  }
+
+  // Experimental: WASMEDGE_TIER2_LOAD_IR=<dir> lets us replace the emitted
+  // batch IR with a hand-edited file from that directory, keyed by the first
+  // function's name. Used for RC2 (register-ABI) experiments.
+  if (const char *LoadDir = std::getenv("WASMEDGE_TIER2_LOAD_IR")) {
+    std::string LoadPath = std::string(LoadDir) + "/tier2_batch_" +
+                           Entries[EmittedIdx[0]].FuncName + ".ll";
+    if (FILE *F = fopen(LoadPath.c_str(), "r")) {
+      fseek(F, 0, SEEK_END);
+      long Sz = ftell(F);
+      fseek(F, 0, SEEK_SET);
+      std::string Override(static_cast<size_t>(Sz), '\0');
+      size_t Got = fread(Override.data(), 1, static_cast<size_t>(Sz), F);
+      fclose(F);
+      if (Got == static_cast<size_t>(Sz)) {
+        IRText = std::move(Override);
+        spdlog::info("tier2-batch: LOADED override IR for {} from {}",
+                     Entries[EmittedIdx[0]].FuncName, LoadPath);
+      }
     }
   }
 
@@ -1000,8 +1281,8 @@ Tier2Compiler::compileBatch(std::vector<BatchEntry> &Entries,
                   OptLevel > 3 ? 3u : OptLevel);
 
     LLVMPassBuilderOptionsRef PBO = LLVMCreatePassBuilderOptions();
-    LLVMPassBuilderOptionsSetLoopVectorization(PBO, 0);
-    LLVMPassBuilderOptionsSetSLPVectorization(PBO, 0);
+    LLVMPassBuilderOptionsSetLoopVectorization(PBO, 1);
+    LLVMPassBuilderOptionsSetSLPVectorization(PBO, 1);
     if (auto Err = LLVMRunPasses(Mod, PassStr, P->TM, PBO)) {
       auto Msg = LLVMGetErrorMessage(Err);
       spdlog::warn("tier2-batch: LLVMRunPasses warning: {}", Msg);
