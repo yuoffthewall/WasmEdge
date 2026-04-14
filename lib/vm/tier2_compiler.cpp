@@ -5,42 +5,581 @@
 
 #if defined(WASMEDGE_BUILD_IR_JIT) && defined(WASMEDGE_USE_LLVM)
 
-#include "vm/ir_jit_engine.h"
-#include "vm/jit_symbol_registry.h"
+#include "ast/module.h"
+#include "common/configure.h"
+#include "executor/executor.h"
+#include "llvm/compiler.h"
+#include "llvm/data.h"
+
 #include <spdlog/spdlog.h>
 
-// dstogov/ir headers (for loading serialized IR text)
-extern "C" {
-#include "ir.h"
-}
-
-// LLVM C API headers
-#include <llvm-c/Analysis.h>
 #include <llvm-c/Core.h>
-#include <llvm-c/IRReader.h>
+#include <llvm-c/Error.h>
 #include <llvm-c/LLJIT.h>
 #include <llvm-c/Orc.h>
-#include <llvm-c/OrcEE.h>
 #include <llvm-c/Target.h>
 #include <llvm-c/TargetMachine.h>
 #include <llvm-c/Transforms/PassBuilder.h>
 
-#include <algorithm>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <string>
-#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
+// Tier-2 helper defined in ir_jit_engine.cpp. Returns the thread-local
+// JitExecEnv* the running invoke() set up; used by t1_thunks that bridge
+// tier-2 SysV calls back into tier-1's (JitExecEnv*, uint64_t*) ABI.
+extern "C" void *wasmedge_tier2_get_jit_env(void);
+
+// Debug helper gated by WASMEDGE_TIER2_TRACE_FUNC env var. Prints
+// (func_idx, arg0..arg3) on each fwd_thunk entry. Bound via ORC absolute
+// symbol and called from inside emitFwdThunk when the env var is set.
+namespace {
+int g_tier2_trace_func = -1;
+}
+extern "C" void wasmedge_tier2_trace_thunk(uint32_t FuncIdx, uint64_t A0,
+                                            uint64_t A1, uint64_t A2,
+                                            uint64_t A3) {
+  if (static_cast<int>(FuncIdx) != g_tier2_trace_func) {
+    return;
+  }
+  std::fprintf(stderr,
+               "[tier2-trace] f%u(a0=0x%lx a1=0x%lx a2=0x%lx a3=0x%lx)\n",
+               FuncIdx, A0, A1, A2, A3);
+
+  // Also dump the memory bytes at a0 for len = min(a1, 32). This is f30
+  // specific (__fwritex buf/len).
+  void *Ctx = WasmEdge::Executor::Executor::getThreadLocalExecutionContextPtr();
+  if (!Ctx) {
+    std::fprintf(stderr, "[tier2-trace-mem] ctx=null\n");
+    return;
+  }
+  // ExecutionContext first field is Memories (see executor.h).
+  // STABLE:    uint8_t *const * Memories
+  // NON-STABLE: uint8_t **const * Memories
+  void *MemField = *static_cast<void **>(Ctx);
+  if (!MemField) {
+    std::fprintf(stderr, "[tier2-trace-mem] MemField=null\n");
+    return;
+  }
+  uint8_t *Base = nullptr;
+#if defined(WASMEDGE_ALLOCATOR_IS_STABLE) && WASMEDGE_ALLOCATOR_IS_STABLE
+  Base = static_cast<uint8_t *const *>(MemField)[0];
+#else
+  void *Slot = static_cast<void *const *>(MemField)[0];
+  if (Slot) Base = *static_cast<uint8_t **>(Slot);
+#endif
+  std::fprintf(stderr, "[tier2-trace-mem] MemField=%p Base=%p\n", MemField,
+               (void *)Base);
+  if (!Base) return;
+  uint32_t Buf = static_cast<uint32_t>(A0);
+  uint32_t Len = static_cast<uint32_t>(A1);
+  if (Len > 32) Len = 32;
+  char Pr[64] = {0};
+  char Hx[100] = {0};
+  for (uint32_t i = 0; i < Len && i < 32; ++i) {
+    unsigned char c = Base[Buf + i];
+    Pr[i] = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
+    std::snprintf(Hx + i * 3, 4, "%02x ", c);
+  }
+  std::fprintf(stderr, "[tier2-trace-mem] f%u mem[0x%x..+%u]='%s' hex=%s\n",
+               FuncIdx, Buf, Len, Pr, Hx);
+}
+
 namespace WasmEdge::VM {
 
-static void stripTierUpPrologue(std::string &IR);
+namespace {
+
+/// Build a synthetic mini AST::Module from \p Src that only keeps real
+/// bodies for functions in \p BatchSet. Every other defined function
+/// body is replaced with `unreachable; end`, which is stack-polymorphic
+/// and trivially type-checks against any signature. The funcIdx space
+/// is preserved so `call <funcIdx>` instructions in batch bodies still
+/// resolve correctly against the original module layout. Non-batch
+/// symbols are rewritten as cross-tier thunks by a later pass.
+/// Return the AST::FunctionType for module-wide funcIdx \p FuncIdx.
+/// Caller must have verified it is in-bounds and promotable.
+const AST::FunctionType &getFuncType(const AST::Module &Mod, uint32_t FuncIdx,
+                                     uint32_t ImportFuncNum) {
+  const uint32_t DefinedIdx = FuncIdx - ImportFuncNum;
+  const auto &FuncSec = Mod.getFunctionSection().getContent();
+  const uint32_t TypeIdx = FuncSec[DefinedIdx];
+  const auto &TypeSec = Mod.getTypeSection().getContent();
+  return TypeSec[TypeIdx].getCompositeType().getFuncType();
+}
+
+/// Build a synthetic mini AST::Module from \p Src that only keeps real
+/// bodies for functions in \p BatchSet. Every other defined function
+/// body is replaced with a minimal "push default returns; end" body,
+/// which type-checks against the function's own signature. We avoid the
+/// obvious `unreachable; end` stub because the LLVM frontend marks the
+/// resulting function `noreturn`, and any batch body calling it would
+/// be compiled under the assumption the call never returns — collapsing
+/// subsequent code paths into unreachable. We post-process the stub
+/// bodies of *referenced* non-batch functions in the LLVM module to
+/// become tier-2 → tier-1 thunks (see emitT1ThunkInPlace).
+AST::Module synthesizeMiniModule(const AST::Module &Src,
+                                 const std::unordered_set<uint32_t> &BatchSet,
+                                 uint32_t ImportFuncNum) {
+  AST::Module Mini(Src);
+  auto &CodeSec = Mini.getCodeSection().getContent();
+  const auto &FuncSec = Mini.getFunctionSection().getContent();
+  const auto &TypeSec = Mini.getTypeSection().getContent();
+  for (size_t I = 0; I < CodeSec.size(); ++I) {
+    const uint32_t FuncIdx = ImportFuncNum + static_cast<uint32_t>(I);
+    if (BatchSet.count(FuncIdx)) {
+      continue;
+    }
+    auto &Seg = CodeSec[I];
+    Seg.getLocals().clear();
+    auto &Instrs = Seg.getExpr().getInstrs();
+    Instrs.clear();
+    const uint32_t TypeIdx = FuncSec[I];
+    const auto &FT = TypeSec[TypeIdx].getCompositeType().getFuncType();
+    for (const auto &RT : FT.getReturnTypes()) {
+      switch (RT.getCode()) {
+      case TypeCode::I32: {
+        AST::Instruction Inst(OpCode::I32__const);
+        Inst.setNum(static_cast<uint32_t>(0));
+        Instrs.push_back(Inst);
+        break;
+      }
+      case TypeCode::I64: {
+        AST::Instruction Inst(OpCode::I64__const);
+        Inst.setNum(static_cast<uint64_t>(0));
+        Instrs.push_back(Inst);
+        break;
+      }
+      case TypeCode::F32: {
+        AST::Instruction Inst(OpCode::F32__const);
+        Inst.setNum(0.0f);
+        Instrs.push_back(Inst);
+        break;
+      }
+      case TypeCode::F64: {
+        AST::Instruction Inst(OpCode::F64__const);
+        Inst.setNum(0.0);
+        Instrs.push_back(Inst);
+        break;
+      }
+      default:
+        // v128/ref — only reachable through non-batch functions that
+        // are never called from the batch (because batch filter excludes
+        // non-scalar sigs). Fall back to a trapping stub; the function
+        // still has a body so validation passes, and LLVM's noreturn
+        // inference is harmless for unreferenced functions.
+        Instrs.emplace_back(OpCode::Unreachable);
+        break;
+      }
+    }
+    Instrs.emplace_back(OpCode::End);
+  }
+  // The batch bodies came from an already-validated parent module, and
+  // the stubbed non-batch bodies validate trivially via stack-polymorphic
+  // unreachable. Skip the expensive re-validation — Compiler::compile()
+  // only checks the flag.
+  Mini.setIsValidated(true);
+  return Mini;
+}
+
+/// Tier-1's `IR_FASTCALL_FUNC` direct-call convention (x86_64/aarch64 Linux
+/// → sysv default) expects a specific return type per wasm ret:
+///   void/i32/i64 → i64       (i32 is truncated by the caller)
+///   f32          → float
+///   f64          → double
+LLVMTypeRef tier1ThunkRetType(LLVMContextRef Ctx,
+                              Span<const ValType> Rets) noexcept {
+  if (Rets.empty()) {
+    return LLVMInt64TypeInContext(Ctx);
+  }
+  switch (Rets.front().getCode()) {
+  case TypeCode::F32:
+    return LLVMFloatTypeInContext(Ctx);
+  case TypeCode::F64:
+    return LLVMDoubleTypeInContext(Ctx);
+  default:
+    return LLVMInt64TypeInContext(Ctx);
+  }
+}
+
+/// Append `f<FuncIdx>_fwd_thunk` to the LLVM module produced by the
+/// WasmEdge LLVM frontend. The thunk is the live-swap entry point we
+/// install into tier-1's FuncTable. It:
+///   1. calls `wasmedge_tier2_get_exec_ctx` to obtain the thread-local
+///      ExecCtxPtrTy value the frontend expects,
+///   2. unmarshals each wasm param from the tier-1 `uint64_t *args`
+///      scratch area into the correct scalar LLVM type,
+///   3. tail-calls `f<FuncIdx>(exec_ctx, params...)` with the frontend's
+///      default SysV calling convention,
+///   4. remarshals the return into tier-1's expected wire type.
+void emitFwdThunk(LLVMModuleRef LLMod, LLVMContextRef Ctx, uint32_t FuncIdx,
+                  const AST::FunctionType &FT) {
+  const auto &Params = FT.getParamTypes();
+  const auto &Rets = FT.getReturnTypes();
+
+  LLVMTypeRef PtrTy = LLVMPointerTypeInContext(Ctx, 0);
+  LLVMTypeRef Int64Ty = LLVMInt64TypeInContext(Ctx);
+  LLVMTypeRef Int32Ty = LLVMInt32TypeInContext(Ctx);
+
+  // Tier-1 signature: ret (void*, uint64_t*).
+  LLVMTypeRef ThunkRetTy = tier1ThunkRetType(Ctx, Rets);
+  LLVMTypeRef ThunkParamTys[2] = {PtrTy, PtrTy};
+  LLVMTypeRef ThunkFTy =
+      LLVMFunctionType(ThunkRetTy, ThunkParamTys, 2, /*IsVarArg=*/0);
+
+  const std::string ThunkName =
+      "f" + std::to_string(FuncIdx) + "_fwd_thunk";
+  LLVMValueRef Thunk =
+      LLVMAddFunction(LLMod, ThunkName.c_str(), ThunkFTy);
+  LLVMSetLinkage(Thunk, LLVMExternalLinkage);
+
+  // Declare the helper that returns &Executor::ExecutionContext. We bind
+  // this to its real address via ORC absolute symbols at JIT time.
+  LLVMValueRef GetCtx = LLVMGetNamedFunction(LLMod, "wasmedge_tier2_get_exec_ctx");
+  if (!GetCtx) {
+    LLVMTypeRef GetCtxFTy = LLVMFunctionType(PtrTy, nullptr, 0, 0);
+    GetCtx = LLVMAddFunction(LLMod, "wasmedge_tier2_get_exec_ctx", GetCtxFTy);
+    LLVMSetLinkage(GetCtx, LLVMExternalLinkage);
+  }
+  LLVMTypeRef GetCtxFTy = LLVMFunctionType(PtrTy, nullptr, 0, 0);
+
+  // Look up the target function `f<FuncIdx>` already in the module.
+  const std::string CalleeName = "f" + std::to_string(FuncIdx);
+  LLVMValueRef Callee = LLVMGetNamedFunction(LLMod, CalleeName.c_str());
+  if (!Callee) {
+    spdlog::error("tier2: fwd_thunk: callee {} not found in module",
+                  CalleeName);
+    return;
+  }
+  LLVMTypeRef CalleeFTy = LLVMGlobalGetValueType(Callee);
+
+  LLVMBasicBlockRef Entry = LLVMAppendBasicBlockInContext(Ctx, Thunk, "entry");
+  LLVMBuilderRef B = LLVMCreateBuilderInContext(Ctx);
+  LLVMPositionBuilderAtEnd(B, Entry);
+
+  // %exec_ctx = call ptr @wasmedge_tier2_get_exec_ctx()
+  LLVMValueRef ExecCtx =
+      LLVMBuildCall2(B, GetCtxFTy, GetCtx, nullptr, 0, "exec_ctx");
+
+  // Unmarshal params from args[] scratch buffer.
+  LLVMValueRef Args = LLVMGetParam(Thunk, 1);
+
+  // Optional debug trace (env var WASMEDGE_TIER2_TRACE_FUNC).
+  if (g_tier2_trace_func >= 0) {
+    LLVMTypeRef TraceTys[5] = {LLVMInt32TypeInContext(Ctx), Int64Ty, Int64Ty,
+                                Int64Ty, Int64Ty};
+    LLVMTypeRef TraceFTy =
+        LLVMFunctionType(LLVMVoidTypeInContext(Ctx), TraceTys, 5, 0);
+    LLVMValueRef TraceFn =
+        LLVMGetNamedFunction(LLMod, "wasmedge_tier2_trace_thunk");
+    if (!TraceFn) {
+      TraceFn =
+          LLVMAddFunction(LLMod, "wasmedge_tier2_trace_thunk", TraceFTy);
+      LLVMSetLinkage(TraceFn, LLVMExternalLinkage);
+    }
+    auto LoadSlot = [&](unsigned I) -> LLVMValueRef {
+      LLVMValueRef Idx = LLVMConstInt(Int64Ty, I, 0);
+      LLVMValueRef S =
+          LLVMBuildInBoundsGEP2(B, Int64Ty, Args, &Idx, 1, "traceslot");
+      return LLVMBuildLoad2(B, Int64Ty, S, "trace_raw");
+    };
+    LLVMValueRef Zero64 = LLVMConstInt(Int64Ty, 0, 0);
+    LLVMValueRef TArgs[5] = {
+        LLVMConstInt(LLVMInt32TypeInContext(Ctx), FuncIdx, 0),
+        Params.size() > 0 ? LoadSlot(0) : Zero64,
+        Params.size() > 1 ? LoadSlot(1) : Zero64,
+        Params.size() > 2 ? LoadSlot(2) : Zero64,
+        Params.size() > 3 ? LoadSlot(3) : Zero64};
+    LLVMBuildCall2(B, TraceFTy, TraceFn, TArgs, 5, "");
+  }
+  std::vector<LLVMValueRef> CallArgs;
+  CallArgs.reserve(Params.size() + 1);
+  CallArgs.push_back(ExecCtx);
+  for (size_t I = 0; I < Params.size(); ++I) {
+    LLVMValueRef Idx = LLVMConstInt(Int64Ty, static_cast<uint64_t>(I), 0);
+    LLVMValueRef Slot =
+        LLVMBuildInBoundsGEP2(B, Int64Ty, Args, &Idx, 1, "slot");
+    LLVMValueRef Raw = LLVMBuildLoad2(B, Int64Ty, Slot, "raw");
+    LLVMValueRef Casted = nullptr;
+    switch (Params[I].getCode()) {
+    case TypeCode::I32:
+      Casted = LLVMBuildTrunc(B, Raw, Int32Ty, "p");
+      break;
+    case TypeCode::I64:
+      Casted = Raw;
+      break;
+    case TypeCode::F32: {
+      LLVMValueRef Trunc = LLVMBuildTrunc(B, Raw, Int32Ty, "pf32bits");
+      Casted = LLVMBuildBitCast(B, Trunc, LLVMFloatTypeInContext(Ctx), "p");
+      break;
+    }
+    case TypeCode::F64:
+      Casted = LLVMBuildBitCast(B, Raw, LLVMDoubleTypeInContext(Ctx), "p");
+      break;
+    default:
+      spdlog::error("tier2: fwd_thunk: non-scalar param in f{} — bug in "
+                    "promotion filter",
+                    FuncIdx);
+      LLVMDisposeBuilder(B);
+      return;
+    }
+    CallArgs.push_back(Casted);
+  }
+
+  LLVMValueRef CallRes = LLVMBuildCall2(B, CalleeFTy, Callee, CallArgs.data(),
+                                        static_cast<unsigned>(CallArgs.size()),
+                                        Rets.empty() ? "" : "retv");
+
+  // Remarshal return to tier-1 wire format.
+  LLVMValueRef ThunkRet = nullptr;
+  if (Rets.empty()) {
+    ThunkRet = LLVMConstInt(Int64Ty, 0, 0);
+  } else {
+    switch (Rets.front().getCode()) {
+    case TypeCode::I32:
+      ThunkRet = LLVMBuildZExt(B, CallRes, Int64Ty, "retz");
+      break;
+    case TypeCode::I64:
+      ThunkRet = CallRes;
+      break;
+    case TypeCode::F32:
+    case TypeCode::F64:
+      ThunkRet = CallRes;
+      break;
+    default:
+      spdlog::error("tier2: fwd_thunk: non-scalar ret in f{} — bug in "
+                    "promotion filter",
+                    FuncIdx);
+      LLVMDisposeBuilder(B);
+      return;
+    }
+  }
+  LLVMBuildRet(B, ThunkRet);
+  LLVMDisposeBuilder(B);
+}
+
+/// Rewrite the stub body of the non-batch function `f<FuncIdx>` already
+/// present in \p LLMod (compiled from synthesizeMiniModule's default-value
+/// stub) into a tier-2 → tier-1 dispatch thunk. The function's
+/// signature stays the SysV `(ExecCtxPtrTy, params...) -> ret` that
+/// batch callers reference; we replace its body with:
+///   1. allocate uint64_t args[N] on stack
+///   2. marshal each param into args[i]
+///   3. call `wasmedge_tier2_get_jit_env()` to retrieve the current
+///      JitExecEnv* (set by IRJitEngine::invoke)
+///   4. load FuncTable[FuncIdx] from env->FuncTable
+///   5. invoke target(env, args) via the tier-1 calling convention
+///   6. remarshal the return into the frontend's ret type
+/// Since we edit the Function's existing Value, every call site in the
+/// already-compiled batch bodies that references `@f<FuncIdx>` gets the
+/// new body automatically (LLVM references are by Value, not by name).
+void emitT1ThunkInPlace(LLVMModuleRef LLMod, LLVMContextRef Ctx,
+                        uint32_t FuncIdx, const AST::FunctionType &FT) {
+  const std::string Name = "f" + std::to_string(FuncIdx);
+  LLVMValueRef Fn = LLVMGetNamedFunction(LLMod, Name.c_str());
+  if (!Fn) {
+    spdlog::warn("tier2: t1_thunk: target {} missing in module", Name);
+    return;
+  }
+
+  // Strip attributes that leak compile-time assumptions from the old
+  // default-return stub (which may have been marked cold/readnone/etc.
+  // during optimization) that would confuse callers now that this body
+  // has side effects and dispatches to external code.
+  auto Strip = [&](const char *AttrName) {
+    unsigned K = LLVMGetEnumAttributeKindForName(
+        AttrName, static_cast<unsigned>(std::strlen(AttrName)));
+    if (K != 0) {
+      LLVMRemoveEnumAttributeAtIndex(Fn, LLVMAttributeFunctionIndex, K);
+    }
+  };
+  for (const char *A :
+       {"noreturn", "readnone", "readonly", "memory", "willreturn",
+        "mustprogress", "nofree", "norecurse", "cold", "noinline",
+        "nounwind"}) {
+    Strip(A);
+  }
+
+  // Drop existing basic blocks (the compiled default-return stub body).
+  while (LLVMBasicBlockRef BB = LLVMGetFirstBasicBlock(Fn)) {
+    LLVMDeleteBasicBlock(BB);
+  }
+
+  LLVMTypeRef PtrTy = LLVMPointerTypeInContext(Ctx, 0);
+  LLVMTypeRef Int64Ty = LLVMInt64TypeInContext(Ctx);
+  LLVMTypeRef Int32Ty = LLVMInt32TypeInContext(Ctx);
+  LLVMTypeRef FloatTy = LLVMFloatTypeInContext(Ctx);
+  LLVMTypeRef DoubleTy = LLVMDoubleTypeInContext(Ctx);
+
+  LLVMBasicBlockRef Entry = LLVMAppendBasicBlockInContext(Ctx, Fn, "entry");
+  LLVMBuilderRef B = LLVMCreateBuilderInContext(Ctx);
+  LLVMPositionBuilderAtEnd(B, Entry);
+
+  // Declare the env helper on demand.
+  LLVMValueRef GetEnv =
+      LLVMGetNamedFunction(LLMod, "wasmedge_tier2_get_jit_env");
+  LLVMTypeRef GetEnvFTy = LLVMFunctionType(PtrTy, nullptr, 0, 0);
+  if (!GetEnv) {
+    GetEnv =
+        LLVMAddFunction(LLMod, "wasmedge_tier2_get_jit_env", GetEnvFTy);
+    LLVMSetLinkage(GetEnv, LLVMExternalLinkage);
+  }
+
+  const auto &Params = FT.getParamTypes();
+  const auto &Rets = FT.getReturnTypes();
+
+  // Allocate args buffer on stack: [max(1, NumParams) x i64].
+  unsigned NumParams = static_cast<unsigned>(Params.size());
+  LLVMValueRef ArrLen = LLVMConstInt(Int32Ty, NumParams == 0 ? 1 : NumParams, 0);
+  LLVMValueRef ArgsArr = LLVMBuildArrayAlloca(B, Int64Ty, ArrLen, "args");
+
+  // Marshal each param (LLVM param 0 is ExecCtxPtrTy).
+  for (unsigned I = 0; I < NumParams; ++I) {
+    LLVMValueRef Param = LLVMGetParam(Fn, I + 1);
+    LLVMValueRef Raw = nullptr;
+    switch (Params[I].getCode()) {
+    case TypeCode::I32:
+      Raw = LLVMBuildZExt(B, Param, Int64Ty, "zext");
+      break;
+    case TypeCode::I64:
+      Raw = Param;
+      break;
+    case TypeCode::F32: {
+      LLVMValueRef Bits = LLVMBuildBitCast(B, Param, Int32Ty, "f32b");
+      Raw = LLVMBuildZExt(B, Bits, Int64Ty, "f32z");
+      break;
+    }
+    case TypeCode::F64:
+      Raw = LLVMBuildBitCast(B, Param, Int64Ty, "f64b");
+      break;
+    default:
+      spdlog::error("tier2: t1_thunk: non-scalar param in f{} — bug",
+                    FuncIdx);
+      LLVMBuildUnreachable(B);
+      LLVMDisposeBuilder(B);
+      return;
+    }
+    LLVMValueRef Idx = LLVMConstInt(Int64Ty, I, 0);
+    LLVMValueRef Slot =
+        LLVMBuildInBoundsGEP2(B, Int64Ty, ArgsArr, &Idx, 1, "aslot");
+    LLVMBuildStore(B, Raw, Slot);
+  }
+
+  // %env = call ptr @wasmedge_tier2_get_jit_env()
+  LLVMValueRef Env = LLVMBuildCall2(B, GetEnvFTy, GetEnv, nullptr, 0, "env");
+
+  // FuncTable lives at offset 0 of JitExecEnv (void **FuncTable).
+  LLVMValueRef FuncTablePtr =
+      LLVMBuildLoad2(B, PtrTy, Env, "func_table");
+
+  // target = FuncTable[FuncIdx]
+  LLVMValueRef IdxVal = LLVMConstInt(Int64Ty, FuncIdx, 0);
+  LLVMValueRef TgtSlot =
+      LLVMBuildInBoundsGEP2(B, PtrTy, FuncTablePtr, &IdxVal, 1, "tslot");
+  LLVMValueRef Target = LLVMBuildLoad2(B, PtrTy, TgtSlot, "target");
+
+  // Tier-1 ABI: ret func(JitExecEnv*, uint64_t*)
+  LLVMTypeRef Tier1RetTy = tier1ThunkRetType(Ctx, Rets);
+  LLVMTypeRef Tier1ParamTys[2] = {PtrTy, PtrTy};
+  LLVMTypeRef Tier1FTy =
+      LLVMFunctionType(Tier1RetTy, Tier1ParamTys, 2, /*IsVarArg=*/0);
+
+  LLVMValueRef CallArgs[2] = {Env, ArgsArr};
+  LLVMValueRef Res = LLVMBuildCall2(B, Tier1FTy, Target, CallArgs, 2,
+                                    Rets.empty() ? "" : "tr");
+
+  // Remarshal tier-1 return into the frontend's function-local ret type.
+  if (Rets.empty()) {
+    LLVMBuildRetVoid(B);
+  } else {
+    LLVMValueRef Out = nullptr;
+    switch (Rets.front().getCode()) {
+    case TypeCode::I32:
+      // Tier-1 returned i64; frontend expects i32.
+      Out = LLVMBuildTrunc(B, Res, Int32Ty, "i32r");
+      break;
+    case TypeCode::I64:
+      Out = Res;
+      break;
+    case TypeCode::F32:
+      // tier1ThunkRetType already returned FloatTy.
+      (void)FloatTy;
+      Out = Res;
+      break;
+    case TypeCode::F64:
+      (void)DoubleTy;
+      Out = Res;
+      break;
+    default:
+      spdlog::error("tier2: t1_thunk: non-scalar ret in f{} — bug",
+                    FuncIdx);
+      LLVMBuildUnreachable(B);
+      LLVMDisposeBuilder(B);
+      return;
+    }
+    LLVMBuildRet(B, Out);
+  }
+  LLVMDisposeBuilder(B);
+}
+
+/// Walk the bodies of every function in \p BatchSet and collect all direct
+/// `call` targets that are (a) defined (not imports) and (b) not already
+/// in the batch. These are the non-batch functions for which we must
+/// emit tier-2 → tier-1 bridges.
+std::vector<uint32_t>
+collectNonBatchCallees(const AST::Module &Mod,
+                       const std::unordered_set<uint32_t> &BatchSet,
+                       uint32_t ImportFuncNum) noexcept {
+  std::vector<uint32_t> Result;
+  std::unordered_set<uint32_t> Seen;
+  const auto &CodeSec = Mod.getCodeSection().getContent();
+  for (uint32_t FuncIdx : BatchSet) {
+    if (FuncIdx < ImportFuncNum) {
+      continue;
+    }
+    const uint32_t DefinedIdx = FuncIdx - ImportFuncNum;
+    if (DefinedIdx >= CodeSec.size()) {
+      continue;
+    }
+    const auto Instrs = CodeSec[DefinedIdx].getExpr().getInstrs();
+    for (auto It = Instrs.begin(); It != Instrs.end(); ++It) {
+      if (It->getOpCode() != OpCode::Call) {
+        continue;
+      }
+      uint32_t Target = It->getTargetIndex();
+      if (Target < ImportFuncNum) {
+        continue; // imports are handled by the frontend's intrinsics path
+      }
+      if (BatchSet.count(Target)) {
+        continue;
+      }
+      if (Seen.insert(Target).second) {
+        Result.push_back(Target);
+      }
+    }
+  }
+  return Result;
+}
+
+} // namespace
 
 struct Tier2Compiler::Impl {
   LLVMTargetMachineRef TM = nullptr;
   char *Triple = nullptr;
 
+  /// ORC LLJITs produced by compileBatch() are retained here for the
+  /// lifetime of the Tier2Compiler, so FuncTable entries returned to the
+  /// worker stay valid. We never de-tier, so liveness == compiler lifetime.
+  std::vector<LLVMOrcLLJITRef> JITs;
+
   ~Impl() {
+    for (auto *JIT : JITs) {
+      if (JIT) {
+        LLVMOrcDisposeLLJIT(JIT);
+      }
+    }
     if (TM)
       LLVMDisposeTargetMachine(TM);
     if (Triple)
@@ -53,1308 +592,280 @@ Tier2Compiler::Tier2Compiler() noexcept : P(std::make_unique<Impl>()) {
   LLVMInitializeNativeAsmPrinter();
   LLVMInitializeNativeAsmParser();
 
-  // Create a native TargetMachine for optimization passes and codegen.
+  if (const char *E = ::getenv("WASMEDGE_TIER2_TRACE_FUNC")) {
+    g_tier2_trace_func = std::atoi(E);
+  }
+
   P->Triple = LLVMGetDefaultTargetTriple();
   LLVMTargetRef Target = nullptr;
   char *Err = nullptr;
   if (!LLVMGetTargetFromTriple(P->Triple, &Target, &Err)) {
     P->TM = LLVMCreateTargetMachine(Target, P->Triple, "generic", "",
-                                     LLVMCodeGenLevelDefault,
-                                     LLVMRelocPIC, LLVMCodeModelJITDefault);
+                                    LLVMCodeGenLevelDefault, LLVMRelocPIC,
+                                    LLVMCodeModelJITDefault);
   } else {
     spdlog::error("tier2: failed to get target for {}: {}", P->Triple,
                   Err ? Err : "(null)");
     LLVMDisposeMessage(Err);
   }
 }
+
 Tier2Compiler::~Tier2Compiler() noexcept = default;
 
-// ---------------------------------------------------------------------------
-// Minimal ir_loader callbacks for reloading serialized IR text.
-// The loader only needs func_init (to ir_init the context) and func_process
-// (to capture the parsed result).  All other callbacks are optional.
-// ---------------------------------------------------------------------------
-struct Tier2Loader {
-  ir_loader Base;
-  ir_ctx *Result; // Set by func_process — the caller must ir_free + delete.
-  uint8_t RetType; // ir_type from tier-1 (ir_save doesn't encode it).
-};
-
-static bool tier2_func_init(ir_loader *loader, ir_ctx *ctx, const char *) {
-  (void)loader;
-  ir_init(ctx, IR_FUNCTION | IR_OPT_FOLDING, IR_CONSTS_LIMIT_MIN,
-          IR_INSNS_LIMIT_MIN);
-  return true;
-}
-
-static bool tier2_func_process(ir_loader *loader, ir_ctx *ctx, const char *) {
-  auto *L = reinterpret_cast<Tier2Loader *>(loader);
-
-  // ir_save doesn't encode ret_type; ir_load sets it to -1 (unset).
-  // Use the ret_type captured from tier-1's ir_ctx before ir_jit_compile.
-  if (ctx->ret_type == static_cast<ir_type>(-1)) {
-    ctx->ret_type = static_cast<ir_type>(L->RetType);
-  }
-
-  // Shallow-copy the ctx so that ir_load's subsequent ir_free(&ctx) doesn't
-  // destroy the data we need.  We null the original's pointers to prevent
-  // double-free.
-  auto *Copy = new (std::nothrow) ir_ctx;
-  if (!Copy)
-    return false;
-  std::memcpy(Copy, ctx, sizeof(ir_ctx));
-  // Zero the original so ir_free in ir_load.c is a no-op.
-  std::memset(ctx, 0, sizeof(ir_ctx));
-  L->Result = Copy;
-  return true;
-}
-
-static bool tier2_external_func_dcl(ir_loader *, const char *, uint32_t,
-                                     ir_type, uint32_t, const uint8_t *) {
-  return true; // Accept all external function declarations.
-}
-
-static bool tier2_external_sym_dcl(ir_loader *, const char *, uint32_t) {
-  return true;
-}
-
-/// Extract callee funcIdx values from an ir_ctx by walking CALL instructions.
-/// Pattern: CALL → op2 (PROTO) → op1 (LOAD) → op1 (ADD(FuncTablePtr, CONST)).
-/// CONST / sizeof(void*) = funcIdx.
-static std::vector<uint32_t> extractCallees(ir_ctx *Ctx) {
-  std::vector<uint32_t> Callees;
-  if (!Ctx || Ctx->insns_count <= 1)
-    return Callees;
-
-  // Find the FuncTablePtr ref: it's the first LOAD of type ADDR whose
-  // source is an ADD of a PARAM + CONST (env + offsetof(FuncTable)).
-  // We don't need to identify it precisely — we just need the constant
-  // operand from the ADD in the CALL's load chain.
-
-  for (ir_ref i = 1; i < Ctx->insns_count; ++i) {
-    ir_insn *Insn = &Ctx->ir_base[i];
-    if (Insn->op != IR_CALL)
-      continue;
-
-    // op2 = function operand (should be PROTO)
-    ir_ref FuncRef = ir_insn_op(Insn, 2);
-    if (FuncRef <= 0 || FuncRef >= Ctx->insns_count)
-      continue;
-    ir_insn *ProtoInsn = &Ctx->ir_base[FuncRef];
-    if (ProtoInsn->op != IR_PROTO)
-      continue;
-
-    // PROTO's op1 = the loaded function pointer (should be LOAD)
-    ir_ref LoadRef = ProtoInsn->op1;
-    if (LoadRef <= 0 || LoadRef >= Ctx->insns_count)
-      continue;
-    ir_insn *LoadInsn = &Ctx->ir_base[LoadRef];
-    if (LoadInsn->op != IR_LOAD)
-      continue;
-
-    // LOAD's op2 = address (should be ADD)
-    ir_ref AddrRef = LoadInsn->op2;
-    if (AddrRef <= 0 || AddrRef >= Ctx->insns_count)
-      continue;
-    ir_insn *AddInsn = &Ctx->ir_base[AddrRef];
-    if (AddInsn->op != IR_ADD)
-      continue;
-
-    // ADD has two operands. One should be FuncTablePtr (a LOAD from env),
-    // the other a constant offset. Find the constant operand.
-    ir_ref ConstRef = IR_UNUSED;
-    if (IR_IS_CONST_REF(AddInsn->op1))
-      ConstRef = AddInsn->op1;
-    else if (IR_IS_CONST_REF(AddInsn->op2))
-      ConstRef = AddInsn->op2;
-    else
-      continue;
-
-    // Extract the constant value (address type = uintptr_t).
-    ir_insn *ConstInsn = &Ctx->ir_base[ConstRef];
-    uintptr_t Offset = ConstInsn->val.addr;
-    if (Offset == 0 || Offset % sizeof(void *) != 0)
-      continue;
-
-    uint32_t FuncIdx = static_cast<uint32_t>(Offset / sizeof(void *));
-    Callees.push_back(FuncIdx);
-  }
-
-  // Deduplicate.
-  std::sort(Callees.begin(), Callees.end());
-  Callees.erase(std::unique(Callees.begin(), Callees.end()), Callees.end());
-  return Callees;
-}
-
-/// Load serialized IR text into a fresh ir_ctx.  Caller owns the returned
-/// ir_ctx and must ir_free + delete it.
-static ir_ctx *loadIRText(const std::string &IRText, uint8_t RetType) {
-  ir_loader_init();
-
-  Tier2Loader L{};
-  L.Base.default_func_flags = IR_FUNCTION | IR_OPT_FOLDING;
-  L.Base.func_init = tier2_func_init;
-  L.Base.func_process = tier2_func_process;
-  L.Base.external_func_dcl = tier2_external_func_dcl;
-  L.Base.external_sym_dcl = tier2_external_sym_dcl;
-  L.Result = nullptr;
-  L.RetType = RetType;
-
-  FILE *F = fmemopen(const_cast<char *>(IRText.data()), IRText.size(), "r");
-  if (!F) {
-    ir_loader_free();
-    return nullptr;
-  }
-
-  ir_load_safe(&L.Base, F);
-  fclose(F);
-  ir_loader_free();
-
-  return L.Result;
-}
-
-/// Convert a dstogov/ir ir_ctx* to LLVM IR text via ir_emit_llvm.
-/// Runs the full scheduling pipeline (GCM + schedule + block ordering) on a
-/// fresh context so that instructions are placed in dominating blocks.
-static bool emitLLVMIR(ir_ctx *Ctx, const std::string &FuncName,
-                       std::string &OutIR) {
-  ir_build_def_use_lists(Ctx);
-  if (!ir_build_cfg(Ctx)
-   || !ir_build_dominators_tree(Ctx)
-   || !ir_find_loops(Ctx)
-   || !ir_gcm(Ctx)
-   || !ir_schedule(Ctx)
-   || !ir_schedule_blocks(Ctx)) {
-    spdlog::error("tier2: IR scheduling passes failed for {}", FuncName);
-    return false;
-  }
-
-  char *Buf = nullptr;
-  size_t BufSize = 0;
-  FILE *MemStream = open_memstream(&Buf, &BufSize);
-  if (!MemStream) {
-    spdlog::error("tier2: open_memstream failed");
-    return false;
-  }
-
-  int Ret = ir_emit_llvm(Ctx, FuncName.c_str(), MemStream);
-  fclose(MemStream);
-
-  if (!Ret || !Buf) {
-    spdlog::error("tier2: ir_emit_llvm failed for {}", FuncName);
-    free(Buf);
-    return false;
-  }
-
-  OutIR.assign(Buf, BufSize);
-  free(Buf);
-  return true;
-}
-
-// ---------------------------------------------------------------------------
-// Register all JIT helper symbols as absolute symbols in the LLJIT's main
-// JITDylib so LLVM-compiled code can resolve external calls.
-// ---------------------------------------------------------------------------
-static void registerSymbolsWithLLJIT(LLVMOrcLLJITRef J) {
-  const auto &Registry = getJitSymbolRegistry();
-  if (Registry.empty())
-    return;
-
-  auto ES = LLVMOrcLLJITGetExecutionSession(J);
-  auto MainJD = LLVMOrcLLJITGetMainJITDylib(J);
-
-  std::vector<LLVMOrcCSymbolMapPair> Pairs;
-  Pairs.reserve(Registry.size());
-
-  for (const auto &[Name, Addr] : Registry) {
-    LLVMOrcCSymbolMapPair Pair;
-    Pair.Name = LLVMOrcExecutionSessionIntern(ES, Name.c_str());
-    Pair.Sym.Address = reinterpret_cast<LLVMOrcJITTargetAddress>(Addr);
-    Pair.Sym.Flags.GenericFlags = LLVMJITSymbolGenericFlagsExported;
-    Pair.Sym.Flags.TargetFlags = 0;
-    Pairs.push_back(Pair);
-  }
-
-  auto MU = LLVMOrcAbsoluteSymbols(Pairs.data(), Pairs.size());
-  if (auto Err = LLVMOrcJITDylibDefine(MainJD, MU)) {
-    auto Msg = LLVMGetErrorMessage(Err);
-    spdlog::error("tier2: failed to define absolute symbols: {}", Msg);
-    LLVMDisposeErrorMessage(Msg);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Tier2Compiler::compile
-// ---------------------------------------------------------------------------
-Expect<Tier2CompileResult> Tier2Compiler::compile(const std::string &IRTextIn,
-                                                   const std::string &FuncName,
-                                                   uint8_t RetType,
-                                                   unsigned OptLevel) {
-  if (IRTextIn.empty()) {
-    spdlog::warn("tier2: empty IR text for {}", FuncName);
-    return Unexpect(ErrCode::Value::RuntimeError);
-  }
-
-  // 1. Reload IR text into a fresh ir_ctx, then emit LLVM IR from it.
-  ir_ctx *Ctx = loadIRText(IRTextIn, RetType);
-  if (!Ctx) {
-    spdlog::warn("tier2: failed to reload IR text for {}", FuncName);
-    return Unexpect(ErrCode::Value::RuntimeError);
-  }
-
-  std::string IRText;
-  bool EmitOk = emitLLVMIR(Ctx, FuncName, IRText);
-  ir_free(Ctx);
-  ::operator delete(Ctx);
-
-  if (!EmitOk) {
-    return Unexpect(ErrCode::Value::RuntimeError);
-  }
-
-  // RC3: strip the tier-up counter prologue before LLVM parses the text.
-  // Gated so the A/B experiments stay easy: set WASMEDGE_TIER2_NO_STRIP=1
-  // to measure tier-2 with the prologue still present.
-  if (!std::getenv("WASMEDGE_TIER2_NO_STRIP"))
-    stripTierUpPrologue(IRText);
-
-  if (std::getenv("WASMEDGE_TIER2_DUMP_IR")) {
-    // Also dump the raw serialized IR text for debugging.
-    std::string RawPath = "/tmp/tier2_" + FuncName + ".ir";
-    if (FILE *F = fopen(RawPath.c_str(), "w")) {
-      fwrite(IRTextIn.data(), 1, IRTextIn.size(), F);
-      fclose(F);
-    }
-    std::string DumpPath = "/tmp/tier2_" + FuncName + ".ll";
-    if (FILE *F = fopen(DumpPath.c_str(), "w")) {
-      fwrite(IRText.data(), 1, IRText.size(), F);
-      fclose(F);
-      spdlog::info("tier2: wrote LLVM IR for {} to {}", FuncName, DumpPath);
-    }
-  }
-
-  // 2. Create a ThreadSafeContext, get its underlying LLVMContext, and parse
-  //    the LLVM IR text into a Module within that context.
-  LLVMOrcThreadSafeContextRef TSCtx = LLVMOrcCreateNewThreadSafeContext();
-  LLVMContextRef LLCtx = LLVMOrcThreadSafeContextGetContext(TSCtx);
-
-  LLVMMemoryBufferRef MemBuf = LLVMCreateMemoryBufferWithMemoryRangeCopy(
-      IRText.data(), IRText.size(), "tier2_ir");
-
-  LLVMModuleRef Mod = nullptr;
-  char *ErrMsg = nullptr;
-  if (LLVMParseIRInContext(LLCtx, MemBuf, &Mod, &ErrMsg)) {
-
-    spdlog::error("tier2: LLVMParseIRInContext failed for {}: {}", FuncName,
-                  ErrMsg ? ErrMsg : "(null)");
-    LLVMDisposeMessage(ErrMsg);
-    LLVMOrcDisposeThreadSafeContext(TSCtx);
-    return Unexpect(ErrCode::Value::RuntimeError);
-  }
-
-  // 2a. Set target triple and data layout so optimization passes work correctly.
-  if (P->TM) {
-    LLVMSetTarget(Mod, P->Triple);
-    auto *DL = LLVMCreateTargetDataLayout(P->TM);
-    LLVMSetModuleDataLayout(Mod, DL);
-    LLVMDisposeTargetData(DL);
-  }
-
-  // 2b. Verify the LLVM IR module. ir_emit_llvm can produce domination errors
-  //     or other invalid IR that would crash LLVM's codegen.
-  {
-    char *VerifyMsg = nullptr;
-    if (LLVMVerifyModule(Mod, LLVMReturnStatusAction, &VerifyMsg)) {
-  
-      spdlog::warn("tier2: LLVM verification failed for {}: {}", FuncName,
-                    VerifyMsg ? VerifyMsg : "(null)");
-      LLVMDisposeMessage(VerifyMsg);
-      LLVMDisposeModule(Mod);
-      LLVMOrcDisposeThreadSafeContext(TSCtx);
-      return Unexpect(ErrCode::Value::RuntimeError);
-    }
-    LLVMDisposeMessage(VerifyMsg);
-  }
-
-  // Bail out if shutdown was signaled (avoid entering long LLVM calls).
-  if (isShutdown()) {
-    LLVMDisposeModule(Mod);
-    LLVMOrcDisposeThreadSafeContext(TSCtx);
-    return Unexpect(ErrCode::Value::RuntimeError);
-  }
-
-  // 3. Run LLVM optimization passes.
-  {
-    char PassStr[32];
-    std::snprintf(PassStr, sizeof(PassStr), "default<O%u>",
-                  OptLevel > 3 ? 3u : OptLevel);
-
-    LLVMPassBuilderOptionsRef PBO = LLVMCreatePassBuilderOptions();
-    // RC4: Re-enable loop and SLP vectorization. They were disabled earlier as
-    // a workaround for LLVM 18 ISel crashes on scalable-vector patterns, but
-    // the affected inputs came from the tier-1 IR JIT path that went through
-    // LLVM JIT before tier-2 existed. Tier-2's input is the dstogov/ir graph
-    // rendered back to plain LLVM IR — no scalable vectors appear in it — so
-    // the workaround was over-broad and was costing us the whole LLVM-JIT
-    // advantage on loop-vectorisable kernels (ctype, ed25519, random, sieve,
-    // base64, matrix). If a kernel starts crashing in ISel after this flip,
-    // narrow the fix to a per-pass knob rather than re-disabling wholesale.
-    LLVMPassBuilderOptionsSetLoopVectorization(PBO, 1);
-    LLVMPassBuilderOptionsSetSLPVectorization(PBO, 1);
-    if (auto Err = LLVMRunPasses(Mod, PassStr, P->TM, PBO)) {
-      auto Msg = LLVMGetErrorMessage(Err);
-      spdlog::warn("tier2: LLVMRunPasses warning for {}: {}", FuncName, Msg);
-      LLVMDisposeErrorMessage(Msg);
-    }
-    LLVMDisposePassBuilderOptions(PBO);
-  }
-
-  // Bail out if shutdown was signaled (avoid ISel codegen which can crash).
-  if (isShutdown()) {
-    LLVMDisposeModule(Mod);
-    LLVMOrcDisposeThreadSafeContext(TSCtx);
-    return Unexpect(ErrCode::Value::RuntimeError);
-  }
-
-  // 4. Create an ORC LLJIT and add the module.
-  LLVMOrcLLJITRef J = nullptr;
-  if (auto Err = LLVMOrcCreateLLJIT(&J, nullptr)) {
-
-    auto Msg = LLVMGetErrorMessage(Err);
-    spdlog::error("tier2: LLVMOrcCreateLLJIT failed: {}", Msg);
-    LLVMDisposeErrorMessage(Msg);
-    LLVMDisposeModule(Mod);
-    LLVMOrcDisposeThreadSafeContext(TSCtx);
-    return Unexpect(ErrCode::Value::RuntimeError);
-  }
-
-  // Register external JIT helper symbols before adding the module.
-  registerSymbolsWithLLJIT(J);
-
-  // Wrap module in ThreadSafeModule (takes ownership of Mod) and add to LLJIT.
-  {
-    LLVMOrcThreadSafeModuleRef TSMod =
-        LLVMOrcCreateNewThreadSafeModule(Mod, TSCtx);
-    // TSMod now owns Mod. TSCtx is shared; we still hold our ref.
-
-    auto MainJD = LLVMOrcLLJITGetMainJITDylib(J);
-    if (auto Err = LLVMOrcLLJITAddLLVMIRModule(J, MainJD, TSMod)) {
-  
-      auto Msg = LLVMGetErrorMessage(Err);
-      spdlog::error("tier2: addLLVMIRModule failed for {}: {}", FuncName, Msg);
-      LLVMDisposeErrorMessage(Msg);
-      LLVMOrcDisposeThreadSafeModule(TSMod);
-      LLVMOrcDisposeThreadSafeContext(TSCtx);
-      LLVMOrcDisposeLLJIT(J);
-      return Unexpect(ErrCode::Value::RuntimeError);
-    }
-    // On success, LLJIT owns TSMod.
-  }
-
-  // Last chance to bail out before codegen (ISel is where LLVM 18 bugs crash).
-  if (isShutdown()) {
-    LLVMOrcDisposeThreadSafeContext(TSCtx);
-    LLVMOrcDisposeLLJIT(J);
-    return Unexpect(ErrCode::Value::RuntimeError);
-  }
-
-  // 5. Look up the compiled function (triggers LLJIT codegen).
-  LLVMOrcJITTargetAddress FuncAddr = 0;
-  if (auto Err = LLVMOrcLLJITLookup(J, &FuncAddr, FuncName.c_str())) {
-
-    auto Msg = LLVMGetErrorMessage(Err);
-    spdlog::error("tier2: lookup failed for {}: {}", FuncName, Msg);
-    LLVMDisposeErrorMessage(Msg);
-    LLVMOrcDisposeThreadSafeContext(TSCtx);
-    LLVMOrcDisposeLLJIT(J);
-    return Unexpect(ErrCode::Value::RuntimeError);
-  }
-
-  if (!FuncAddr) {
-    spdlog::error("tier2: lookup returned null for {}", FuncName);
-    LLVMOrcDisposeThreadSafeContext(TSCtx);
-    LLVMOrcDisposeLLJIT(J);
-    return Unexpect(ErrCode::Value::RuntimeError);
-  }
-
-  // Note: We intentionally leak J and TSCtx here — the compiled code lives
-  // in LLJIT's memory.  Phase 3 (Tier2Manager) will properly own these.
-  // For now, tier-2 functions live for the process lifetime anyway.
-
-  Tier2CompileResult Result;
-  Result.NativeFunc = reinterpret_cast<void *>(FuncAddr);
-  Result.CodeSize = 0; // ORC doesn't expose code size directly.
-
-  spdlog::info("tier2: compiled {} → {:#x}", FuncName,
-               static_cast<uintptr_t>(FuncAddr));
-
-  return Result;
-}
-
-// ---------------------------------------------------------------------------
-// Tier2Compiler::getCallees — public wrapper around extractCallees + loadIRText
-// ---------------------------------------------------------------------------
-std::vector<uint32_t> Tier2Compiler::getCallees(const std::string &IRText,
-                                                uint8_t RetType) {
-  ir_ctx *Ctx = loadIRText(IRText, RetType);
-  if (!Ctx)
-    return {};
-  auto Result = extractCallees(Ctx);
-  ir_free(Ctx);
-  ::operator delete(Ctx);
-  return Result;
-}
-
-// ---------------------------------------------------------------------------
-// RC3: Neutralise the tier-up counter prologue in tier-2 function bodies.
-//
-// Tier-1 emits, at the top of every function when tier-up is enabled, a
-// prologue that loads the per-function call counter, compares against
-// TierUpThreshold, and — while still below — increments it and optionally
-// calls jit_tier_up_notify. That graph is serialised into the ir_ctx text
-// and reloaded verbatim when tier-2 compiles the same function. But by the
-// time tier-2 runs, the counter is already saturated (tier-up has fired),
-// so the prologue is pure overhead on every call: LLVM cannot DCE the
-// store-back or the external call on its own.
-//
-// We neutralise it by finding the guard icmp and forcing its RHS constant
-// to 0. `icmp ult i32 %v, 0` folds to `i1 false`, which makes the
-// increment/store/notify branch unreachable; LLVM's SimplifyCFG + DCE then
-// remove the whole prologue — counter load, ptrtoint/add/inttoptr chain,
-// stores, and the call — without any further hand-holding.
-//
-// Matching the prologue uniquely in the emitted LLVM IR text:
-//   %A = ptrtoint ptr %<env-param> to i64
-//   %B = add i64 %A, <offsetof(JitExecEnv, CallCounters)>
-//   %C = inttoptr i64 %B to ptr
-//   %D = load ptr, ptr %C                ; CallCountersPtr
-//   %E = ptrtoint ptr %D to i64
-//   %F = add i64 %E, <funcIdx*4>
-//   %G = inttoptr i64 %F to ptr
-//   %H = load i32, ptr %G                ; counter value
-//   %I = icmp ult i32 %H, <TierUpThreshold>   ; <-- rewrite RHS to 0
-//
-// Tracking the chain from `%<env-param>` forward rules out collisions with
-// user-level `icmp ult i32` comparisons later in the function.
-// ---------------------------------------------------------------------------
-static void stripTierUpPrologue(std::string &IR) {
-  const uint64_t CallCountersOffset =
-      static_cast<uint64_t>(offsetof(JitExecEnv, CallCounters));
-
-  auto Trim = [](std::string_view S) -> std::string {
-    size_t Start = 0, End = S.size();
-    while (Start < End && (S[Start] == ' ' || S[Start] == '\t'))
-      ++Start;
-    while (End > Start && (S[End - 1] == ' ' || S[End - 1] == '\t'))
-      --End;
-    return std::string(S.substr(Start, End - Start));
-  };
-  auto GetDest = [&Trim](const std::string &Line) -> std::string {
-    auto EqPos = Line.find('=');
-    if (EqPos == std::string::npos)
-      return {};
-    return Trim(std::string_view(Line).substr(0, EqPos));
-  };
-  auto IsDigits = [](std::string_view S) -> bool {
-    if (S.empty())
-      return false;
-    for (char C : S)
-      if (C < '0' || C > '9')
-        return false;
-    return true;
-  };
-
-  // Per-function state machine: each SSA name is set in order and the chain
-  // is cross-checked end-to-end before we accept the final icmp as the
-  // counter guard.
-  std::string EnvParam;       // e.g. "%d2"
-  std::string EnvInt;         // ptrtoint ptr %envParam to i64
-  std::string CCIntermedInt;  // add i64 %envInt, 112
-  std::string CCPtr;          // inttoptr i64 %CCIntermedInt to ptr
-  std::string CCBase;         // load ptr, ptr %CCPtr
-  std::string CCBaseInt;      // ptrtoint ptr %CCBase to i64
-  std::string SlotInt;        // add i64 %CCBaseInt, <funcIdx*4>
-  std::string SlotPtr;        // inttoptr i64 %SlotInt to ptr
-  std::string CounterVal;     // load i32, ptr %SlotPtr
-  bool Done = false;
-
-  auto Reset = [&]() {
-    EnvParam.clear();
-    EnvInt.clear();
-    CCIntermedInt.clear();
-    CCPtr.clear();
-    CCBase.clear();
-    CCBaseInt.clear();
-    SlotInt.clear();
-    SlotPtr.clear();
-    CounterVal.clear();
-    Done = false;
-  };
-
-  std::string Result;
-  Result.reserve(IR.size());
-  uint32_t StripCount = 0;
-
-  size_t Pos = 0;
-  while (Pos < IR.size()) {
-    size_t LineEnd = IR.find('\n', Pos);
-    if (LineEnd == std::string::npos)
-      LineEnd = IR.size();
-    std::string Line = IR.substr(Pos, LineEnd - Pos);
-
-    if (Line.find("define ") != std::string::npos) {
-      Reset();
-      // Parse first parameter SSA name from "define TY @name(ptr %dN, ...)".
-      auto OpenParen = Line.find('(');
-      if (OpenParen != std::string::npos) {
-        size_t P = OpenParen + 1;
-        while (P < Line.size() && Line[P] != '%' && Line[P] != ')')
-          ++P;
-        if (P < Line.size() && Line[P] == '%') {
-          size_t E = P;
-          while (E < Line.size() && Line[E] != ',' && Line[E] != ')' &&
-                 Line[E] != ' ')
-            ++E;
-          EnvParam = Line.substr(P, E - P);
-        }
-      }
-    }
-
-    std::string OutLine = Line;
-
-    if (!Done && !EnvParam.empty()) {
-      const std::string Dest = GetDest(Line);
-
-      // Walk each chain step in order. Later steps only run once earlier
-      // ones have fired, so we never accidentally match an unrelated
-      // instruction elsewhere in the function.
-
-      if (EnvInt.empty()) {
-        auto P = Line.find("= ptrtoint ptr ");
-        if (P != std::string::npos && !Dest.empty()) {
-          std::string After = Line.substr(P + 15);
-          auto Sp = After.find(' ');
-          if (Sp != std::string::npos && After.substr(0, Sp) == EnvParam)
-            EnvInt = Dest;
-        }
-      } else if (CCIntermedInt.empty()) {
-        auto P = Line.find("= add i64 ");
-        if (P != std::string::npos && !Dest.empty()) {
-          std::string Rest = Line.substr(P + 10);
-          auto CP = Rest.find(", ");
-          if (CP != std::string::npos) {
-            std::string Op1 = Trim(std::string_view(Rest).substr(0, CP));
-            std::string Op2 = Trim(std::string_view(Rest).substr(CP + 2));
-            if (Op1 == EnvInt && IsDigits(Op2) &&
-                std::stoull(Op2) == CallCountersOffset)
-              CCIntermedInt = Dest;
-          }
-        }
-      } else if (CCPtr.empty()) {
-        auto P = Line.find("= inttoptr i64 ");
-        if (P != std::string::npos && !Dest.empty()) {
-          std::string After = Line.substr(P + 15);
-          auto Sp = After.find(' ');
-          if (Sp != std::string::npos && After.substr(0, Sp) == CCIntermedInt)
-            CCPtr = Dest;
-        }
-      } else if (CCBase.empty()) {
-        auto P = Line.find("= load ptr, ptr ");
-        if (P != std::string::npos && !Dest.empty()) {
-          std::string Src = Trim(std::string_view(Line).substr(P + 16));
-          if (Src == CCPtr)
-            CCBase = Dest;
-        }
-      } else if (CCBaseInt.empty()) {
-        auto P = Line.find("= ptrtoint ptr ");
-        if (P != std::string::npos && !Dest.empty()) {
-          std::string After = Line.substr(P + 15);
-          auto Sp = After.find(' ');
-          if (Sp != std::string::npos && After.substr(0, Sp) == CCBase)
-            CCBaseInt = Dest;
-        }
-      } else if (SlotInt.empty()) {
-        auto P = Line.find("= add i64 ");
-        if (P != std::string::npos && !Dest.empty()) {
-          std::string Rest = Line.substr(P + 10);
-          auto CP = Rest.find(", ");
-          if (CP != std::string::npos) {
-            std::string Op1 = Trim(std::string_view(Rest).substr(0, CP));
-            std::string Op2 = Trim(std::string_view(Rest).substr(CP + 2));
-            // FuncIdx offset can be 0 (for funcIdx 0), so accept any digits.
-            if ((Op1 == CCBaseInt && IsDigits(Op2)) ||
-                (Op2 == CCBaseInt && IsDigits(Op1)))
-              SlotInt = Dest;
-          }
-        }
-      } else if (SlotPtr.empty()) {
-        auto P = Line.find("= inttoptr i64 ");
-        if (P != std::string::npos && !Dest.empty()) {
-          std::string After = Line.substr(P + 15);
-          auto Sp = After.find(' ');
-          if (Sp != std::string::npos && After.substr(0, Sp) == SlotInt)
-            SlotPtr = Dest;
-        }
-      } else if (CounterVal.empty()) {
-        auto P = Line.find("= load i32, ptr ");
-        if (P != std::string::npos && !Dest.empty()) {
-          std::string Src = Trim(std::string_view(Line).substr(P + 16));
-          if (Src == SlotPtr)
-            CounterVal = Dest;
-        }
-      } else {
-        // Final step: rewrite the guard icmp's RHS to 0.
-        auto P = Line.find("= icmp ult i32 ");
-        if (P != std::string::npos && !Dest.empty()) {
-          std::string Rest = Line.substr(P + 15);
-          auto CP = Rest.find(", ");
-          if (CP != std::string::npos) {
-            std::string Op1 = Trim(std::string_view(Rest).substr(0, CP));
-            if (Op1 == CounterVal) {
-              std::string Op2Raw = Rest.substr(CP + 2);
-              // Trim trailing whitespace, ignore anything after the literal.
-              size_t E2 = 0;
-              while (E2 < Op2Raw.size() && Op2Raw[E2] >= '0' &&
-                     Op2Raw[E2] <= '9')
-                ++E2;
-              if (E2 > 0) {
-                // "<prefix>= icmp ult i32 %H, " + "0" + "<suffix>"
-                OutLine = Line.substr(0, P + 15 + CP + 2) + "0" +
-                          Op2Raw.substr(E2);
-                Done = true;
-                ++StripCount;
-              }
-            }
-          }
-        }
-      }
-    }
-
-    Result += OutLine;
-    Result += '\n';
-    Pos = LineEnd + 1;
-  }
-
-  if (!IR.empty() && IR.back() != '\n' && !Result.empty() &&
-      Result.back() == '\n')
-    Result.pop_back();
-
-  if (StripCount > 0)
-    spdlog::info("tier2: stripped tier-up prologue from {} functions",
-                 StripCount);
-
-  IR = std::move(Result);
-}
-
-// ---------------------------------------------------------------------------
-// Phase 2: Rewrite indirect FuncTable calls to direct calls for batch members.
-//
-// Scans the LLVM IR text line-by-line for the pattern:
-//   %tN = add i64 %tM, OFFSET          ; OFFSET = funcIdx * 8
-//   %dN = inttoptr i64 %tN to ptr
-//   %dM = load ptr, ptr %dN             ; load FuncTable[funcIdx]
-//   ... (optional bitcast)
-//   %dR = call x86_fastcallcc TYPE %dM(...)  ; indirect call
-//
-// When OFFSET matches a batch member, replaces the indirect call target
-// with a direct @funcName reference.
-// ---------------------------------------------------------------------------
-static void rewriteIntraBatchCalls(
-    std::string &IR,
-    const std::unordered_map<uint64_t, std::string> &OffsetToName) {
-  if (OffsetToName.empty())
-    return;
-
-  // Trim leading/trailing whitespace from an SSA name.
-  auto Trim = [](const std::string &S) -> std::string {
-    size_t Start = 0, End = S.size();
-    while (Start < End && (S[Start] == ' ' || S[Start] == '\t'))
-      ++Start;
-    while (End > Start && (S[End - 1] == ' ' || S[End - 1] == '\t'))
-      --End;
-    return S.substr(Start, End - Start);
-  };
-
-  // Extract the LHS SSA name before '=' (trimmed).
-  auto GetDest = [&Trim](const std::string &Line) -> std::string {
-    auto EqPos = Line.find('=');
-    if (EqPos == std::string::npos)
-      return {};
-    return Trim(Line.substr(0, EqPos));
-  };
-
-  // First pass: collect return types from define lines.
-  // "define i32 @wasm_tier2_030(..." → funcRetType["@wasm_tier2_030"] = "i32"
-  std::unordered_map<std::string, std::string> FuncRetType;
-  {
-    size_t P = 0;
-    while (P < IR.size()) {
-      size_t LE = IR.find('\n', P);
-      if (LE == std::string::npos) LE = IR.size();
-      auto DefPos = IR.find("define ", P);
-      if (DefPos != std::string::npos && DefPos < LE) {
-        // "define TYPE @name("
-        auto AtPos = IR.find('@', DefPos);
-        auto ParenPos = IR.find('(', DefPos);
-        if (AtPos != std::string::npos && ParenPos != std::string::npos &&
-            AtPos < ParenPos) {
-          std::string Name = IR.substr(AtPos, ParenPos - AtPos);
-          // Type is between "define " and " @"
-          std::string TypeStr = Trim(IR.substr(DefPos + 7, AtPos - DefPos - 7));
-          FuncRetType[Name] = TypeStr;
-        }
-      }
-      P = LE + 1;
-    }
-  }
-
-  // SSA name tracking maps (all keys/values are trimmed).
-  std::unordered_set<std::string> FuncTablePtrInts; // ptrtoint of %d4
-  std::unordered_map<std::string, uint64_t> AddResultToOffset;
-  std::unordered_map<std::string, uint64_t> IntToPtrToOffset;
-  std::unordered_map<std::string, std::string> PtrToFunc;
-  std::string FuncTableSSA; // SSA name of FuncTablePtr (first load from env)
-  std::string EnvParamSSA;  // First parameter of current function (env ptr).
-
-  std::string Result;
-  Result.reserve(IR.size());
-  uint32_t RewriteCount = 0;
-
-  size_t Pos = 0;
-  while (Pos < IR.size()) {
-    size_t LineEnd = IR.find('\n', Pos);
-    if (LineEnd == std::string::npos)
-      LineEnd = IR.size();
-    std::string Line = IR.substr(Pos, LineEnd - Pos);
-
-    // Reset tracking at function boundaries to avoid cross-function pollution.
-    if (Line.find("define ") != std::string::npos) {
-      FuncTablePtrInts.clear();
-      AddResultToOffset.clear();
-      IntToPtrToOffset.clear();
-      PtrToFunc.clear();
-      FuncTableSSA.clear();
-      EnvParamSSA.clear();
-      // Parse first parameter SSA name from: "define TY @name(ptr %dN, ...)".
-      auto OpenParen = Line.find('(');
-      if (OpenParen != std::string::npos) {
-        size_t P = OpenParen + 1;
-        // Skip leading type "ptr " / "i32 " etc.
-        while (P < Line.size() && Line[P] != '%' && Line[P] != ')')
-          ++P;
-        if (P < Line.size() && Line[P] == '%') {
-          size_t E = P;
-          while (E < Line.size() && Line[E] != ',' && Line[E] != ')' &&
-                 Line[E] != ' ')
-            ++E;
-          EnvParamSSA = Line.substr(P, E - P);
-        }
-      }
-    }
-
-    // Detect FuncTablePtr: the load of the FuncTable pointer from the env
-    // struct. FuncTable lives at offset 0, so the emitted IR is literally
-    // "%dN = load ptr, ptr %<env>". Matching on "load ptr, ptr <env-param>"
-    // avoids latching onto the tier-up counter-prologue load, which first
-    // goes through a ptrtoint/add/inttoptr chain (CallCounters offset).
-    if (FuncTableSSA.empty() && !EnvParamSSA.empty()) {
-      auto LP = Line.find("= load ptr, ptr ");
-      if (LP != std::string::npos) {
-        std::string Src = Trim(Line.substr(LP + 16));
-        if (Src == EnvParamSSA) {
-          std::string Dest = GetDest(Line);
-          if (!Dest.empty())
-            FuncTableSSA = Dest;
-        }
-      }
-    }
-
-    // Track ptrtoint of FuncTablePtr: "%tN_1 = ptrtoint ptr %d4 to i64"
-    {
-      auto PIP = Line.find("= ptrtoint ptr ");
-      if (PIP != std::string::npos && !FuncTableSSA.empty()) {
-        // Extract the source pointer after "= ptrtoint ptr "
-        // "= ptrtoint ptr " is 15 chars
-        std::string After = Line.substr(PIP + 15);
-        auto Sp = After.find(' ');
-        if (Sp != std::string::npos) {
-          std::string Src = After.substr(0, Sp);
-          if (Src == FuncTableSSA) {
-            std::string Dest = GetDest(Line);
-            if (!Dest.empty())
-              FuncTablePtrInts.insert(Dest);
-          }
-        }
-      }
-    }
-
-    // Pattern 1: %tN = add i64 %tN_1, OFFSET
-    // Only match when the non-constant operand is a ptrtoint of FuncTablePtr.
-    {
-      auto P1 = Line.find("= add i64 ");
-      if (P1 != std::string::npos) {
-        std::string Dest = GetDest(Line);
-        if (!Dest.empty()) {
-          // Extract the two operands after "= add i64 "
-          // "= add i64 " is 10 chars
-          std::string After = Line.substr(P1 + 10);
-          auto CommaPos = After.find(", ");
-          if (CommaPos != std::string::npos) {
-            std::string Op1 = Trim(After.substr(0, CommaPos));
-            std::string Op2 = Trim(After.substr(CommaPos + 2));
-            // One operand should be a FuncTablePtrInt, the other a number.
-            std::string OffStr;
-            bool IsFTAdd = false;
-            if (FuncTablePtrInts.count(Op1)) {
-              OffStr = Op2;
-              IsFTAdd = true;
-            } else if (FuncTablePtrInts.count(Op2)) {
-              OffStr = Op1;
-              IsFTAdd = true;
-            }
-            if (IsFTAdd) {
-              bool IsNum = !OffStr.empty();
-              for (char C : OffStr)
-                if (C < '0' || C > '9') { IsNum = false; break; }
-              if (IsNum) {
-                uint64_t Off = std::stoull(OffStr);
-                if (OffsetToName.count(Off))
-                  AddResultToOffset[Dest] = Off;
-              }
-            }
-          }
-        }
-      }
-    }
-
-    // Pattern 2: %dN = inttoptr i64 %tM to ptr
-    {
-      auto P2 = Line.find("= inttoptr i64 ");
-      if (P2 != std::string::npos) {
-        std::string Dest = GetDest(Line);
-        if (!Dest.empty()) {
-          // "= inttoptr i64 " is 15 chars
-          std::string After = Line.substr(P2 + 15);
-          auto Sp = After.find(' ');
-          if (Sp != std::string::npos) {
-            std::string Src = After.substr(0, Sp);
-            auto It = AddResultToOffset.find(Src);
-            if (It != AddResultToOffset.end())
-              IntToPtrToOffset[Dest] = It->second;
-          }
-        }
-      }
-    }
-
-    // Pattern 3: %dM = load ptr, ptr %dN
-    {
-      auto P3 = Line.find("= load ptr, ptr ");
-      if (P3 != std::string::npos) {
-        std::string Dest = GetDest(Line);
-        if (!Dest.empty()) {
-          // "= load ptr, ptr " is 16 chars
-          std::string Src = Trim(Line.substr(P3 + 16));
-          auto It = IntToPtrToOffset.find(Src);
-          if (It != IntToPtrToOffset.end()) {
-            auto NameIt = OffsetToName.find(It->second);
-            if (NameIt != OffsetToName.end())
-              PtrToFunc[Dest] = "@" + NameIt->second;
-          }
-        }
-      }
-    }
-
-    // Pattern 3b: bitcast (pass-through)
-    {
-      auto P3b = Line.find("= bitcast ptr ");
-      if (P3b != std::string::npos) {
-        std::string Dest = GetDest(Line);
-        if (!Dest.empty()) {
-          // "= bitcast ptr " is 14 chars
-          std::string Src = Line.substr(P3b + 14);
-          auto ToPos = Src.find(" to ");
-          if (ToPos != std::string::npos)
-            Src = Src.substr(0, ToPos);
-          Src = Trim(Src);
-          auto It = PtrToFunc.find(Src);
-          if (It != PtrToFunc.end())
-            PtrToFunc[Dest] = It->second;
-        }
-      }
-    }
-
-    // Pattern 4: Replace indirect call target with direct call.
-    // Handle return type mismatch (caller uses i64, callee defines i32/void).
-    bool Replaced = false;
-    {
-      auto CallKwPos = Line.find("call x86_fastcallcc ");
-      if (CallKwPos != std::string::npos) {
-        auto ParenPos = Line.find('(');
-        if (ParenPos != std::string::npos && ParenPos > 1) {
-          size_t End = ParenPos;
-          while (End > 0 && Line[End - 1] == ' ')
-            --End;
-          size_t Start = End;
-          while (Start > 0 && Line[Start - 1] != ' ')
-            --Start;
-          std::string Target = Line.substr(Start, End - Start);
-          auto It = PtrToFunc.find(Target);
-          if (It != PtrToFunc.end()) {
-            // Extract call return type.
-            // "call x86_fastcallcc " is 20 chars from CallKwPos
-            size_t TypeStart = CallKwPos + 20;
-            size_t TypeEnd = Line.find(' ', TypeStart);
-            std::string CallRetType =
-                (TypeEnd != std::string::npos)
-                    ? Line.substr(TypeStart, TypeEnd - TypeStart)
-                    : "";
-            auto RIt = FuncRetType.find(It->second);
-            std::string DefRetType =
-                (RIt != FuncRetType.end()) ? RIt->second : CallRetType;
-
-            // Helper: strip "x86_fastcallcc " from a line (callee defines
-            // use default CC, not fastcall).
-            auto StripFastcall = [](std::string &S) {
-              auto P = S.find("x86_fastcallcc ");
-              if (P != std::string::npos)
-                S.erase(P, 15); // "x86_fastcallcc " = 15 chars
-            };
-
-            if (CallRetType == DefRetType || DefRetType.empty()) {
-              // Types match — simple rewrite.
-              std::string NewLine =
-                  Line.substr(0, Start) + It->second + Line.substr(End);
-              StripFastcall(NewLine);
-              Result += NewLine;
-              Result += '\n';
-              Replaced = true;
-              ++RewriteCount;
-            } else if (CallRetType == "i64" &&
-                       (DefRetType == "i32" || DefRetType == "i16" ||
-                        DefRetType == "i8")) {
-              // Caller expects i64 but callee returns smaller int.
-              // Rewrite call with callee's type, then zext to i64.
-              std::string Dest = GetDest(Line);
-              if (!Dest.empty()) {
-                std::string TmpName = Dest + "_narrow";
-                std::string CallLine = Line;
-                // Replace dest with temp name.
-                auto EqPos = CallLine.find('=');
-                if (EqPos != std::string::npos)
-                  CallLine = "\t" + TmpName + " " + CallLine.substr(EqPos);
-                StripFastcall(CallLine);
-                // Replace return type after "call ".
-                auto CallKw2 = CallLine.find("call ");
-                if (CallKw2 != std::string::npos) {
-                  size_t TS = CallKw2 + 5;
-                  size_t TE = CallLine.find(' ', TS);
-                  if (TE != std::string::npos)
-                    CallLine.replace(TS, TE - TS, DefRetType);
-                }
-                // Replace target.
-                auto Paren2 = CallLine.find('(');
-                if (Paren2 != std::string::npos) {
-                  size_t E2 = Paren2;
-                  while (E2 > 0 && CallLine[E2 - 1] == ' ') --E2;
-                  size_t S2 = E2;
-                  while (S2 > 0 && CallLine[S2 - 1] != ' ') --S2;
-                  CallLine = CallLine.substr(0, S2) + It->second +
-                             CallLine.substr(E2);
-                }
-                Result += CallLine;
-                Result += '\n';
-                Result += "\t" + Dest + " = zext " + DefRetType + " " +
-                          TmpName + " to i64\n";
-                Replaced = true;
-                ++RewriteCount;
-              }
-            }
-            // Other mismatches (void, float, double) — skip rewrite.
-          }
-        }
-      }
-    }
-
-    if (!Replaced) {
-      Result += Line;
-      Result += '\n';
-    }
-
-    Pos = LineEnd + 1;
-  }
-
-  if (!IR.empty() && IR.back() != '\n' && !Result.empty() &&
-      Result.back() == '\n')
-    Result.pop_back();
-
-  if (RewriteCount > 0)
-    spdlog::info("tier2-batch: rewrote {} indirect → direct calls",
-                 RewriteCount);
-
-  IR = std::move(Result);
-}
-
-// ---------------------------------------------------------------------------
-// Shared emit loader for multi-function LLVM IR emission.
-// Prevents duplicate `declare` statements when emitting multiple functions
-// to the same FILE stream.
-// ---------------------------------------------------------------------------
-struct SharedEmitLoader {
-  ir_loader Base;
-  std::unordered_set<std::string> DeclaredSyms;
-};
-
-static bool sharedHasSym(ir_loader *L, const char *Name) {
-  auto *SL = reinterpret_cast<SharedEmitLoader *>(L);
-  return SL->DeclaredSyms.count(Name) > 0;
-}
-
-static bool sharedAddSym(ir_loader *L, const char *Name, void *) {
-  auto *SL = reinterpret_cast<SharedEmitLoader *>(L);
-  SL->DeclaredSyms.insert(Name);
-  return true;
-}
-
-// ---------------------------------------------------------------------------
-// Tier2Compiler::compileBatch — compile multiple functions in one LLVM module.
-// ---------------------------------------------------------------------------
 Expect<std::vector<std::pair<uint32_t, void *>>>
-Tier2Compiler::compileBatch(std::vector<BatchEntry> &Entries,
-                            unsigned OptLevel) {
-  if (Entries.empty())
-    return Unexpect(ErrCode::Value::RuntimeError);
-
-  // 1. Emit all functions to a single LLVM IR text buffer.
-  SharedEmitLoader SL{};
-  std::memset(&SL.Base, 0, sizeof(ir_loader));
-  SL.Base.has_sym = sharedHasSym;
-  SL.Base.add_sym = sharedAddSym;
-
-  char *Buf = nullptr;
-  size_t BufSize = 0;
-  FILE *MemStream = open_memstream(&Buf, &BufSize);
-  if (!MemStream) {
-    spdlog::error("tier2-batch: open_memstream failed");
-    return Unexpect(ErrCode::Value::RuntimeError);
+Tier2Compiler::compileBatch(Span<const uint32_t> BatchIdx,
+                            const AST::Module &Mod, unsigned OptLevel) {
+  std::vector<std::pair<uint32_t, void *>> Result;
+  if (isShutdown() || BatchIdx.empty()) {
+    return Result;
   }
 
-  // Track which functions we successfully emitted.
-  std::vector<size_t> EmittedIdx;
-  for (size_t i = 0; i < Entries.size(); ++i) {
-    auto &E = Entries[i];
-    ir_ctx *Ctx = loadIRText(E.IRText, E.RetType);
-    if (!Ctx) {
-      spdlog::warn("tier2-batch: failed to load IR for {}", E.FuncName);
-      continue;
-    }
-
-    // Run scheduling passes.
-    ir_build_def_use_lists(Ctx);
-    bool Ok = ir_build_cfg(Ctx) && ir_build_dominators_tree(Ctx) &&
-              ir_find_loops(Ctx) && ir_gcm(Ctx) && ir_schedule(Ctx) &&
-              ir_schedule_blocks(Ctx);
-    if (!Ok) {
-      spdlog::warn("tier2-batch: scheduling failed for {}", E.FuncName);
-      ir_free(Ctx);
-      ::operator delete(Ctx);
-      continue;
-    }
-
-    // Set shared loader to deduplicate declarations.
-    Ctx->loader = &SL.Base;
-
-    int Ret = ir_emit_llvm(Ctx, E.FuncName.c_str(), MemStream);
-    Ctx->loader = nullptr; // Don't let ir_free touch the shared loader.
-    ir_free(Ctx);
-    ::operator delete(Ctx);
-
-    if (!Ret) {
-      spdlog::warn("tier2-batch: ir_emit_llvm failed for {}", E.FuncName);
-      continue;
-    }
-    EmittedIdx.push_back(i);
-  }
-
-  fclose(MemStream);
-
-  if (EmittedIdx.empty()) {
-    free(Buf);
-    return Unexpect(ErrCode::Value::RuntimeError);
-  }
-
-  std::string IRText(Buf, BufSize);
-  free(Buf);
-
-  // 1b. Rewrite intra-batch indirect calls to direct calls (Phase 2).
-  // Build a map of offset -> funcName for batch members.
-  std::unordered_map<uint64_t, std::string> OffsetToName;
-  for (size_t idx : EmittedIdx) {
-    auto &E = Entries[idx];
-    uint64_t Offset = static_cast<uint64_t>(E.FuncIdx) * sizeof(void *);
-    OffsetToName[Offset] = E.FuncName;
-  }
-  rewriteIntraBatchCalls(IRText, OffsetToName);
-
-  // RC3: strip the tier-up counter prologue from every function in the batch.
-  if (!std::getenv("WASMEDGE_TIER2_NO_STRIP"))
-    stripTierUpPrologue(IRText);
-
-  if (std::getenv("WASMEDGE_TIER2_DUMP_IR")) {
-    std::string DumpPath = "/tmp/tier2_batch_" +
-                           Entries[EmittedIdx[0]].FuncName + ".ll";
-    if (FILE *F = fopen(DumpPath.c_str(), "w")) {
-      fwrite(IRText.data(), 1, IRText.size(), F);
-      fclose(F);
-      spdlog::info("tier2-batch: wrote batch LLVM IR to {}", DumpPath);
+  // Derive import func count from the full module.
+  uint32_t ImportFuncNum = 0;
+  for (const auto &ImpDesc : Mod.getImportSection().getContent()) {
+    if (ImpDesc.getExternalType() == ExternalType::Function) {
+      ++ImportFuncNum;
     }
   }
 
-  // Experimental: WASMEDGE_TIER2_LOAD_IR=<dir> lets us replace the emitted
-  // batch IR with a hand-edited file from that directory, keyed by the first
-  // function's name. Used for RC2 (register-ABI) experiments.
-  if (const char *LoadDir = std::getenv("WASMEDGE_TIER2_LOAD_IR")) {
-    std::string LoadPath = std::string(LoadDir) + "/tier2_batch_" +
-                           Entries[EmittedIdx[0]].FuncName + ".ll";
-    if (FILE *F = fopen(LoadPath.c_str(), "r")) {
-      fseek(F, 0, SEEK_END);
-      long Sz = ftell(F);
-      fseek(F, 0, SEEK_SET);
-      std::string Override(static_cast<size_t>(Sz), '\0');
-      size_t Got = fread(Override.data(), 1, static_cast<size_t>(Sz), F);
-      fclose(F);
-      if (Got == static_cast<size_t>(Sz)) {
-        IRText = std::move(Override);
-        spdlog::info("tier2-batch: LOADED override IR for {} from {}",
-                     Entries[EmittedIdx[0]].FuncName, LoadPath);
-      }
-    }
+  std::unordered_set<uint32_t> BatchSet;
+  BatchSet.reserve(BatchIdx.size());
+  for (uint32_t F : BatchIdx) {
+    BatchSet.insert(F);
   }
 
-  // 2. Parse into one LLVM module.
-  LLVMOrcThreadSafeContextRef TSCtx = LLVMOrcCreateNewThreadSafeContext();
-  LLVMContextRef LLCtx = LLVMOrcThreadSafeContextGetContext(TSCtx);
-
-  LLVMMemoryBufferRef MemBuf = LLVMCreateMemoryBufferWithMemoryRangeCopy(
-      IRText.data(), IRText.size(), "tier2_batch_ir");
-
-  LLVMModuleRef Mod = nullptr;
-  char *ErrMsg = nullptr;
-  if (LLVMParseIRInContext(LLCtx, MemBuf, &Mod, &ErrMsg)) {
-    spdlog::error("tier2-batch: LLVMParseIRInContext failed: {}",
-                  ErrMsg ? ErrMsg : "(null)");
-    LLVMDisposeMessage(ErrMsg);
-    LLVMOrcDisposeThreadSafeContext(TSCtx);
-    return Unexpect(ErrCode::Value::RuntimeError);
-  }
-
-  // 2a. Set target triple and data layout.
-  if (P->TM) {
-    LLVMSetTarget(Mod, P->Triple);
-    auto *DL = LLVMCreateTargetDataLayout(P->TM);
-    LLVMSetModuleDataLayout(Mod, DL);
-    LLVMDisposeTargetData(DL);
-  }
-
-  // 2b. Verify.
-  {
-    char *VerifyMsg = nullptr;
-    if (LLVMVerifyModule(Mod, LLVMReturnStatusAction, &VerifyMsg)) {
-      spdlog::warn("tier2-batch: LLVM verification failed: {}",
-                    VerifyMsg ? VerifyMsg : "(null)");
-      LLVMDisposeMessage(VerifyMsg);
-      LLVMDisposeModule(Mod);
-      LLVMOrcDisposeThreadSafeContext(TSCtx);
-      return Unexpect(ErrCode::Value::RuntimeError);
-    }
-    LLVMDisposeMessage(VerifyMsg);
-  }
+  AST::Module Mini = synthesizeMiniModule(Mod, BatchSet, ImportFuncNum);
 
   if (isShutdown()) {
-    LLVMDisposeModule(Mod);
-    LLVMOrcDisposeThreadSafeContext(TSCtx);
-    return Unexpect(ErrCode::Value::RuntimeError);
+    return Result;
   }
 
-  // 3. Optimize.
-  {
-    char PassStr[32];
-    std::snprintf(PassStr, sizeof(PassStr), "default<O%u>",
-                  OptLevel > 3 ? 3u : OptLevel);
+  // Build a Configure tuned for tier-2 JIT: gas / instr counting / cost
+  // measuring off so the runtime ExecCtx nullables stay safe, and the
+  // WasmEdge LLVM frontend doesn't emit interrupt-check code.
+  //
+  // IMPORTANT: force O0 for the frontend compile. The LLVM opt pipeline
+  // would otherwise inline / DCE the constant-return bodies we use as
+  // stubs for non-batch defined functions *before* we get a chance to
+  // rewrite those bodies into t1_thunks. Callers would then hold onto a
+  // folded constant instead of the real cross-tier bridge. We run our
+  // own opt pipeline after post-processing.
+  Configure Conf;
+  Conf.getCompilerConfigure().setOptimizationLevel(
+      CompilerConfigure::OptimizationLevel::O0);
+  Conf.getCompilerConfigure().setInterruptible(false);
+  Conf.getCompilerConfigure().setGenericBinary(false);
+  Conf.getStatisticsConfigure().setInstructionCounting(false);
+  Conf.getStatisticsConfigure().setCostMeasuring(false);
+  Conf.getStatisticsConfigure().setTimeMeasuring(false);
 
+  LLVM::Compiler LC(Conf);
+  auto CompRes = LC.compile(Mini);
+  if (!CompRes) {
+    spdlog::warn("tier2: LLVM frontend compile failed (head func {})",
+                 BatchIdx.front());
+    return Result;
+  }
+
+  LLVMModuleRef LLMod = CompRes->getModuleRef();
+  LLVMContextRef LLCtx = CompRes->getContextRef();
+  if (!LLMod || !LLCtx) {
+    spdlog::error("tier2: compiled Data has no LLVM module/context");
+    return Result;
+  }
+
+  for (uint32_t FuncIdx : BatchIdx) {
+    const auto &FT = getFuncType(Mod, FuncIdx, ImportFuncNum);
+    emitFwdThunk(LLMod, LLCtx, FuncIdx, FT);
+  }
+
+  // Replace the stub body of every non-batch defined function that is
+  // referenced by a batch body with a tier-2 → tier-1 dispatch thunk.
+  // This is what makes cross-batch calls safe: without this pass the
+  // batch would execute a `[const, end]` stub and silently drop the
+  // call, corrupting the caller's logical state.
+  const auto NonBatchCallees =
+      collectNonBatchCallees(Mod, BatchSet, ImportFuncNum);
+  for (uint32_t CalleeIdx : NonBatchCallees) {
+    const auto &FT = getFuncType(Mod, CalleeIdx, ImportFuncNum);
+    emitT1ThunkInPlace(LLMod, LLCtx, CalleeIdx, FT);
+  }
+  if (!NonBatchCallees.empty()) {
+    spdlog::debug("tier2: rewrote {} non-batch stubs as t1_thunks",
+                  NonBatchCallees.size());
+  }
+
+  // Run LLVM opt on the post-processed module now that all thunks and
+  // stub rewrites are in place. The WasmEdge frontend was invoked at O0,
+  // so call sites to non-batch stubs (now t1_thunks) are still intact.
+  // Opt here is free to inline t1_thunks where profitable.
+  if (P->TM && OptLevel > 0) {
+    const char *Pipeline = OptLevel >= 3 ? "default<O3>"
+                            : OptLevel == 2 ? "default<O2>"
+                                             : "default<O1>";
     LLVMPassBuilderOptionsRef PBO = LLVMCreatePassBuilderOptions();
-    LLVMPassBuilderOptionsSetLoopVectorization(PBO, 1);
-    LLVMPassBuilderOptionsSetSLPVectorization(PBO, 1);
-    if (auto Err = LLVMRunPasses(Mod, PassStr, P->TM, PBO)) {
-      auto Msg = LLVMGetErrorMessage(Err);
-      spdlog::warn("tier2-batch: LLVMRunPasses warning: {}", Msg);
+    if (LLVMErrorRef Err = LLVMRunPasses(LLMod, Pipeline, P->TM, PBO)) {
+      char *Msg = LLVMGetErrorMessage(Err);
+      spdlog::warn("tier2: post-opt pipeline failed: {}",
+                   Msg ? Msg : "(null)");
       LLVMDisposeErrorMessage(Msg);
     }
     LLVMDisposePassBuilderOptions(PBO);
   }
 
-  if (isShutdown()) {
-    LLVMDisposeModule(Mod);
-    LLVMOrcDisposeThreadSafeContext(TSCtx);
-    return Unexpect(ErrCode::Value::RuntimeError);
-  }
-
-  // 4. Create LLJIT, add module, look up all functions.
-  LLVMOrcLLJITRef J = nullptr;
-  if (auto Err = LLVMOrcCreateLLJIT(&J, nullptr)) {
-    auto Msg = LLVMGetErrorMessage(Err);
-    spdlog::error("tier2-batch: LLVMOrcCreateLLJIT failed: {}", Msg);
-    LLVMDisposeErrorMessage(Msg);
-    LLVMDisposeModule(Mod);
-    LLVMOrcDisposeThreadSafeContext(TSCtx);
-    return Unexpect(ErrCode::Value::RuntimeError);
-  }
-
-  registerSymbolsWithLLJIT(J);
-
-  {
-    LLVMOrcThreadSafeModuleRef TSMod =
-        LLVMOrcCreateNewThreadSafeModule(Mod, TSCtx);
-    auto MainJD = LLVMOrcLLJITGetMainJITDylib(J);
-    if (auto Err = LLVMOrcLLJITAddLLVMIRModule(J, MainJD, TSMod)) {
-      auto Msg = LLVMGetErrorMessage(Err);
-      spdlog::error("tier2-batch: addLLVMIRModule failed: {}", Msg);
-      LLVMDisposeErrorMessage(Msg);
-      LLVMOrcDisposeThreadSafeModule(TSMod);
-      LLVMOrcDisposeThreadSafeContext(TSCtx);
-      LLVMOrcDisposeLLJIT(J);
-      return Unexpect(ErrCode::Value::RuntimeError);
+  if (const char *DumpDir = ::getenv("WASMEDGE_TIER2_DUMP_IR")) {
+    std::string Path = std::string(DumpDir);
+    if (!Path.empty() && Path.back() != '/') {
+      Path.push_back('/');
+    }
+    Path += "tier2_f" + std::to_string(BatchIdx.front()) + ".ll";
+    char *Err = nullptr;
+    if (LLVMPrintModuleToFile(LLMod, Path.c_str(), &Err)) {
+      spdlog::warn("tier2: dump module to {} failed: {}", Path,
+                   Err ? Err : "(null)");
+      LLVMDisposeMessage(Err);
+    } else {
+      spdlog::info("tier2: dumped module to {}", Path);
     }
   }
 
-  if (isShutdown()) {
-    LLVMOrcDisposeThreadSafeContext(TSCtx);
-    LLVMOrcDisposeLLJIT(J);
-    return Unexpect(ErrCode::Value::RuntimeError);
+  // Take ownership of the module + its thread-safe context, then hand
+  // them to a fresh ORC LLJIT.
+  LLVMModuleRef OwnedMod = CompRes->releaseModule();
+  LLVMOrcThreadSafeContextRef TSCtx = CompRes->releaseTSContext();
+  if (!OwnedMod || !TSCtx) {
+    spdlog::error("tier2: failed to release module/TSContext");
+    if (OwnedMod)
+      LLVMDisposeModule(OwnedMod);
+    if (TSCtx)
+      LLVMOrcDisposeThreadSafeContext(TSCtx);
+    return Result;
   }
 
-  // 5. Look up each function by name.
-  std::vector<std::pair<uint32_t, void *>> Results;
-  for (size_t idx : EmittedIdx) {
-    auto &E = Entries[idx];
-    LLVMOrcJITTargetAddress FuncAddr = 0;
-    if (auto Err = LLVMOrcLLJITLookup(J, &FuncAddr, E.FuncName.c_str())) {
-      auto Msg = LLVMGetErrorMessage(Err);
-      spdlog::warn("tier2-batch: lookup failed for {}: {}", E.FuncName, Msg);
+  LLVMOrcLLJITBuilderRef Builder = LLVMOrcCreateLLJITBuilder();
+  LLVMOrcLLJITRef JIT = nullptr;
+  if (LLVMErrorRef Err = LLVMOrcCreateLLJIT(&JIT, Builder)) {
+    char *Msg = LLVMGetErrorMessage(Err);
+    spdlog::error("tier2: LLVMOrcCreateLLJIT failed: {}",
+                  Msg ? Msg : "(null)");
+    LLVMDisposeErrorMessage(Msg);
+    LLVMDisposeModule(OwnedMod);
+    LLVMOrcDisposeThreadSafeContext(TSCtx);
+    return Result;
+  }
+
+  LLVMOrcJITDylibRef MainJD = LLVMOrcLLJITGetMainJITDylib(JIT);
+  LLVMOrcExecutionSessionRef ES = LLVMOrcLLJITGetExecutionSession(JIT);
+
+  // Define the two tier-2 helpers as absolute symbols:
+  //   - wasmedge_tier2_get_exec_ctx: returns &Executor::ExecutionContext,
+  //     used by fwd_thunks to build a valid ExecCtxPtrTy when tier-1
+  //     dispatches into tier-2 code via the FuncTable.
+  //   - wasmedge_tier2_get_jit_env:  returns the thread-local JitExecEnv*
+  //     set by IRJitEngine::invoke, used by t1_thunks to dispatch tier-2
+  //     → tier-1 calls via FuncTable[idx] with the tier-1 ABI.
+  {
+    LLVMOrcCSymbolMapPair Pairs[3];
+    Pairs[0].Name =
+        LLVMOrcExecutionSessionIntern(ES, "wasmedge_tier2_get_exec_ctx");
+    Pairs[0].Sym.Address = reinterpret_cast<LLVMOrcJITTargetAddress>(
+        reinterpret_cast<void *>(
+            &Executor::Executor::getThreadLocalExecutionContextPtr));
+    Pairs[0].Sym.Flags.GenericFlags =
+        LLVMJITSymbolGenericFlagsExported | LLVMJITSymbolGenericFlagsCallable;
+    Pairs[0].Sym.Flags.TargetFlags = 0;
+
+    Pairs[1].Name =
+        LLVMOrcExecutionSessionIntern(ES, "wasmedge_tier2_get_jit_env");
+    Pairs[1].Sym.Address = reinterpret_cast<LLVMOrcJITTargetAddress>(
+        reinterpret_cast<void *>(&wasmedge_tier2_get_jit_env));
+    Pairs[1].Sym.Flags.GenericFlags =
+        LLVMJITSymbolGenericFlagsExported | LLVMJITSymbolGenericFlagsCallable;
+    Pairs[1].Sym.Flags.TargetFlags = 0;
+
+    Pairs[2].Name =
+        LLVMOrcExecutionSessionIntern(ES, "wasmedge_tier2_trace_thunk");
+    Pairs[2].Sym.Address = reinterpret_cast<LLVMOrcJITTargetAddress>(
+        reinterpret_cast<void *>(&wasmedge_tier2_trace_thunk));
+    Pairs[2].Sym.Flags.GenericFlags =
+        LLVMJITSymbolGenericFlagsExported | LLVMJITSymbolGenericFlagsCallable;
+    Pairs[2].Sym.Flags.TargetFlags = 0;
+
+    LLVMOrcMaterializationUnitRef MU = LLVMOrcAbsoluteSymbols(Pairs, 3);
+    if (LLVMErrorRef Err = LLVMOrcJITDylibDefine(MainJD, MU)) {
+      char *Msg = LLVMGetErrorMessage(Err);
+      spdlog::error("tier2: define absolute symbols failed: {}",
+                    Msg ? Msg : "(null)");
+      LLVMDisposeErrorMessage(Msg);
+      LLVMOrcDisposeLLJIT(JIT);
+      LLVMDisposeModule(OwnedMod);
+      LLVMOrcDisposeThreadSafeContext(TSCtx);
+      return Result;
+    }
+  }
+
+  // Hand the module to ORC. addLLVMIRModule takes ownership of the
+  // ThreadSafeModule (which shares ownership of TSCtx). We still own our
+  // TSCtx handle and dispose it at the end.
+  LLVMOrcThreadSafeModuleRef TSM =
+      LLVMOrcCreateNewThreadSafeModule(OwnedMod, TSCtx);
+  OwnedMod = nullptr; // TSM owns the module now.
+  if (LLVMErrorRef Err = LLVMOrcLLJITAddLLVMIRModule(JIT, MainJD, TSM)) {
+    char *Msg = LLVMGetErrorMessage(Err);
+    spdlog::error("tier2: addLLVMIRModule failed: {}", Msg ? Msg : "(null)");
+    LLVMDisposeErrorMessage(Msg);
+    LLVMOrcDisposeLLJIT(JIT);
+    LLVMOrcDisposeThreadSafeContext(TSCtx);
+    return Result;
+  }
+
+  // Look up `intrinsics` global and install &Executor::Intrinsics. The
+  // LLVM frontend emits `intrinsics` as a mutable external global (see
+  // lib/llvm/compiler.cpp:5981 — set null initializer, globalConstant=false).
+  // At runtime the loader writes the real intrinsics table address into
+  // the global's storage. Tier-2 must do the same.
+  {
+    LLVMOrcJITTargetAddress Addr = 0;
+    if (LLVMErrorRef Err = LLVMOrcLLJITLookup(JIT, &Addr, "intrinsics")) {
+      char *Msg = LLVMGetErrorMessage(Err);
+      spdlog::error("tier2: lookup `intrinsics` failed: {}",
+                    Msg ? Msg : "(null)");
+      LLVMDisposeErrorMessage(Msg);
+      LLVMOrcDisposeLLJIT(JIT);
+      LLVMOrcDisposeThreadSafeContext(TSCtx);
+      return Result;
+    }
+    auto **Slot = reinterpret_cast<const Executable::IntrinsicsTable **>(
+        static_cast<uintptr_t>(Addr));
+    *Slot = &Executor::Executor::Intrinsics;
+  }
+
+  // Look up each batch fwd_thunk address for atomic FuncTable swap.
+  Result.reserve(BatchIdx.size());
+  for (uint32_t FuncIdx : BatchIdx) {
+    const std::string ThunkName =
+        "f" + std::to_string(FuncIdx) + "_fwd_thunk";
+    LLVMOrcJITTargetAddress Addr = 0;
+    if (LLVMErrorRef Err =
+            LLVMOrcLLJITLookup(JIT, &Addr, ThunkName.c_str())) {
+      char *Msg = LLVMGetErrorMessage(Err);
+      spdlog::warn("tier2: lookup {} failed: {}", ThunkName,
+                   Msg ? Msg : "(null)");
       LLVMDisposeErrorMessage(Msg);
       continue;
     }
-    if (FuncAddr) {
-      Results.emplace_back(E.FuncIdx, reinterpret_cast<void *>(FuncAddr));
-      spdlog::info("tier2-batch: compiled {} → {:#x}", E.FuncName,
-                   static_cast<uintptr_t>(FuncAddr));
-    }
+    Result.emplace_back(FuncIdx,
+                        reinterpret_cast<void *>(static_cast<uintptr_t>(Addr)));
   }
 
-  // Intentionally leak J and TSCtx — compiled code lives in LLJIT's memory.
+  // Retain the JIT for the lifetime of this Tier2Compiler — the code
+  // returned to the FuncTable swap lives inside it.
+  P->JITs.push_back(JIT);
+  LLVMOrcDisposeThreadSafeContext(TSCtx);
 
-  if (Results.empty())
-    return Unexpect(ErrCode::Value::RuntimeError);
-
-  return Results;
+  spdlog::info("tier2: step-5 ORC done for func {} (emitted {} thunks)",
+               BatchIdx.front(), Result.size());
+  return Result;
 }
 
 } // namespace WasmEdge::VM

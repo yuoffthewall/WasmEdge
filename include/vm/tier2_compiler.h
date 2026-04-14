@@ -8,14 +8,16 @@
 //===----------------------------------------------------------------------===//
 ///
 /// \file
-/// Tier-2 compiler: takes pre-emitted LLVM IR text (generated from the
-/// dstogov/ir graph before tier-1 compilation), optimizes with LLVM,
-/// and produces native code via ORC LLJIT.
+/// Tier-2 compiler: takes a batch of hot function indices and the parent
+/// AST::Module, synthesizes a mini AST::Module, feeds it through
+/// WasmEdge::LLVM::Compiler to get an llvm::Module, patches in ABI thunks,
+/// and ORC-JITs it. Returns (funcIdx, tier1-ABI entry pointer) pairs.
 ///
 //===----------------------------------------------------------------------===//
 #pragma once
 
 #include "common/errcode.h"
+#include "common/span.h"
 
 #if defined(WASMEDGE_BUILD_IR_JIT) && defined(WASMEDGE_USE_LLVM)
 
@@ -23,23 +25,18 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <string>
 #include <utility>
 #include <vector>
 
-namespace WasmEdge::VM {
+namespace WasmEdge {
+namespace AST {
+class Module;
+} // namespace AST
+namespace VM {
 
-/// Result of tier-2 compilation.
-struct Tier2CompileResult {
-  void *NativeFunc = nullptr; // Pointer to LLVM-compiled native code
-  size_t CodeSize = 0;        // Approximate code size
-};
-
-/// Tier-2 compiler: serialized IR text → LLVM IR → optimized native code.
-///
-/// Holds an ORC LLJIT instance that persists for the lifetime of the compiler,
-/// accumulating compiled functions. Each compile() call adds a new function
-/// to the JIT and returns a callable pointer.
+/// Tier-2 compiler. One instance is owned by the background Tier2Manager
+/// worker. Each compileBatch() call produces a fresh ORC LLJIT containing
+/// the compiled batch.
 class Tier2Compiler {
 public:
   Tier2Compiler() noexcept;
@@ -48,42 +45,26 @@ public:
   Tier2Compiler(const Tier2Compiler &) = delete;
   Tier2Compiler &operator=(const Tier2Compiler &) = delete;
 
-  /// Set a shutdown flag. If non-null, compile() checks it at key points
-  /// and bails out early if set, avoiding long-running LLVM codegen calls.
-  void setShutdownFlag(std::atomic<bool> *Flag) noexcept { ShutdownFlag_ = Flag; }
+  /// Set a shutdown flag. If non-null, compileBatch() checks it at key
+  /// points and bails out early if set, avoiding long-running LLVM codegen.
+  void setShutdownFlag(std::atomic<bool> *Flag) noexcept {
+    ShutdownFlag_ = Flag;
+  }
 
-  /// Entry in a batch compilation request.
-  struct BatchEntry {
-    uint32_t FuncIdx;
-    std::string IRText;
-    std::string FuncName;
-    uint8_t RetType;
-  };
-
-  /// Compile a single function from its serialized dstogov/ir text.
-  /// The text is loaded into a fresh ir_ctx, converted to LLVM IR via
-  /// ir_emit_llvm, then optimized and compiled to native code.
-  /// \param IRText    Serialized IR text (from ir_save before tier-1 compile).
-  /// \param FuncName  Name for the compiled function (e.g. "wasm_tier2_042").
-  /// \param RetType   ir_type of return value (from tier-1 ir_ctx->ret_type).
-  /// \param OptLevel  LLVM optimization level (0-3), default 2.
-  /// \returns Native function pointer on success.
-  Expect<Tier2CompileResult> compile(const std::string &IRText,
-                                     const std::string &FuncName,
-                                     uint8_t RetType,
-                                     unsigned OptLevel = 2);
-
-  /// Compile a batch of functions into a single LLVM module, enabling
-  /// cross-function inlining. Returns (funcIdx, nativePtr) pairs.
-  /// \param Entries   Functions to compile together.
-  /// \param OptLevel  LLVM optimization level (0-3), default 2.
+  /// Compile a batch of hot functions by synthesizing a mini AST::Module
+  /// from \p Mod that contains only the batch bodies (non-batch defined
+  /// functions get `unreachable` stubs to preserve funcIdx space), feeding
+  /// it through WasmEdge::LLVM::Compiler, and ORC-JITing the result.
+  ///
+  /// \param BatchIdx  Module-wide function indices to promote (imports are
+  ///                  not valid inputs here). First entry is the hot head.
+  /// \param Mod       Full parsed AST::Module. Kept alive by the manager.
+  /// \param OptLevel  LLVM optimization level (0-3).
+  /// \returns A vector of (funcIdx, tier1-ABI entry pointer) pairs suitable
+  ///          for atomic FuncTable swap.
   Expect<std::vector<std::pair<uint32_t, void *>>>
-  compileBatch(std::vector<BatchEntry> &Entries, unsigned OptLevel = 2);
-
-  /// Extract callee funcIdx values from a function's serialized IR text.
-  /// Used by the batch assembly logic to identify call targets.
-  static std::vector<uint32_t> getCallees(const std::string &IRText,
-                                          uint8_t RetType);
+  compileBatch(Span<const uint32_t> BatchIdx, const AST::Module &Mod,
+               unsigned OptLevel = 2);
 
 private:
   bool isShutdown() const noexcept {
@@ -95,6 +76,7 @@ private:
   std::atomic<bool> *ShutdownFlag_ = nullptr;
 };
 
-} // namespace WasmEdge::VM
+} // namespace VM
+} // namespace WasmEdge
 
 #endif // WASMEDGE_BUILD_IR_JIT && WASMEDGE_USE_LLVM

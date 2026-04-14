@@ -543,47 +543,14 @@ extern "C" void jit_tier_up_notify(WasmEdge::VM::JitExecEnv *env,
                 funcIdx, counterVal);
 
 #if defined(WASMEDGE_USE_LLVM)
-  // Enqueue for tier-2 LLVM recompilation. Copy the IRText now so the
-  // background worker never accesses the ModuleInstance (which may be
-  // destroyed before the worker processes the request).
-  if (g_jitModInst && env->FuncTable) {
-    auto Funcs = g_jitModInst->getFunctionInstances();
-    if (funcIdx < Funcs.size()) {
-      const auto *FuncInst = Funcs[funcIdx];
-      if (FuncInst && FuncInst->isIRJitFunction()) {
-        const auto &JitFunc = FuncInst->getIRJitFunc();
-        if (!JitFunc.IRText.empty()) {
-          // Pass the shared FuncTable so the tier-2 worker keeps it alive
-          // even if the Executor/Cache is destroyed before processing.
-          auto FT = g_jitExecutor->getJitFuncTable(g_jitModInst);
-          if (FT) {
-            // Build a shared snapshot of all module functions' IR data so
-            // the background worker can pull callees into a batch without
-            // touching the ModuleInstance.
-            static std::shared_ptr<WasmEdge::VM::Tier2Manager::ModuleFuncMap>
-                CachedModFuncs;
-            static const void *CachedModInst = nullptr;
-            if (CachedModInst != g_jitModInst) {
-              auto Map = std::make_shared<
-                  WasmEdge::VM::Tier2Manager::ModuleFuncMap>();
-              for (uint32_t i = 0; i < Funcs.size(); ++i) {
-                const auto *Fi = Funcs[i];
-                if (Fi && Fi->isIRJitFunction()) {
-                  const auto &Jf = Fi->getIRJitFunc();
-                  if (!Jf.IRText.empty()) {
-                    Map->emplace(i, std::make_pair(Jf.IRText, Jf.RetType));
-                  }
-                }
-              }
-              CachedModFuncs = std::move(Map);
-              CachedModInst = g_jitModInst;
-            }
-            getTier2Manager()->enqueue(funcIdx, JitFunc.IRText,
-                                       JitFunc.RetType, std::move(FT),
-                                       CachedModFuncs);
-          }
-        }
-      }
+  // Enqueue for tier-2 LLVM recompilation. The background worker walks
+  // the preserved AST::Module to build a per-batch synthetic mini-module
+  // and lowers it through WasmEdge::LLVM::Compiler.
+  if (g_jitModInst && g_jitExecutor && env->FuncTable) {
+    auto FT = g_jitExecutor->getJitFuncTable(g_jitModInst);
+    auto Mod = g_jitExecutor->getJitFullModule(g_jitModInst);
+    if (FT && Mod) {
+      getTier2Manager()->enqueue(funcIdx, std::move(Mod), std::move(FT));
     }
   }
 #endif
@@ -603,9 +570,13 @@ Expect<void> Executor::jitCallFunction(
   // (e.g. WASI) get the correct CallingFrame and can access the caller's
   // memory.  runFunction uses nullptr here, which breaks host functions
   // that need memory access when called from JIT code.
+  // Arity is set to the callee's return count so the matching popFrame
+  // below preserves the values the callee leaves on the ValueStack.
+  const uint32_t RetsN = static_cast<uint32_t>(
+      Func.getFuncType().getReturnTypes().size());
   StackMgr.pushFrame(
       const_cast<Runtime::Instance::ModuleInstance *>(CallerMod),
-      AST::InstrView::iterator(), 0, 0);
+      AST::InstrView::iterator(), 0, RetsN);
 
   const auto &PTypes = Func.getFuncType().getParamTypes();
   for (uint32_t I = 0; I < Params.size(); I++) {
@@ -625,7 +596,12 @@ Expect<void> Executor::jitCallFunction(
             return execute(StackMgr, StartIt, Func.getInstrs().end());
           });
 
-  if (!Res && likely(Res.error() == ErrCode::Value::Terminated)) {
+  if (Res) {
+    // Pop the dummy frame so tier-2 callers' later popFrame lands on the
+    // correct frame. Arity=RetsN keeps the callee's returns on the stack
+    // for jit_host_call to consume.
+    StackMgr.popFrame();
+  } else if (likely(Res.error() == ErrCode::Value::Terminated)) {
     // When called from JIT (jit_host_call), the stack still has the JIT
     // caller's frame. reset() would wipe it and cause a segfault when
     // returning to the JIT. Only undo what we pushed: host frame + dummy frame.
@@ -1075,6 +1051,15 @@ Executor::enterFunction(Runtime::StackManager &StackMgr,
     uint32_t DispSize = static_cast<uint32_t>(Cache.Table0Dispatch.size());
     uint32_t *CallCounters =
         Cache.CallCounters.empty() ? nullptr : Cache.CallCounters.data();
+    // Install the thread-local Executor state (This/CurrentStack/
+    // ExecutionContext) that the WasmEdge LLVM frontend's intrinsics
+    // expect when tier-2 code calls into helpers like memory.grow,
+    // proxyCall, etc. This also lets tier-2 fwd_thunks resolve
+    // `wasmedge_tier2_get_exec_ctx` to a live context that indirects
+    // through the module instance's memory/global pointer arrays.
+    // RAII scope below covers the entire IR JIT invocation.
+    SavedThreadLocal SavedTL(*this, StackMgr, Func);
+
     auto Res = IREngine.invoke(Func.getIRJitNativeFunc(), FuncType, Args, Rets,
                                FuncTable, FuncTableSize, GlobalBase,
                                MemoryBase, MemSizeBytes,

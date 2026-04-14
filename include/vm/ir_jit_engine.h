@@ -164,10 +164,8 @@ class IRJitEngine {
 public:
   /// Compilation result
   struct CompileResult {
-    void *NativeFunc;     // Pointer to generated native code
-    size_t CodeSize;      // Size of generated code in bytes
-    std::string IRText;   // Serialized IR text for potential tier-up
-    uint8_t RetType;      // ir_type of return value (for tier-2 ret_type)
+    void *NativeFunc; // Pointer to generated native code
+    size_t CodeSize;  // Size of generated code in bytes
   };
 
   IRJitEngine() noexcept;

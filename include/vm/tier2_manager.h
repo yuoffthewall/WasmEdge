@@ -24,12 +24,12 @@
 #include <mutex>
 #include <queue>
 #include <set>
-#include <string>
 #include <thread>
-#include <unordered_map>
-#include <utility>
 
 namespace WasmEdge {
+namespace AST {
+class Module;
+} // namespace AST
 namespace VM {
 
 class Tier2Manager {
@@ -44,22 +44,17 @@ public:
   /// before _exit(0) to give the worker a chance to check Shutdown_.
   void shutdown() noexcept;
 
-  /// Map of funcIdx -> (IRText, RetType) for all module functions.
-  /// Built once per module, shared across tier-up requests.
-  using ModuleFuncMap =
-      std::unordered_map<uint32_t, std::pair<std::string, uint8_t>>;
-
   /// Enqueue a function for tier-2 recompilation.
   /// Called from jit_tier_up_notify (JIT code context).
-  /// \param FuncIdx    Module function index.
-  /// \param IRText     Serialized IR text for the function.
-  /// \param RetType    ir_type of the function's return value.
-  /// \param FuncTable  Shared pointer to the FuncTable array (for live code swap).
-  /// \param ModFuncs   Shared snapshot of all module functions' IR data (for
-  ///                   callee-pulling batch compilation).
-  void enqueue(uint32_t FuncIdx, std::string IRText, uint8_t RetType,
-               std::shared_ptr<void *[]> FuncTable,
-               std::shared_ptr<ModuleFuncMap> ModFuncs) noexcept;
+  /// \param FuncIdx    Module function index (total space: imports + defined).
+  /// \param Mod        Shared pointer to the full parsed AST::Module. The
+  ///                   tier-2 worker walks this to build per-batch synthetic
+  ///                   mini-modules and feeds them to WasmEdge::LLVM::Compiler.
+  /// \param FuncTable  Shared pointer to the FuncTable array (for live code
+  ///                   swap). Kept alive by the worker via shared_ptr.
+  void enqueue(uint32_t FuncIdx,
+               std::shared_ptr<const AST::Module> Mod,
+               std::shared_ptr<void *[]> FuncTable) noexcept;
 
   /// Number of functions successfully recompiled to tier-2.
   uint32_t tier2Count() const noexcept {
@@ -69,10 +64,8 @@ public:
 private:
   struct Request {
     uint32_t FuncIdx;
-    std::string IRText;
-    uint8_t RetType;
+    std::shared_ptr<const AST::Module> Mod;
     std::shared_ptr<void *[]> FuncTable;
-    std::shared_ptr<ModuleFuncMap> ModFuncs;
   };
 
   void workerLoop();

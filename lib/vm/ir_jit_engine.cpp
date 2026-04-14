@@ -23,6 +23,19 @@ extern "C" {
 
 namespace {
 static thread_local jmp_buf g_termination_buf;
+// Thread-local current JitExecEnv*, set by IRJitEngine::invoke before
+// dispatching into tier-1 JIT code. Tier-2 code reads it via the helper
+// `wasmedge_tier2_get_jit_env` when its t1_thunks need to dispatch back
+// into tier-1 via FuncTable[idx] — the tier-1 calling convention needs
+// the JitExecEnv* as arg0, which is not otherwise available to tier-2.
+static thread_local WasmEdge::VM::JitExecEnv *g_tier2_current_env = nullptr;
+} // namespace
+
+extern "C" void *wasmedge_tier2_get_jit_env(void) {
+  return g_tier2_current_env;
+}
+
+namespace {
 
 /// SIGSEGV guard for ir_jit_compile: the IR library can segfault on certain
 /// complex IR patterns (e.g. nested loops with many PHIs). We install a
@@ -151,29 +164,6 @@ IRJitEngine::compile(ir_ctx *Ctx) {
     if (f) { ir_save(Ctx, 0, f); fclose(f); }
   }
 
-  // Snapshot IR text and ret_type BEFORE ir_jit_compile (which mutates the context).
-  // Tier-2 reloads this text into a fresh ir_ctx for LLVM emission.
-  // Only serialize when tier-2 is enabled — ir_save is expensive for large functions.
-  uint8_t RetType = Ctx->ret_type;
-  std::string IRText;
-  static const bool Tier2Enabled = [] {
-    const char *E = std::getenv("WASMEDGE_TIER2_ENABLE");
-    return E && E[0] == '1' && E[1] == '\0';
-  }();
-  if (Tier2Enabled) {
-    char *buf = nullptr;
-    size_t len = 0;
-    FILE *memf = open_memstream(&buf, &len);
-    if (memf) {
-      ir_save(Ctx, 0, memf);
-      fclose(memf);
-      if (buf && len > 0) {
-        IRText.assign(buf, len);
-      }
-      free(buf);
-    }
-  }
-
   size_t CodeSize = 0;
   void *NativeCode = ir_jit_compile(Ctx, opt_level, &CodeSize);
 
@@ -202,8 +192,6 @@ IRJitEngine::compile(ir_ctx *Ctx) {
   CompileResult Result;
   Result.NativeFunc = NativeCode;
   Result.CodeSize = CodeSize;
-  Result.IRText = std::move(IRText);
-  Result.RetType = RetType;
 
   return Result;
 }
@@ -247,6 +235,17 @@ Expect<void> IRJitEngine::invoke(void *NativeFunc,
   for (size_t i = 0; i < ParamTypes.size(); ++i)
     ArgsBuffer_[i] = valVariantToRaw(Args[i], ParamTypes[i]);
   uint64_t *ArgsData = ArgsBuffer_.empty() ? nullptr : ArgsBuffer_.data();
+
+  // Publish the current env to the per-thread slot so tier-2 t1_thunks can
+  // dispatch tier-2 → tier-1 calls via FuncTable[idx], which require a
+  // JitExecEnv* as arg0 that is not otherwise reachable from tier-2 code.
+  // Save/restore for re-entrancy (e.g. a host callback re-enters invoke).
+  WasmEdge::VM::JitExecEnv *SavedTlsEnv = g_tier2_current_env;
+  g_tier2_current_env = &Env;
+  struct TlsRestore {
+    WasmEdge::VM::JitExecEnv *Prev;
+    ~TlsRestore() { g_tier2_current_env = Prev; }
+  } TlsRestore_{SavedTlsEnv};
 
   void *termBuf = wasmedge_ir_jit_get_termination_buf();
   if (termBuf) {

@@ -361,11 +361,9 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
           FuncIdx++;
           continue;
         }
-        // Upgrade function to IR JIT.
-        // Pass serialized IR text for potential tier-2 LLVM recompilation.
-        FuncInst->upgradeToIRJit(CompRes->NativeFunc, CompRes->CodeSize,
-                                 std::move(CompRes->IRText),
-                                 CompRes->RetType);
+        // Upgrade function to IR JIT. Tier-2 uses the preserved AST::Module
+        // from IRJitEnvCache (stashed below) rather than per-function IR text.
+        FuncInst->upgradeToIRJit(CompRes->NativeFunc, CompRes->CodeSize);
         SuccessCount++;
       }
       CodeIdx++;
@@ -373,9 +371,18 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
     }
     spdlog::info("IR JIT stats: init_fail={}, build_fail={}, compile_fail={}",
                  InitFailCount, BuildFailCount, CompileFailCount);
-    
-    spdlog::info("IR JIT: Compiled {}/{} functions successfully", 
+
+    spdlog::info("IR JIT: Compiled {}/{} functions successfully",
                  SuccessCount, FuncIdx - ImportFuncNum);
+
+    // Preserve the full AST::Module for tier-2 recompilation through the
+    // WasmEdge LLVM frontend. The background tier-2 worker walks this to
+    // build per-batch synthetic mini-modules. Only stash if tier-2 is
+    // enabled to avoid the copy cost in tier-1-only runs.
+    if (Tier2Threshold > 0) {
+      IRJitEnvCache_[ModInst.get()].FullModule =
+          std::make_shared<const AST::Module>(Mod);
+    }
   }
 #endif
   (void)Conf; // Suppress unused warning when IR JIT disabled
