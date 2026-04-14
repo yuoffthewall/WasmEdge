@@ -3036,7 +3036,7 @@ Expect<void> WasmToIRBuilder::visitCall(const AST::Instruction &Instr) {
     }
 
     // Check if we can use inline fast path (table 0 + canonical type ID)
-    bool UseInlineFastPath = (TableIdx == 0 &&
+    bool UseInlineFastPath = (false && TableIdx == 0 &&
                               TypeIdx < CanonicalTypeIds.size() &&
                               CanonicalTypeIds[TypeIdx] != 0);
 

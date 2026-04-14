@@ -8,8 +8,6 @@
 #include "vm/tier2_compiler.h"
 #include <fmt/format.h>
 #include <spdlog/spdlog.h>
-#include <pthread.h>
-#include <sched.h>
 
 namespace WasmEdge::VM {
 
@@ -50,14 +48,6 @@ void Tier2Manager::enqueue(uint32_t FuncIdx, std::string IRText,
 }
 
 void Tier2Manager::workerLoop() {
-  // Lower background thread priority so LLVM compilation doesn't steal CPU
-  // from the main execution thread.
-  {
-    struct sched_param Param = {};
-    Param.sched_priority = 0;
-    pthread_setschedparam(pthread_self(), SCHED_IDLE, &Param);
-  }
-
   Tier2Compiler Compiler;
   Compiler.setShutdownFlag(&Shutdown_);
 
