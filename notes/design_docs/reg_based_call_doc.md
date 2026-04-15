@@ -4,11 +4,11 @@
 
 The WasmEdge IR JIT uses the **dstogov/ir** library to compile Wasm functions
 to native x86-64 machine code.  This document describes the calling convention
-evolution: from buffer-based, to register-based, and the final decision to
-revert to buffer-based after performance analysis showed register-based hurts
-more than it helps.
+evolution: from buffer-based, to register-based, and the decision to keep
+buffer-based as the default after benchmarking showed register-based is
+execution-neutral with unpredictable per-kernel variance from LSRA sensitivity.
 
-### Buffer-based (current)
+### Buffer-based (current default)
 
 Every JIT-compiled function has the uniform signature:
 
@@ -21,11 +21,11 @@ callee loads them with `ir_LOAD` from buffer offsets.  Direct JIT-to-JIT calls
 use inline `ir_CALL_N` with a 2-param proto; host calls and `call_indirect`
 go through their respective C trampolines.
 
-### Register-based (attempted, reverted)
+### Register-based (implemented, disabled)
 
-Each JIT-compiled function declared its Wasm parameters as individual
-`ir_PARAM` nodes with native IR types.  The IR library assigned SysV ABI
-registers automatically.  Direct JIT-to-JIT calls used `ir_CALL_N` with a
+Each JIT-compiled function declares its Wasm parameters as individual
+`ir_PARAM` nodes with native IR types.  The IR library assigns SysV ABI
+registers automatically.  Direct JIT-to-JIT calls use `ir_CALL_N` with a
 typed `ir_proto`, passing arguments directly in registers.
 
 ```
@@ -33,7 +33,7 @@ ret func(JitExecEnv *env, arg0, arg1, ...)
          ^^^ rdi           ^^^ rsi/xmm0, rdx/xmm1, ...
 ```
 
-**Why it was reverted:** see "Performance Analysis" section below.
+**Why it is disabled:** see "Performance Analysis" section below.
 
 ### Hybrid threshold mechanism (in code, threshold = 0)
 
@@ -302,230 +302,197 @@ l_N = RETURN(l_12, d_13);
 
 ---
 
-## Performance Analysis: Why Register-Based Calling Hurts
+## Performance Analysis
 
-Benchmarked all Sightglass kernels at O2, 3-run medians, comparing:
-- **BEFORE**: commit 8ead9c32 (pre-reg-call, all buffer-based)
-- **AllBuf**: current code with `kRegCallMaxParams = 0` (all buffer)
-- **Hybrid**: current code with `kRegCallMaxParams = 3`
+Benchmarked all Sightglass kernels at O2, 3-run medians:
+- **ir_jit**: baseline (buffer-based, `kRegCallMaxParams = 0`)
+- **reg_call**: register-based (`kRegCallMaxParams = 100`)
+- Excluded: spidermonkey, tinygo, rust-compression (crashes on reg_call),
+  richards (no output), shootout-ackermann (high variance)
 
-### Results (selected kernels, WorkTime µs)
+### Aggregate
 
-| Kernel | BEFORE | AllBuf | Hybrid | AllBuf% | Hybrid% |
-|---|---|---|---|---|---|
-| shootout-ackermann | 657 | **526** | 632 | **-19.9%** | -3.7% |
-| shootout-sieve | 176K | **139K** | 172K | **-21.2%** | -2.1% |
-| shootout-fib2 | 647K | **574K** | 612K | **-11.3%** | -5.4% |
-| hashset | 30K | 30K | **27K** | -2.1% | **-11.5%** |
-| richards | 23.2M | 25.9M | 28.7M | +11.7% | +23.6% |
-| ratelimit | 174K | 194K | 210K | +11.9% | +20.9% |
-| blake3 | 60 | 61 | 102 | +1.7% | +69.9% |
+| Metric | ir_jit (µs) | reg_call (µs) | Speedup |
+|--------|-------------|---------------|---------|
+| Exec   | 9,194,428   | 9,183,915     | 1.00×   |
+| Total (compile+exec) | 12,849,494 | 12,000,130 | 1.07× |
 
-AllBuf wins overall: 9 improved, 13 neutral, 11 regressed vs BEFORE.
-Hybrid is strictly worse than AllBuf on most kernels.
+Execution time is flat in aggregate. The 7% total-time improvement is
+driven by compile-time reductions.
 
-### Root cause: `ir_PARAM` liveness pins callee-saved registers
+### Per-kernel exec results
 
-The IR LSRA assigns each `ir_PARAM` to a **callee-saved register** (rbx,
-rbp, r12–r15) and holds it for the param's full live range. x86-64 has
-6 callee-saved GPRs total.
+**Exec improvements (reg_call faster):**
 
-**Buffer-based** — `func(env, args_buf)`:
+| Kernel | ir_jit (µs) | reg_call (µs) | Speedup |
+|--------|-------------|---------------|---------|
+| shootout-ed25519 | 1,731,933 | 1,485,257 | 1.17× |
+| blind-sig | 46,552 | 41,537 | 1.12× |
+| shootout-ctype | 140,291 | 132,839 | 1.06× |
+
+**Exec regressions (reg_call slower):**
+
+| Kernel | ir_jit (µs) | reg_call (µs) | Ratio |
+|--------|-------------|---------------|-------|
+| shootout-sieve | 140,237 | 173,047 | 0.81× |
+| rust-html-rewriter | 10,398 | 12,753 | 0.82× |
+| hashset | 29,157 | 34,811 | 0.84× |
+| shootout-ratelimit | 173,164 | 201,139 | 0.86× |
+| shootout-minicsv | 1,179,992 | 1,341,543 | 0.88× |
+| shootout-fib2 | 561,523 | 594,979 | 0.94× |
+
+Regressions are consistent across all 3 runs (not noise).
+
+**Compile-time improvements:**
+
+| Kernel | ir_jit (µs) | reg_call (µs) | Speedup |
+|--------|-------------|---------------|---------|
+| hashset | 1,018,675 | 246,490 | 4.13× |
+| shootout-ed25519 | 143,376 | 98,651 | 1.45× |
+
+The 7% total-time win is almost entirely from hashset's 4.13× compile-time
+reduction (772 ms saved). Without hashset the total speedup is ~1.01×.
+
+### What register-based calling changes in the IR graph
+
+Register-based calling modifies the IR graph in two ways:
+
+**1. Fewer IR nodes per call site.** Buffer-based emits N `ir_STORE` +
+N `ir_ADD_A` + 1 `ir_CALL_2` per direct JIT call. Register-based emits
+1 `ir_CALL_(N+1)`. This explains the compile-time improvements: fewer
+nodes → faster register allocation and optimization.
+
+**2. Different SSA numbering.** SSA numbers are assigned sequentially as
+nodes are emitted. Fewer nodes at call sites shift all subsequent SSA
+numbers. The LSRA processes live intervals in start-point order (SSA
+number), so a small shift propagates through the entire function, changing
+which intervals compete for which registers at each allocation step.
+
+### How `ir_PARAM` interacts with the register allocator
+
+The IR library's register allocator (`ir_emit.c:ir_get_param_reg`,
+`ir_x86.dasc:1667`) assigns each `ir_PARAM` node a **fixed physical
+register constraint** — the SysV ABI register it arrives in (RDI, RSI,
+RDX, RCX, R8, R9 for integer params; XMM0–XMM7 for FP). The LSRA must
+keep that ABI register reserved from function entry until the value is
+copied to its allocated register:
+
+```c
+case IR_PARAM:
+    constraints->def_reg = ir_get_param_reg(ctx, ref);  // e.g., RSI
+    // ...
+    // Fixed live range blocks the ABI register from start to def_pos:
+    ir_add_fixed_live_range(ctx, reg, start, def_pos);
 ```
-env  = ir_PARAM("exec_env", 1)  →  rbx  (live entire function)
-buf  = ir_PARAM("args", 2)      →  rbp  (dies after prologue loads)
-p0   = ir_LOAD(buf + 0)         →  regular IR value
-p1   = ir_LOAD(buf + 8)         →  regular IR value
-// buf is dead → rbp freed → 5 callee-saved regs available for body
-```
 
-The buffer pointer `args` dies immediately after the last parameter load.
-Its callee-saved register is released. The loaded parameters are fresh IR
-values — the allocator assigns registers based on actual liveness (callee-
-saved if needed across calls, caller-saved if short-lived).
+`ir_LOAD` values from the buffer have **no fixed-register constraint** —
+the LSRA can target the load directly into any register (including
+callee-saved).
 
-**Register-based** — `func(env, p0, p1, p2)`:
-```
-env = ir_PARAM("exec_env", 1)  →  rbx  (live entire function)
-p0  = ir_PARAM("p0", 2)        →  rbp  (live until last use of p0)
-p1  = ir_PARAM("p1", 3)        →  r12  (live until last use of p1)
-p2  = ir_PARAM("p2", 4)        →  r13  (live until last use of p2)
-// 2 callee-saved regs available for body
-```
+If a param lives across a call, the LSRA moves it to a callee-saved
+register in both cases. But `ir_PARAM` additionally blocks the ABI
+register during the copy window, and these extra fixed-range constraints
+interact with the LSRA's allocation decisions for all other intervals.
 
-Each `ir_PARAM` IS the value used throughout the function. Wasm params are
-typically live for the entire function (loop counters, base addresses), so
-they pin callee-saved registers permanently.
+### The direct savings are modest
 
-### Why callee-saved registers matter
+Per direct JIT call with N args, register-based eliminates:
+- **Caller:** N `ir_STORE` instructions (marshal args into buffer)
+- **Callee prologue:** N `ir_LOAD` instructions (read args from buffer)
 
-In a function with N call sites, **callee-saved registers survive every
-call for free**. Values in caller-saved registers must be spilled before
-and reloaded after each call. The loop-invariant values from `JitExecEnv`
-— `FuncTablePtr`, `MemoryBase`, `GlobalBasePtr` — are used at every memory
-access and call site.
+It replaces them with register-to-register moves (value → ABI reg at
+caller + ABI reg → allocated reg at callee). Register moves are ~1 cycle;
+L1 loads/stores are 1–4 cycles. For a call with 3 args: savings of
+~6–18 cycles per call — negligible relative to overall function execution.
 
-Buffer-based with 0 wasm params uses 1 callee-saved (env), leaving 5 for:
-```
-FuncTablePtr → r12 (survives all N calls)
-MemoryBase   → r13 (survives all N calls)
-GlobalBasePtr→ r14 (survives all N calls)
-// + 2 more for hot locals
-```
+### `call_indirect` does not benefit
 
-Register-based with 3 wasm params uses 4 callee-saved, leaving only 2:
-```
-FuncTablePtr → r14 (survives all N calls)
-MemoryBase   → r15 (survives all N calls)
-GlobalBasePtr→ spill to stack, reload at every use after a call
-```
+`call_indirect` always goes through the `jit_call_indirect` C trampoline
+(buffer-based). Even with `kRegCallMaxParams = 100`:
 
-For ratelimit func 043 (95 call sites, 5128 IR lines): losing 1 callee-
-saved register = 95 extra reload pairs per evicted value.
+1. Caller stores args to `SharedCallArgs` buffer (same cost)
+2. Calls `jit_call_indirect(env, tableIdx, elemIdx, typeIdx, args, retCode)`
+3. Trampoline does Wasm type-check, then calls `irJitInvokeNative`
+4. `irJitInvokeNative` dispatches through the autogenerated switch cascade
+   (~21K paths) to call the function with the correct register signature
 
-### The cost asymmetry
+The buffer-based path (`irJitInvokeNativeBuffer`) is simpler: a single
+`reinterpret_cast` and call.  So `call_indirect` to JIT targets is
+**strictly more expensive** with register-based targets due to the
+autogenerated dispatcher overhead.
 
-- **Buffer overhead**: 2 instructions per parameter per call (store at
-  caller + load in callee prologue). Paid once.
-- **Lost callee-saved register**: 2 instructions (spill + reload) per
-  call site per evicted loop-invariant value. Paid N times.
+### Why specific kernels regress
 
-Even for functions with 1 wasm param, the buffer pointer dies early and
-frees a callee-saved register that can save N reloads. The one-time buffer
-marshalling cost is trivially amortized.
+The dominant effect is **LSRA sensitivity to SSA numbering**, not
+callee-saved register pressure per se. Evidence:
+
+**shootout-sieve (−19%):** The hot function `__original_main` has **0
+wasm params** (type `() → i32`). With `kRegCallMaxParams = 0`, `0 ≤ 0`
+→ register-based path. With `kRegCallMaxParams = 100`, same. The callee
+prologue is identical on both branches. The only structural difference is
+at the `memset` call site: buffer-based emits 3 `ir_STORE` + `ir_CALL_2`,
+register-based emits `ir_CALL_4`. This ~6-node SSA shift propagates to the
+inner sieve loop (8193 iterations × 17000 outer iterations), where the LSRA
+makes different allocation decisions for loop-invariant values like
+`MemoryBase`. Since the inner loop has no function calls, callee-saved vs
+caller-saved is irrelevant — but the LSRA's heuristic register choices
+(which register for which value) change due to the shifted processing order.
+
+**shootout-fib2 (−6%):** Recursive with 1 param. The two recursive call
+sites emit different IR structure, shifting SSA numbering for all
+subsequent nodes in the function.
+
+**shootout-ed25519 (+17%):** 1402 direct calls, minimal `call_indirect`
+(3). The LSRA perturbation from the restructured IR graph happens to
+produce better allocation for the large computation functions in this
+module. The same mechanism that causes regressions in other kernels
+produces improvements here — it is not predictable from the calling
+convention alone.
+
+### LSRA sensitivity to SSA ordering
+
+The dstogov/ir LSRA is a standard linear-scan allocator that processes
+live intervals sorted by start point. When two intervals compete for the
+same physical register, the one processed first (earlier SSA number) gets
+priority. Small changes in SSA numbering — from adding or removing a few
+IR nodes — can flip specific allocation decisions:
+
+- A loop-invariant value that got a callee-saved register may instead spill
+- Two values may swap register assignments, changing move/shuffle code at
+  call sites
+- The order in which intervals are evicted changes
+
+This sensitivity is a well-known property of linear-scan allocators.
+Graph-coloring allocators have similar issues with node ordering. The
+effect is that any IR graph restructuring — regardless of whether it is
+"better" structurally — introduces allocation noise that can dominate
+small signals like eliminated buffer marshalling.
+
+The prologue emission order also exploits this sensitivity: in the current
+code, wasm param loads are emitted *before* env field loads. This gives
+wasm params earlier SSA numbers and higher LSRA priority for callee-saved
+registers, which benefits recursive/call-heavy functions where params must
+survive across calls. This ordering was validated by isolated benchmarks
+(fib2 −12%, ackermann −9% improvement over the reverse order).
 
 ### Conclusion
 
-Register-based calling is a net loss with the current IR LSRA because
-`ir_PARAM` values monopolize callee-saved registers. Buffer-based calling
-gives the allocator more freedom by separating the parameter-passing
-mechanism (short-lived buffer pointer) from the parameter values (regular
-IR values with independent liveness). The hybrid threshold mechanism is
-retained in code for future use if the IR register allocator gains better
-`ir_PARAM` liveness splitting.
+Register-based calling is execution-neutral in aggregate (1.00×). The
+direct savings from eliminating buffer marshalling are small (~6–18 cycles
+per call with 3 args). These savings are drowned out by LSRA allocation
+noise from the changed IR graph structure, which produces unpredictable
+per-kernel variance (±19%). The 7% total-time improvement is almost
+entirely from compile-time reduction (fewer IR nodes → faster RA), not
+execution improvement.
 
----
+The threshold mechanism is retained in code for future use. Two paths to
+realizing the register-based benefit:
 
-## Prologue Reorder and Per-Branch Marshalling
-
-The AllBuf configuration outperformed BEFORE on recursive/call-heavy
-kernels (ackermann -18%, fib2 -13%, sieve -20%), despite both using
-identical buffer-based calling convention (`kRegCallMaxParams = 0`).
-Investigation isolated two structural IR changes that explain the full
-speedup. Both operate through the same mechanism: they alter SSA definition
-order, which changes how the IR LSRA assigns callee-saved registers.
-
-### Change 1: Prologue reorder (params before env fields)
-
-The `initialize()` prologue emits IR nodes for function parameters and
-`JitExecEnv` fields. The emission order determines SSA numbering, which
-determines LSRA priority for callee-saved registers.
-
-**Before** — env fields first, then params:
-```
-d_2  = PARAM("exec_env", 1)
-d_3  = PARAM("args", 2)
-d_4  = LOAD(env + 0x00)      ← FuncTablePtr     SSA #4
-d_6  = LOAD(env + 0x08)      ← GlobalBasePtr     SSA #6
-d_8  = LOAD(env + 0x10)      ← MemoryBase        SSA #8
-d_9  = LOAD(args[0])          ← wasm param 0      SSA #9
-d_11 = LOAD(args[1])          ← wasm param 1      SSA #11
-```
-
-**After** — params first, then env fields:
-```
-d_2  = PARAM("exec_env", 1)
-d_3  = PARAM("args", 2)
-d_4  = LOAD(args[0])          ← wasm param 0      SSA #4
-d_6  = LOAD(args[1])          ← wasm param 1      SSA #6
-d_8  = LOAD(args[2])          ← wasm param 2      SSA #8
-d_9  = LOAD(env + 0x00)      ← FuncTablePtr      SSA #9
-d_11 = LOAD(env + 0x08)      ← GlobalBasePtr      SSA #11
-```
-
-LSRA processes live intervals in start-point order. Values with earlier
-SSA numbers and long live ranges get first pick of callee-saved registers.
-In the "before" layout, env fields (FuncTablePtr, MemoryBase) consume
-callee-saved registers first, potentially pushing wasm params into caller-
-saved registers. In the "after" layout, wasm params get priority.
-
-**Why it matters for recursive functions:** When wasm params are in caller-
-saved registers, they must be spilled to stack before every CALL and
-reloaded after. Ackermann(3,12) makes ~500K recursive calls. With 2-3
-params each requiring a store+load pair per call (~2-4 cycles from L1
-cache), this adds millions of extra memory operations.
-
-**Isolated benchmark (prologue reorder only):** fib2 -12%, ackermann -9%.
-Does not help sieve.
-
-### Change 2: Per-branch arg marshalling
-
-The `visitCallOrCallIndirect()` method marshals wasm arguments into the
-`SharedCallArgs` buffer before each call instruction. The original code
-performed marshalling at the top of the method (before the host/indirect/
-direct dispatch), while the changed code moves marshalling into each
-dispatch branch.
-
-For direct JIT-to-JIT calls this changes the SSA emission order at each
-call site:
-
-**Before** — stores first, then FuncPtr load:
-```
-STORE(buf[0], arg0)             ← SSA #A   (marshal first)
-STORE(buf[1], arg1)             ← SSA #A+2
-FuncPtr = LOAD(FuncTable[idx])  ← SSA #A+4 (late)
-CALL(FuncPtr, env, buf)
-```
-
-**After** — FuncPtr load first, then stores:
-```
-FuncPtr = LOAD(FuncTable[idx])  ← SSA #A   (early)
-STORE(buf[0], arg0)             ← SSA #A+2
-STORE(buf[1], arg1)             ← SSA #A+4
-CALL(FuncPtr, env, buf)
-```
-
-This reorders SSA numbers at every call site, shifting subsequent node
-numbers throughout the function. For functions with multiple call sites
-(ackermann has 2, sieve has calls in a tight loop), these shifts compound
-and change LSRA eviction decisions for values live across the loop back-
-edge and across calls.
-
-**Isolated benchmark (per-branch marshalling only, without prologue
-reorder):** Not tested alone — identified after the combined test showed
-the prologue reorder was insufficient for ackermann and sieve.
-
-### Combined benchmark (all 33 kernels, 3 runs each, O2)
-
-| Kernel | Baseline (us) | Changed (us) | Change |
-|---|---|---|---|
-| shootout-sieve | 171.4K | **137.3K** | **-19.9%** |
-| shootout-ackermann | 649.5 | **545.0** | **-16.1%** |
-| shootout-fib2 | 641.7K | **556.0K** | **-13.3%** |
-| 28 other kernels | | | -3% to +3% (neutral) |
-
-3 faster, 28 neutral, 2 noise-level slower (sub-millisecond kernels).
-
-### Why only recursive/call-heavy kernels are affected
-
-1. **CALL instructions are the trigger.** Callee-saved vs caller-saved
-   only matters at call boundaries where caller-saved registers are
-   clobbered.
-2. **The calls must be in hot paths.** Prologue setup runs once, but
-   spill/reload at calls runs per-invocation.
-3. **Register pressure must be near the 6-register threshold.** If a
-   function uses <=6 long-lived values, all fit in callee-saved registers
-   regardless of order. When it uses 7+, emission order determines which
-   value gets evicted.
-
-### Additional cleanup
-
-- **`DirectOrHostFn` load removed.** Dead since commit c63e38f7 (inline
-  direct calls). Was consuming an IR node and a register slot in the
-  prologue.
-- **Type-specific loads.** Prologue now uses `ir_LOAD_I32`/`ir_LOAD_I64`/
-  `ir_LOAD_F`/`ir_LOAD_D` instead of generic `ir_LOAD(irType, ...)`,
-  matching the buffer-based calling convention path.
+1. **Improve the IR LSRA** to be less sensitive to SSA ordering (e.g.,
+   priority-based allocation, better heuristic tie-breaking).
+2. **Combine with other optimizations** (e.g., inlined `call_indirect`
+   hot path) that reduce the relative weight of call overhead, making the
+   buffer savings more visible.
 
 ---
 
@@ -533,7 +500,7 @@ the prologue reorder was insufficient for ackermann and sieve.
 
 1. **`kRegCallMaxParams = 0`:** Register-based calling is fully implemented
    but disabled. The threshold can be raised if the IR LSRA gains better
-   param liveness management.
+   stability with respect to SSA ordering perturbations.
 
 2. **Arity > 6 for `irJitInvokeNative`:** The register-based host-to-JIT
    entry aborts for functions with >6 Wasm parameters. Not an issue with
@@ -544,13 +511,11 @@ the prologue reorder was insufficient for ackermann and sieve.
    Multi-value returns would require struct-return ABI or additional
    convention.
 
-4. **`DirectOrHostFn` in JitExecEnv:** Field still exists in the struct but
-   the prologue load was removed (dead since c63e38f7 inline direct calls).
-   The struct field itself is retained for ABI stability.
-
-5. **Remaining O2 crash:** `rust-compression` crashes at O2 only (passes at
-   O0 and O1). Root cause is a wasm memory corruption cascade from an
-   O2-compiled function. See `notes/regalloc_bug.md` Remaining Issue #2.
+4. **`DirectOrHostFn` in JitExecEnv:** Field still exists in the struct and
+   the prologue still loads it (`ir_builder.cpp:247`), but it is unused
+   since commit c63e38f7 (inline direct calls). The struct field is retained
+   for ABI stability; the prologue load should be removed (it wastes an IR
+   node, though O2 DCE may eliminate it).
 
 ---
 
@@ -571,3 +536,12 @@ calling convention:
 3. **Register allocator split logic** (`3b173e3`): upstream 2f1f018
    introduced orphaned child intervals and deferred spills in
    `ir_allocate_blocked_reg()`. Reverted to the original split/spill logic.
+
+### Note on benchmark confounding
+
+The `reg_call` branch includes bug fix `7873c3b` (duplicate-arg
+spill-reload) in `thirdparty/ir`, which the `ir_jit` baseline does not.
+While this fix targets a rare case (same variable as two operands of a
+single CALL), its presence changes RA code paths. Ideally the benchmark
+should be re-run with identical `thirdparty/ir` on both branches to fully
+isolate the calling convention effect.

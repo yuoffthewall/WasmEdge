@@ -11,6 +11,12 @@ if(WASMEDGE_BUILD_IR_JIT)
     ir_jit_engine.cpp
     canonical_type_registry.cpp
   )
+  if(WASMEDGE_USE_LLVM)
+    list(APPEND WASMEDGE_VM_SOURCES
+      tier2_compiler.cpp
+      tier2_manager.cpp
+    )
+  endif()
 endif()
 
 wasmedge_add_library(wasmedgeVM
@@ -29,6 +35,7 @@ target_link_libraries(wasmedgeVM
 )
 
 if(WASMEDGE_USE_LLVM)
+  find_package(LLVM REQUIRED HINTS "${LLVM_CMAKE_PATH}" "${LLVM_DIR}")
   target_compile_definitions(wasmedgeVM
     PUBLIC
     -DWASMEDGE_USE_LLVM
@@ -36,6 +43,10 @@ if(WASMEDGE_USE_LLVM)
   target_link_libraries(wasmedgeVM
     PUBLIC
     wasmedgeLLVM
+  )
+  target_include_directories(wasmedgeVM
+    SYSTEM PRIVATE
+    ${LLVM_INCLUDE_DIR}
   )
 endif()
 

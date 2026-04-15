@@ -23,6 +23,19 @@ extern "C" {
 
 namespace {
 static thread_local jmp_buf g_termination_buf;
+// Thread-local current JitExecEnv*, set by IRJitEngine::invoke before
+// dispatching into tier-1 JIT code. Tier-2 code reads it via the helper
+// `wasmedge_tier2_get_jit_env` when its t1_thunks need to dispatch back
+// into tier-1 via FuncTable[idx] — the tier-1 calling convention needs
+// the JitExecEnv* as arg0, which is not otherwise available to tier-2.
+static thread_local WasmEdge::VM::JitExecEnv *g_tier2_current_env = nullptr;
+} // namespace
+
+extern "C" void *wasmedge_tier2_get_jit_env(void) {
+  return g_tier2_current_env;
+}
+
+namespace {
 
 /// SIGSEGV guard for ir_jit_compile: the IR library can segfault on certain
 /// complex IR patterns (e.g. nested loops with many PHIs). We install a
@@ -152,8 +165,6 @@ IRJitEngine::compile(ir_ctx *Ctx) {
   }
 
   size_t CodeSize = 0;
-  // void *NativeCode = safeIrJitCompile(Ctx, opt_level, &CodeSize);
-  // Not using Signal Handler for now to expose the failure.
   void *NativeCode = ir_jit_compile(Ctx, opt_level, &CodeSize);
 
   if (!NativeCode) {
@@ -181,7 +192,6 @@ IRJitEngine::compile(ir_ctx *Ctx) {
   CompileResult Result;
   Result.NativeFunc = NativeCode;
   Result.CodeSize = CodeSize;
-  Result.IRGraph = Ctx; // Preserve for potential tier-up
 
   return Result;
 }
@@ -194,7 +204,8 @@ Expect<void> IRJitEngine::invoke(void *NativeFunc,
                                   void *GlobalBase,
                                   void *MemoryBase, uint64_t MemorySize,
                                   DispatchEntry *Table0Dispatch,
-                                  uint32_t Table0DispatchSize) {
+                                  uint32_t Table0DispatchSize,
+                                  uint32_t *CallCounters) {
   if (!NativeFunc) {
     return Unexpect(ErrCode::Value::RuntimeError);
   }
@@ -217,11 +228,24 @@ Expect<void> IRJitEngine::invoke(void *NativeFunc,
   Env.Table0Dispatch = Table0Dispatch;
   Env.Table0DispatchSize = Table0DispatchSize;
   Env._pad2 = 0;
+  Env.CallCounters = CallCounters;
+  Env.TierUpNotifyFn = reinterpret_cast<void *>(&jit_tier_up_notify);
 
   ArgsBuffer_.resize(ParamTypes.size());
   for (size_t i = 0; i < ParamTypes.size(); ++i)
     ArgsBuffer_[i] = valVariantToRaw(Args[i], ParamTypes[i]);
   uint64_t *ArgsData = ArgsBuffer_.empty() ? nullptr : ArgsBuffer_.data();
+
+  // Publish the current env to the per-thread slot so tier-2 t1_thunks can
+  // dispatch tier-2 → tier-1 calls via FuncTable[idx], which require a
+  // JitExecEnv* as arg0 that is not otherwise reachable from tier-2 code.
+  // Save/restore for re-entrancy (e.g. a host callback re-enters invoke).
+  WasmEdge::VM::JitExecEnv *SavedTlsEnv = g_tier2_current_env;
+  g_tier2_current_env = &Env;
+  struct TlsRestore {
+    WasmEdge::VM::JitExecEnv *Prev;
+    ~TlsRestore() { g_tier2_current_env = Prev; }
+  } TlsRestore_{SavedTlsEnv};
 
   void *termBuf = wasmedge_ir_jit_get_termination_buf();
   if (termBuf) {
@@ -282,11 +306,6 @@ void IRJitEngine::release(void *NativeFunc, size_t) noexcept {
   }
 }
 
-void IRJitEngine::releaseIRGraph(ir_ctx *Ctx) noexcept {
-  if (Ctx) {
-    ir_free(Ctx);
-  }
-}
 
 void *IRJitEngine::allocateExecutable(size_t Size) {
   // Allocate memory with read-write permissions initially (W^X compliant)

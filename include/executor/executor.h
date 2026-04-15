@@ -200,6 +200,26 @@ public:
   /// Getter of Configure
   const Configure &getConfigure() const { return Conf; }
 
+#ifdef WASMEDGE_BUILD_IR_JIT
+  /// Get shared FuncTable for tier-2 background compilation.
+  std::shared_ptr<void *[]> getJitFuncTable(
+      const Runtime::Instance::ModuleInstance *ModInst) const {
+    auto It = IRJitEnvCache_.find(ModInst);
+    if (It != IRJitEnvCache_.end())
+      return It->second.FuncTable;
+    return nullptr;
+  }
+
+  /// Get preserved full AST::Module for tier-2 background compilation.
+  std::shared_ptr<const AST::Module> getJitFullModule(
+      const Runtime::Instance::ModuleInstance *ModInst) const {
+    auto It = IRJitEnvCache_.find(ModInst);
+    if (It != IRJitEnvCache_.end())
+      return It->second.FullModule;
+    return nullptr;
+  }
+#endif
+
   /// Instantiate a WASM Module into an anonymous module instance.
   Expect<std::unique_ptr<Runtime::Instance::ModuleInstance>>
   instantiateModule(Runtime::StoreManager &StoreMgr, const AST::Module &Mod);
@@ -1141,6 +1161,10 @@ public:
   /// Proxy helper template struct
   template <typename FuncPtr> struct ProxyHelper;
 
+  /// Return &ExecutionContext for the current thread. Consumed by tier-2
+  /// fwd_thunks via the `wasmedge_tier2_get_exec_ctx` ORC absolute symbol.
+  static void *getThreadLocalExecutionContextPtr() noexcept;
+
 private:
   /// Execution context for compiled functions.
   struct ExecutionContextStruct {
@@ -1206,10 +1230,21 @@ private:
 #ifdef WASMEDGE_BUILD_IR_JIT
   /// Per-module cache for JIT env (FuncTable, GlobalBase, MemoryBase).
   struct IRJitEnvCache {
-    std::vector<void *> FuncTable;
+    /// FuncTable is shared_ptr so the tier-2 background worker can safely
+    /// write to it even if the Executor/Cache is destroyed first.
+    std::shared_ptr<void *[]> FuncTable;
+    uint32_t FuncTableSize = 0;
     std::vector<ValVariant *> GlobalPtrs;
     void *MemoryBase = nullptr;
     std::vector<VM::DispatchEntry> Table0Dispatch;
+    /// Tier-2 profiling: per-function call counters.
+    std::vector<uint32_t> CallCounters;
+    /// Tier-2 state: 0=tier1, 1=enqueued, 2=tier2.
+    std::vector<uint8_t> TierState;
+    /// Full AST::Module preserved for tier-2 recompilation through the
+    /// WasmEdge LLVM frontend. Populated at instantiation time; kept alive
+    /// for the module's lifetime so late tier-ups can still see it.
+    std::shared_ptr<const AST::Module> FullModule;
   };
   mutable std::unordered_map<const Runtime::Instance::ModuleInstance *,
                              IRJitEnvCache>

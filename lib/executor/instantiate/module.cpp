@@ -180,6 +180,24 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
         ImportFuncNum++;
       }
     }
+    // Tier-2: read tier-up thresholds from env vars.
+    uint32_t Tier2Threshold = 0;
+    uint32_t Tier2LoopThreshold = 0;
+    if (const char *E = std::getenv("WASMEDGE_TIER2_ENABLE")) {
+      if (E[0] == '1' && E[1] == '\0') {
+        Tier2Threshold = 10000;
+        Tier2LoopThreshold = 1000;
+        if (const char *T = std::getenv("WASMEDGE_TIER2_THRESHOLD")) {
+          Tier2Threshold = static_cast<uint32_t>(std::atoi(T));
+        }
+        if (const char *T = std::getenv("WASMEDGE_TIER2_LOOP_THRESHOLD")) {
+          Tier2LoopThreshold = static_cast<uint32_t>(std::atoi(T));
+        }
+        spdlog::debug("IR JIT tier-2 enabled: threshold={}, loop_threshold={}",
+                      Tier2Threshold, Tier2LoopThreshold);
+      }
+    }
+
     const auto &CodeSegs = CodeSec.getContent();
     // ----------------------------------------------------------------
     // Pre-pass: mark wasm functions we skip when IR-JIT-compiling this module.
@@ -267,7 +285,26 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
       {
         // Build IR
         IRBuilder.reset();
-        
+        IRBuilder.setFuncIdx(FuncIdx);
+
+        // Tier-2: set call-counter threshold if tier-2 is enabled.
+        // Pre-scan for loops to choose threshold.
+        if (Tier2Threshold > 0) {
+          bool FuncHasLoop = false;
+          for (const auto &I : InstrVec) {
+            if (I.getOpCode() == OpCode::Loop) {
+              FuncHasLoop = true;
+              break;
+            }
+          }
+          // Instrument all functions: loop functions use a lower threshold
+          // (they benefit from LICM/unrolling), non-loop functions use a
+          // higher threshold (they benefit from cross-function inlining
+          // and indirect→direct call rewriting in tier-2 batches).
+          IRBuilder.setTierUpThreshold(FuncHasLoop ? Tier2LoopThreshold
+                                                   : Tier2Threshold);
+        }
+
         auto InitRes = IRBuilder.initialize(FuncType, Locals);
         if (!InitRes.has_value()) {
           InitFailCount++;
@@ -324,9 +361,9 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
           FuncIdx++;
           continue;
         }
-        // Upgrade function to IR JIT
-        FuncInst->upgradeToIRJit(CompRes->NativeFunc, CompRes->CodeSize,
-                                 nullptr);  // Don't preserve IR graph for now
+        // Upgrade function to IR JIT. Tier-2 uses the preserved AST::Module
+        // from IRJitEnvCache (stashed below) rather than per-function IR text.
+        FuncInst->upgradeToIRJit(CompRes->NativeFunc, CompRes->CodeSize);
         SuccessCount++;
       }
       CodeIdx++;
@@ -334,9 +371,18 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
     }
     spdlog::info("IR JIT stats: init_fail={}, build_fail={}, compile_fail={}",
                  InitFailCount, BuildFailCount, CompileFailCount);
-    
-    spdlog::info("IR JIT: Compiled {}/{} functions successfully", 
+
+    spdlog::info("IR JIT: Compiled {}/{} functions successfully",
                  SuccessCount, FuncIdx - ImportFuncNum);
+
+    // Preserve the full AST::Module for tier-2 recompilation through the
+    // WasmEdge LLVM frontend. The background tier-2 worker walks this to
+    // build per-batch synthetic mini-modules. Only stash if tier-2 is
+    // enabled to avoid the copy cost in tier-1-only runs.
+    if (Tier2Threshold > 0) {
+      IRJitEnvCache_[ModInst.get()].FullModule =
+          std::make_shared<const AST::Module>(Mod);
+    }
   }
 #endif
   (void)Conf; // Suppress unused warning when IR JIT disabled

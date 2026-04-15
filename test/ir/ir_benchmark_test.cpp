@@ -1299,6 +1299,12 @@ TEST_F(IRBenchmarkTest, Benchmark_Quicksort) {
 TEST_F(IRBenchmarkTest, SightglassSuite) {
   auto TestDataPath = getTestDataPath();
   auto SightglassDir = TestDataPath / "sightglass";
+  if (const char *dirEnv = std::getenv("WASMEDGE_SIGHTGLASS_DIR");
+      dirEnv && dirEnv[0] != '\0') {
+    SightglassDir = std::filesystem::path(dirEnv);
+    if (!SightglassDir.is_absolute())
+      SightglassDir = TestDataPath / SightglassDir;
+  }
 
   if (!std::filesystem::exists(SightglassDir) ||
       !std::filesystem::is_directory(SightglassDir)) {
@@ -1438,7 +1444,7 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
 
       WasmEdge::Configure Conf;
       Conf.getCompilerConfigure().setOptimizationLevel(
-          WasmEdge::CompilerConfigure::OptimizationLevel::O3);
+          WasmEdge::CompilerConfigure::OptimizationLevel::O2);
       // Interpreter: ForceInterpreter=true,  EnableJIT=false
       // JIT (LLVM):  ForceInterpreter=false, EnableJIT=true
       // IR_JIT:      ForceInterpreter=false, EnableJIT=false (IR JIT runs in Executor::instantiate)
@@ -1514,7 +1520,7 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
       const char *modeName = "AOT";
       WasmEdge::Configure compileConf;
       compileConf.getCompilerConfigure().setOptimizationLevel(
-          WasmEdge::CompilerConfigure::OptimizationLevel::O3);
+          WasmEdge::CompilerConfigure::OptimizationLevel::O2);
       compileConf.getCompilerConfigure().setOutputFormat(
           WasmEdge::CompilerConfigure::OutputFormat::Native);
       compileConf.getRuntimeConfigure().setForceInterpreter(true);
