@@ -23,11 +23,6 @@
 #include <string>
 #include <vector>
 
-#ifdef WASMEDGE_BUILD_IR_JIT
-// Forward declare IR types
-struct _ir_ctx;
-typedef struct _ir_ctx ir_ctx;
-#endif
 
 namespace WasmEdge {
 namespace Runtime {
@@ -80,10 +75,9 @@ public:
   /// Constructor for IR JIT compiled function.
   FunctionInstance(const ModuleInstance *Mod, const uint32_t TIdx,
                    const AST::FunctionType &Type, void *NativeFunc,
-                   size_t CodeSize, ir_ctx *IRGraph) noexcept
+                   size_t CodeSize) noexcept
       : CompositeBase(Mod, TIdx), FuncType(Type),
-        Data(std::in_place_type_t<IRJitFunction>(), NativeFunc, CodeSize,
-             IRGraph) {
+        Data(std::in_place_type_t<IRJitFunction>(), NativeFunc, CodeSize) {
     assuming(ModInst);
   }
 #endif
@@ -165,11 +159,11 @@ public:
   
   /// Upgrade from WasmFunction to IR JIT compiled function.
   /// Returns true if successful, false if not a WasmFunction.
-  bool upgradeToIRJit(void *NativeFunc, size_t CodeSize, ir_ctx *IRGraph) noexcept {
+  bool upgradeToIRJit(void *NativeFunc, size_t CodeSize) noexcept {
     if (!std::holds_alternative<WasmFunction>(Data)) {
       return false;
     }
-    Data.template emplace<IRJitFunction>(NativeFunc, CodeSize, IRGraph);
+    Data.template emplace<IRJitFunction>(NativeFunc, CodeSize);
     return true;
   }
 #endif
@@ -195,16 +189,11 @@ private:
 
 #ifdef WASMEDGE_BUILD_IR_JIT
   struct IRJitFunction {
-    void *NativeFunc;    // Pointer to JIT compiled code
-    size_t CodeSize;     // Size of compiled code
-    ir_ctx *IRGraph;     // IR graph (preserved for potential tier-up)
+    void *NativeFunc; // Pointer to JIT compiled code
+    size_t CodeSize;  // Size of compiled code
 
-    IRJitFunction(void *Func, size_t Size, ir_ctx *Graph) noexcept
-        : NativeFunc(Func), CodeSize(Size), IRGraph(Graph) {}
-
-    ~IRJitFunction() noexcept {
-      // Cleanup is handled by IRJitEngine
-    }
+    IRJitFunction(void *Func, size_t Size) noexcept
+        : NativeFunc(Func), CodeSize(Size) {}
   };
 #endif
 

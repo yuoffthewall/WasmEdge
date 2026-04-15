@@ -27,11 +27,12 @@ extern "C" {
 namespace WasmEdge {
 namespace VM {
 
-// Helpers for Wasm div_u/rem_u (IR expects U32/U64 operands; stack has I32/I64).
-// JIT code calls these by address so ir_check passes.
 namespace {
+
+// Helpers for Wasm div_u/rem_u (IR expects U32/U64 operands; stack has I32/I64)
+// and copysign. JIT code calls these by address via ir_const_func_addr.
 uint32_t wasm_i32_div_u(uint32_t a, uint32_t b) {
-  return b ? (a / b) : 0;  // Wasm traps on div-by-zero
+  return b ? (a / b) : 0; // Wasm traps on div-by-zero
 }
 uint32_t wasm_i32_rem_u(uint32_t a, uint32_t b) {
   return b ? (a % b) : 0;
@@ -42,12 +43,10 @@ uint64_t wasm_i64_div_u(uint64_t a, uint64_t b) {
 uint64_t wasm_i64_rem_u(uint64_t a, uint64_t b) {
   return b ? (a % b) : 0;
 }
-
-// Wasm f32/f64.copysign: magnitude from first stack operand, sign from second (top).
-static float wasm_f32_copysign(float mag, float sign_src) {
+float wasm_f32_copysign(float mag, float sign_src) {
   return std::copysignf(mag, sign_src);
 }
-static double wasm_f64_copysign(double mag, double sign_src) {
+double wasm_f64_copysign(double mag, double sign_src) {
   return std::copysign(mag, sign_src);
 }
 
@@ -141,6 +140,10 @@ void WasmToIRBuilder::reset() noexcept {
   ModuleGlobalTypes.clear();
   FuncInstrs = Span<const AST::Instruction>();
   CurInstrIdx = 0;
+  // Note: FuncIdx and TierUpThreshold are NOT reset here — they are set
+  // before initialize() and must survive the reset() call inside initialize().
+  CallCountersPtr = 0;
+  TierUpNotifyFnPtr = 0;
 }
 
 Expect<void> WasmToIRBuilder::initialize(
@@ -158,7 +161,7 @@ Expect<void> WasmToIRBuilder::initialize(
     else if (e[0] == '2' && e[1] == '\0')
       ir_opt_level = 2;
   }
-  uint32_t ir_flags = IR_FUNCTION;
+  uint32_t ir_flags = IR_FUNCTION | IR_FASTCALL_FUNC;
   if (ir_opt_level > 0) {
     ir_flags |= IR_OPT_FOLDING | IR_OPT_CFG | IR_OPT_CODEGEN;
     ir_flags |= IR_OPT_MEM2SSA;
@@ -202,7 +205,50 @@ Expect<void> WasmToIRBuilder::initialize(
   EnvPtr = ir_PARAM(IR_ADDR, "exec_env", 1);
   ArgsPtr = ir_PARAM(IR_ADDR, "args", 2);
 
-  // Load wasm parameters from the args buffer BEFORE env fields.
+  // Tier-2 profiling: increment call counter and conditionally notify.
+  // Guard: skip increment+store once counter >= threshold to avoid wrapping
+  // past UINT32_MAX and re-triggering notify every `threshold` calls.
+  // Hot-path after tier-up: load + compare + branch-not-taken (no store).
+  if (TierUpThreshold > 0) {
+    CallCountersPtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, CallCounters))));
+    // counterAddr = CallCounters + FuncIdx * sizeof(uint32_t)
+    ir_ref CounterAddr = ir_ADD_A(CallCountersPtr,
+        ir_CONST_ADDR(static_cast<uintptr_t>(FuncIdx) * sizeof(uint32_t)));
+    ir_ref CounterVal = ir_LOAD_U32(CounterAddr);
+
+    // Only increment and check if counter has not yet reached threshold.
+    ir_ref BelowThreshold = ir_ULT(CounterVal, ir_CONST_U32(TierUpThreshold));
+    ir_ref GuardIf = ir_IF(BelowThreshold);
+    ir_IF_TRUE(GuardIf);
+
+    ir_ref Incremented = ir_ADD_U32(CounterVal, ir_CONST_U32(1));
+    ir_STORE(CounterAddr, Incremented);
+
+    ir_ref Cmp = ir_EQ(Incremented, ir_CONST_U32(TierUpThreshold));
+    ir_ref NotifyIf = ir_IF(Cmp);
+    ir_IF_TRUE(NotifyIf);
+
+    uint8_t NotifyParams[3] = {IR_ADDR, IR_U32, IR_U32};
+    ir_ref NotifyProto = ir_proto(ctx, IR_FASTCALL_FUNC, IR_VOID, 3, NotifyParams);
+    ir_ref NotifyFn = ir_const_func_addr(ctx, (uintptr_t)&jit_tier_up_notify, NotifyProto);
+    ir_CALL_3(IR_VOID, NotifyFn, EnvPtr, ir_CONST_U32(FuncIdx), Incremented);
+
+    ir_ref NotifyEnd = ir_END();
+    ir_IF_FALSE(NotifyIf);
+    ir_ref NoNotifyEnd = ir_END();
+    ir_MERGE_2(NotifyEnd, NoNotifyEnd);
+
+    ir_ref ActiveEnd = ir_END();
+    ir_IF_FALSE(GuardIf);
+    ir_ref SkipEnd = ir_END();
+    ir_MERGE_2(ActiveEnd, SkipEnd);
+  }
+
+  // Load wasm parameters BEFORE env fields but AFTER the tier-up IF/MERGE.
+  // Params get lower SSA numbers than env fields, giving LSRA priority for
+  // callee-saved registers — a significant win on recursive/call-heavy
+  // functions (ackermann -16%, fib2 -13%). Placing them after the MERGE
+  // avoids the live-range-spanning miscompilation (see a5bdee6).
   for (uint32_t i = 0; i < ParamTypes.size(); ++i) {
     ir_type irType = wasmTypeToIRType(ParamTypes[i]);
     LocalTypes[i] = irType;
@@ -220,6 +266,7 @@ Expect<void> WasmToIRBuilder::initialize(
     }
   }
 
+  // Env field loads — after params so params keep lower SSA numbers.
   FuncTablePtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, FuncTable))));
   FuncTableSize = ir_LOAD_U32(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, FuncTableSize))));
   GlobalBasePtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, GlobalBase))));
@@ -255,7 +302,7 @@ Expect<void> WasmToIRBuilder::initialize(
 
 Expect<void>
 WasmToIRBuilder::buildFromInstructions(Span<const AST::Instruction> Instrs) {
-  // Pre-pass: compute max callee arity so we can allocate SharedCallArgs once.
+  // Pre-pass: compute max callee arity for SharedCallArgs allocation.
   uint32_t maxArity = 0;
   for (const auto &Instr : Instrs) {
     OpCode Op = Instr.getOpCode();
@@ -2907,7 +2954,7 @@ Expect<void> WasmToIRBuilder::visitCall(const AST::Instruction &Instr) {
     }
 
     // Check if we can use inline fast path (table 0 + canonical type ID)
-    bool UseInlineFastPath = (TableIdx == 0 &&
+    bool UseInlineFastPath = (false && TableIdx == 0 &&
                               TypeIdx < CanonicalTypeIds.size() &&
                               CanonicalTypeIds[TypeIdx] != 0);
 

@@ -114,6 +114,10 @@ const Executable::IntrinsicsTable Executor::Intrinsics = {
 #pragma clang diagnostic pop
 #endif
 
+void *Executor::getThreadLocalExecutionContextPtr() noexcept {
+  return &Executor::ExecutionContext;
+}
+
 Expect<void> Executor::proxyTrap(Runtime::StackManager &,
                                  const uint32_t Code) noexcept {
   return Unexpect(static_cast<ErrCategory>(Code >> 24), Code);

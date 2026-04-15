@@ -69,6 +69,12 @@ public:
   /// Used to pre-allocate a shared args buffer in the function prologue.
   void setMaxCallArgs(uint32_t N) noexcept { MaxCallArgs = N; }
 
+  /// Set the function index within the module (used for tier-up counter offset).
+  void setFuncIdx(uint32_t Idx) noexcept { FuncIdx = Idx; }
+
+  /// Set the tier-up call count threshold. 0 disables counter instrumentation.
+  void setTierUpThreshold(uint32_t T) noexcept { TierUpThreshold = T; }
+
   /// Set module types from the type section (indexed by type index).
   /// Used for call_indirect type resolution.
   void setModuleTypes(Span<const AST::FunctionType *> Types) noexcept {
@@ -276,6 +282,12 @@ private:
 
   // Canonical type IDs for inline call_indirect (indexed by type section index)
   std::vector<uint32_t> CanonicalTypeIds;
+
+  // Tier-2 profiling
+  uint32_t FuncIdx = 0;           // Module function index (for counter offset)
+  uint32_t TierUpThreshold = 0;   // Call count threshold (0 = disabled)
+  ir_ref CallCountersPtr;         // Loaded from JitExecEnv::CallCounters
+  ir_ref TierUpNotifyFnPtr;       // Loaded from JitExecEnv::TierUpNotifyFn
 };
 
 } // namespace VM
