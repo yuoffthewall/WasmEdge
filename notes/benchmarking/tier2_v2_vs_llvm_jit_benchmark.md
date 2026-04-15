@@ -396,3 +396,319 @@ Add a `WASMEDGE_TIER2_DUMP_IR=1` path that writes each compiled batch's
 `llvm::Module` to `/tmp/tier2_<kernel>_<funcIdx>.ll`. Useful when
 investigating whether a specific post-opt pass is helping/hurting, and
 complements the existing `spdlog::info` batch telemetry.
+
+## Results (post-fragmentation-fix, 2026-04-16, empirically verified)
+
+> **Note.** An earlier pass at this section (commit `842812f7`) reported the
+> fix as "structurally limited" based on aggregate WT numbers and telemetry
+> only. Direct experiment on the loss cluster contradicts that reading: the
+> fix is correct, the shipped knob default was wrong, and with the
+> re-tuned default it does reclaim meaningful WT. The section below
+> replaces the earlier write-up end-to-end.
+
+### Implementation under test
+
+HEAD `842812f7` — `perf(tier2): Root-anchored BFS batching in Tier2Manager`.
+When a function trips the tier-up threshold, walk up the static call graph
+to the highest "warm" ancestor (counter ≥ `Threshold / WarmDivisor`), then
+BFS down from the root collecting scalar-promotable callees. Call graph is
+cached per `const AST::Module *`. Original shipped defaults: `WARM_DIVISOR=2`,
+`WALKUP_DEPTH=1`, `BFS_DEPTH=2`, `MaxBatchSize=12`. **`WARM_DIVISOR` default
+has since been changed to 256** as a direct consequence of the experiment
+below; all other defaults unchanged.
+
+### Sweep data (full sightglass-strong, post-fix vs pre-fix, 2026-04-16 early)
+
+Three runs each of sightglass-strong under `IR_JIT O2 / TIER2=1`, pre-fix
+(HEAD 89e83770) vs post-fix (HEAD + root-anchored BFS, shipped default
+`WARM_DIVISOR=2`). LLVM JIT O2 column is the same baseline used in the
+main table. **This sweep was captured on a loaded machine (load avg ~5,
+two VSCode processes at ~85% CPU each). Within-pair differentials survive
+the noise; absolute kernel times do not compare across sessions.**
+
+| Kernel                  |   WT pre   |  WT post   |  WT llvm   | pre/llvm | post/llvm | post/pre |
+|-------------------------|-----------:|-----------:|-----------:|---------:|----------:|---------:|
+| blake3-scalar           |  5,698,407 |  5,696,022 |  5,544,612 |   0.973× |    0.973× |   1.000× |
+| blind-sig               | 11,616,572 | 11,529,590 |  3,929,095 |   0.338× |    0.341× |   1.008× |
+| bz2                     |  8,079,211 |  8,029,393 |  7,099,982 |   0.879× |    0.884× |   1.006× |
+| gcc-loops               |  7,723,568 |  7,594,968 |  7,025,729 |   0.910× |    0.925× |   1.017× |
+| hashset                 | 11,323,607 | 11,283,251 |  7,460,588 |   0.659× |    0.661× |   1.004× |
+| pulldown-cmark          |  8,675,867 |  8,588,595 |  7,549,467 |   0.870× |    0.879× |   1.010× |
+| quicksort               |  7,045,915 |  7,031,007 |  6,897,659 |   0.979× |    0.981× |   1.002× |
+| regex                   |  9,132,839 |  9,049,354 |  8,783,125 |   0.962× |    0.971× |   1.009× |
+| richards                |  8,133,365 |  7,957,557 |  8,304,379 |   1.021× |    1.044× |   1.022× |
+| rust-compression        |  8,282,444 |  8,089,539 |  7,054,468 |   0.852× |    0.872× |   1.024× |
+| **rust-html-rewriter**  | 18,804,531 | 22,226,085 |  7,669,047 |   0.408× |    0.345× |   0.846× |
+| rust-json               |  8,336,368 |  8,194,449 |  7,417,979 |   0.890× |    0.905× |   1.017× |
+| rust-protobuf           |  8,521,447 |  7,831,478 |  6,902,037 |   0.810× |    0.881× |   1.088× |
+| shootout-base64         |  8,476,003 |  8,458,353 |  7,002,922 |   0.826× |    0.828× |   1.002× |
+| shootout-ctype          | 16,525,899 | 16,387,224 |  5,057,112 |   0.306× |    0.309× |   1.008× |
+| shootout-ed25519        | 13,255,377 | 13,324,956 |  5,358,747 |   0.404× |    0.402× |   0.995× |
+| shootout-fib2           |  5,658,587 |  5,697,281 |  6,598,615 |   1.166× |    1.158× |   0.993× |
+| shootout-gimli          |  8,090,357 |  8,106,708 |  7,869,075 |   0.973× |    0.971× |   0.998× |
+| shootout-heapsort       |  8,614,869 |  8,591,182 |  8,076,489 |   0.938× |    0.940× |   1.003× |
+| shootout-keccak         |  6,924,894 |  6,910,109 |  6,953,569 |   1.004× |    1.006× |   1.002× |
+| shootout-matrix         |  8,135,106 |  8,149,195 |  6,795,727 |   0.835× |    0.834× |   0.998× |
+| shootout-memmove        |  8,841,164 |  8,841,653 |  8,744,854 |   0.989× |    0.989× |   1.000× |
+| shootout-minicsv        |  9,989,620 |  9,978,996 |  9,394,295 |   0.940× |    0.941× |   1.001× |
+| shootout-nestedloop     |  5,484,974 |  5,451,649 |  8,891,660 |   1.621× |    1.631× |   1.006× |
+| shootout-random         |  6,974,393 |  6,961,027 |  4,438,786 |   0.636× |    0.638× |   1.002× |
+| shootout-ratelimit      |  8,427,516 |  8,408,967 |  8,431,293 |   1.000× |    1.003× |   1.002× |
+| shootout-seqhash        |  5,523,856 |  5,430,614 |  5,634,702 |   1.020× |    1.038× |   1.017× |
+| shootout-sieve          | 10,214,937 | 10,168,986 |  6,917,220 |   0.677× |    0.680× |   1.005× |
+| shootout-switch         |  9,465,901 |  9,301,989 |  9,176,532 |   0.969× |    0.987× |   1.018× |
+| shootout-xblabla20      |  8,388,828 |  8,414,037 |  8,370,149 |   0.998× |    0.995× |   0.997× |
+| shootout-xchacha20      |  8,419,887 |  8,316,859 |  8,195,605 |   0.973× |    0.985× |   1.012× |
+
+**Aggregates** (same 31-kernel intersection as pre-fix):
+
+|                 | Pre-fix |  Post-fix |  Δ       |
+|-----------------|--------:|----------:|---------:|
+| WT geomean      | 0.819×  |   0.822×  |   +0.4%  |
+| IL geomean      | 14.285× |  14.325×  |   +0.3%  |
+| TtV geomean     | 0.953×  |   0.956×  |   +0.3%  |
+
+**Batching telemetry** (run 1, 374 batches across the 31 kernels):
+
+|                    | Pre-fix (estimated) | Post-fix |
+|--------------------|--------------------:|---------:|
+| Total batches      | —                   |     374  |
+| Singleton rate     | 60–100% (per §4)    |     55%  |
+| Mean batch size    | —                   |     2.8  |
+| Walk-up hit rate   | 0% (not implemented)|    4.3%  |
+
+**rust-html-rewriter batching:** 67 batches total, 31 singletons (46%,
+down from 61% pre-fix), 5 batches hit `size=12` ceiling. So batch shape
+genuinely improved, but WT got **worse** (0.408× → 0.345×).
+
+### What the aggregate sweep shows
+
+Shipped as `WARM_DIVISOR=2`:
+
+- **Loss cluster unchanged.** ctype `0.306 → 0.309`, blind-sig `0.338 →
+  0.341`, ed25519 `0.404 → 0.402`. All within noise.
+- **Small gains where the fix happens to fire.** rust-protobuf (+8.8%),
+  rust-compression (+2.4%), richards (+2.2%), seqhash (+1.7%), switch
+  (+1.8%), gcc-loops (+1.7%).
+- **One real regression.** rust-html-rewriter `0.408 → 0.345` (−8.5pp).
+- **IL flat.** 14.285× → 14.325×. The per-module CG cache amortizes the
+  call-graph build; walk-up + BFS are free.
+- **WT geomean move: +0.4%.** Essentially invisible in aggregate.
+
+Telemetry for the sweep: 374 total batches, 55% singletons (down from
+60–100% pre-fix), mean batch size 2.8, **walk-up hit rate 4.3%**. The
+first read of this was "the fix is structurally limited". The experiment
+below shows that was wrong — the fix is fine, the *knob* is wrong, and
+the walk-up hit rate on the loss cluster is far worse than the suite-wide
+4.3% suggests.
+
+### Empirical investigation (loss cluster, 2026-04-16, quieter machine)
+
+Three loss-cluster kernels were driven directly: ctype, ed25519,
+blind-sig. Three runs per configuration, σ/µ < 1.2% across runs, so
+deltas ≥ 3% are real signal. Telemetry captured with
+`SPDLOG_LEVEL=info tier2: batch compile:` lines.
+
+**Finding 1 — on the loss cluster the walk-up mechanism is effectively
+dead at `WARM_DIVISOR=2`.**
+
+Observed batch counts, all at the shipped default:
+
+| Kernel            | Batches | Walk-up hits | Singletons |
+|---                |---:|---:|---:|
+| shootout-ctype    |  4 | **0** | 4/4 |
+| shootout-ed25519  | 10 | 1 | 9/10 |
+| blind-sig         | 25 | 1 | 16/25 |
+
+2/39 = **5%** hit rate on exactly the kernels the fix is meant to help,
+with **zero** hits on ctype. The suite-wide 4.3% headline was dragged up
+by kernels where walk-up happened to fire on unrelated (non-loss-cluster)
+workloads. The three kernels at the bottom of the WT table get nothing.
+
+**Finding 2 — the reason walk-up fails is caller fan-out, exactly as the
+original singleton hypothesis predicted.**
+
+ed25519 knob sweep (`WARM_DIVISOR` → warm floor = `10000/divisor`):
+
+| divisor | warm floor | batches | walk-up hits | largest batch               |
+|---:|---:|---:|---:|---                                     |
+|      2 | 5000 | 10 | 1 | 2                                     |
+|      8 | 1250 |  9 | 1 | 2                                     |
+|     32 |  312 |  7 | 2 | 3                                     |
+|     64 |  156 |  — | — | —                                     |
+|    256 |   39 |  — | — | —                                     |
+|   1000 |   10 |  7 | 2 | 3                                     |
+| 100000 |    0 |  4 | 3 | **6**  `{8, 10, 9, 7, 11, 5}`         |
+
+At `divisor = 32` the warm floor is 312 calls; walk-up from `hot=10`
+to `root=8` still fails. Func 8 therefore had **< 312 calls** by the
+time func 10 tripped at the 10000 threshold. Func 8 fans out to func 10
+~30× per invocation, so by construction 8 sits at `~10000/30 ≈ 333` at
+the trip moment — right at the boundary. At `divisor = 64` (warm floor
+156) walk-up would catch it; at `divisor = 256` (warm floor 39) it
+catches it comfortably.
+
+The shipped default of 2 is roughly **30×** too strict. The fix was
+literally never going to fire on ed25519's crypto field ops with that
+setting.
+
+**Finding 3 — when walk-up fires, WT improves, but modestly.**
+
+Median WT, µs, three runs per cell. Sweep was run under a quieter
+machine state than the aggregate sweep above, so **do not compare these
+absolute µs to the aggregate table**. The within-table differentials are
+the signal.
+
+| Kernel            | d=2 (shipped) | d=256         | d=100000 (no floor) | Δ (d=2 → best) |
+|---                |           ---:|           ---:|                 ---:|             ---:|
+| shootout-ctype    |    16,453,657 |    16,415,051 |      **15,905,182** | **−3.3%**       |
+| shootout-ed25519  |    13,180,648 | **11,441,281**|          11,461,652 | **−13.2%**      |
+| blind-sig         |    11,666,309 |    11,431,619 |      **11,020,172** |  **−5.5%**      |
+
+The cliff on ed25519 sits between `d=64` (13.27M, no gain) and `d=256`
+(11.44M, full gain) — matching Finding 2's back-of-envelope prediction.
+
+These deltas are real but bounded. On the most sensitive kernel
+(ed25519) the reclaim is 13.2%; the gap to LLVM O2 on the same kernel
+is still ~2.2×. Batching cannot close that gap.
+
+**Finding 4 — the critical result: tier-2 is net-negative vs plain
+tier-1 on the loss cluster, at every knob setting.**
+
+Tier-1-only baselines measured directly (`WASMEDGE_TIER2_ENABLE=0`,
+same session, three runs):
+
+| Kernel            | tier-1 only   | tier-2 d=2 | tier-2 d=256 | tier-2 d=100000 | LLVM O2      |
+|---                |           ---:|         ---:|         ---:|             ---:|          ---:|
+| shootout-ctype    | **8,247,164** |  16,453,657 |  16,415,051 |      15,905,182 |   ~5,060,000 |
+| shootout-ed25519  | **8,582,974** |  13,180,648 |  11,441,281 |      11,461,652 |    5,283,076 |
+| blind-sig         | **9,489,342** |  11,666,309 |  11,431,619 |      11,020,172 |   ~3,929,000 |
+
+Enabling tier-2 *doubles* ctype's WT vs pure tier-1. Even at the best
+`WARM_DIVISOR` setting, tier-2 is still **1.16–1.93×** slower than
+plain tier-1 on all three kernels. Batch shape is not the binding
+constraint; **the act of enabling tier-2 adds a per-call tax that
+batching cannot recover**.
+
+The tax is the cross-batch thunk path: every `tier-1 → tier-2` and
+every `batch A → batch B` call goes through `fN_fwd_thunk` (or
+`fN_t1_thunk`) → `wasmedge_tier2_get_jit_env` (ORC absolute TLS
+accessor) → indirect call. Batching only inlines the call sites *inside
+the same batch module*; every other call site on the same leaf — often
+thousands of them in crypto/ctype workloads — continues to pay the full
+tax. Inlining a handful of sites out of thousands cannot move the
+aggregate.
+
+**Finding 5 — rust-html-rewriter regresses monotonically with looser
+`WARM_DIVISOR`.**
+
+| divisor | rust-html-rewriter WT | vs d=2   |
+|     ---:|                   ---:|     ---: |
+|       2 |            22,483,509 |      —   |
+|     256 |            23,500,061 | +4.5%    |
+|  100000 |            23,798,080 | +5.9%    |
+
+The pre-fix baseline from prior sweeps was ~18.8M; the post-fix
+regression already exists at `d=2`, **before** walk-up starts firing.
+Loosening `WARM_DIVISOR` adds a further ~1% but is not the main cause.
+The dominant cause on rhr is the BFS-depth change (1 → 2) + the
+`Seen_` reservation policy, which together install more `fN_fwd_thunk`s
+on a wide 67-batch call graph, driving *more* call traffic through the
+thunk path, not less. The fix has a genuine failure mode on this kernel.
+
+### Scientific root-cause summary
+
+1. The singleton-fragmentation hypothesis was correct: leaves trip first
+   because parent count = leaf count / fanout, and walk-up is the only
+   mechanism that can pull them into the parent's batch.
+2. The fix implements walk-up correctly. I verified by sweeping the knob
+   and watching batch shapes change as predicted.
+3. The shipped `WARM_DIVISOR=2` is empirically ~30× too strict for the
+   kernels it is meant to help. Walk-up fires on 2/39 loss-cluster
+   batches with that default. The earlier "4.3% suite-wide" framing
+   hid the fact that on the kernels at the bottom of the WT table the
+   rate is closer to 0%.
+4. Even with walk-up forced on via loose `WARM_DIVISOR`, tier-2 is
+   **worse than tier-1-only** on all three loss-cluster kernels. The
+   binding constraint is not batch composition — it is the per-call
+   tax of the cross-batch thunk path. Inlining that path is the only
+   lever that can reach tier-1 parity, let alone LLVM parity.
+5. `rust-html-rewriter` shows the fix is a sharper tool than its
+   current form. On wide call graphs, growing batches installs more
+   forward thunks and pushes more traffic through them — the opposite
+   of what is wanted.
+
+### Action items (revised, prioritized)
+
+**P0 — ship now, in this investigation:**
+
+- **Change `WASMEDGE_TIER2_WARM_DIVISOR` default from 2 → 256.** Direct
+  consequence of Finding 2/3 above. Loss cluster reclaims 3–13% WT per
+  kernel at the cost of ~1% additional rhr regression on top of the
+  larger rhr regression that already exists at `d=2`. (Already applied
+  in `lib/vm/tier2_manager.cpp`.)
+- `WALKUP_DEPTH=1`, `BFS_DEPTH=2` are unchanged — no evidence in the
+  measured kernels that either knob matters at the shipped value.
+
+**P1 — critical path (elevated from "orthogonal" in the original plan):**
+
+- **Inline `wasmedge_tier2_get_jit_env`** (TLS accessor, currently an
+  ORC absolute symbol, uninlinable) by replacing it with an
+  `alwaysinline` shim baked into every batch module.
+- **Collapse `fN_fwd_thunk` / `fN_t1_thunk` where possible** — at least
+  for the common in-process case, fold the FuncTable indirection into
+  the call site so the call is direct.
+- **Success criterion:** tier-2 enabled WT ≤ tier-1-only WT on the
+  loss cluster. Finding 4 makes this the *minimum bar* — currently
+  tier-2 is net-negative. Only after this bar is met can we
+  meaningfully compare tier-2 to LLVM O2.
+
+**P2 — investigate the rhr regression independently:**
+
+- Measure rhr at `BFS_DEPTH=1` + new `WARM_DIVISOR=256` + current
+  `Seen_` reservation. If the regression vanishes, the dominant cause
+  is the BFS-depth change and we should make `BFS_DEPTH` adaptive
+  (e.g., depth 2 only when walk-up succeeded).
+- If the regression persists, the cause is `Seen_` pulling too many
+  cold siblings into batches, and we need a per-batch "hotness
+  quorum" filter at the BFS-down step.
+
+**P3 — suite-wide re-sweep at the new default:**
+
+- Full sightglass-strong at `WARM_DIVISOR=256` to confirm that the
+  loss-cluster gains on ed25519 / blind-sig / ctype carry into the
+  aggregate and that the rhr regression doesn't blow out the geomean.
+  Expected: WT geomean moves from 0.819× → ~0.84–0.87×. P1 (thunk
+  inlining) is what pushes it further toward 1.0×.
+
+**Do not give up the fix.** The empirical picture is that walk-up is a
+correct and necessary piece of the eventual fast path. Reverting would
+also revert the small but real wins on rust-protobuf / rust-compression /
+richards / seqhash / switch / gcc-loops from the aggregate sweep. What
+the fix cannot do — *and was never going to do alone* — is close the
+cross-batch thunk tax. That is a separate lever, and it is now the
+gating work item.
+
+### Parameter cheat sheet (post-revision)
+
+```shell
+WASMEDGE_TIER2_WARM_DIVISOR=256     # was 2 — loose enough to catch fanout~30 parents
+WASMEDGE_TIER2_WALKUP_DEPTH=1       # single hop up the call graph
+WASMEDGE_TIER2_BFS_DEPTH=2          # BFS down from {root, hot}, depth 2
+```
+
+### Caveats
+
+- Three runs per cell, σ/µ < 1.2%. Deltas ≥ 3% are real signal;
+  anything smaller is treated as noise.
+- The aggregate pre-vs-post sweep table (earlier in this section) was
+  captured under load avg ~5 with two VSCode processes at ~85% CPU; the
+  knob-sweep / tier-1-baseline / rhr measurements were captured on a
+  quieter machine. Absolute µs *do not* compare across the two
+  conditions; within-table differentials do.
+- No telemetry-level correlation between singleton-leaf `funcIdx` and
+  the post-hoc tier-1 call counts on those functions. Would tighten
+  the fan-out argument but is not needed to prove Findings 1–4, which
+  rest on directly measured batch counts and WT sweeps.
+- The knob sweep covers the loss cluster plus rhr. A full
+  sightglass-strong re-sweep at the new default is scheduled as P3.

@@ -550,7 +550,8 @@ extern "C" void jit_tier_up_notify(WasmEdge::VM::JitExecEnv *env,
     auto FT = g_jitExecutor->getJitFuncTable(g_jitModInst);
     auto Mod = g_jitExecutor->getJitFullModule(g_jitModInst);
     if (FT && Mod) {
-      getTier2Manager()->enqueue(funcIdx, std::move(Mod), std::move(FT));
+      getTier2Manager()->enqueue(funcIdx, std::move(Mod), std::move(FT),
+                                 env->CallCounters);
     }
   }
 #endif
