@@ -25,6 +25,8 @@
 #include <queue>
 #include <set>
 #include <thread>
+#include <unordered_map>
+#include <vector>
 
 namespace WasmEdge {
 namespace AST {
@@ -46,15 +48,18 @@ public:
 
   /// Enqueue a function for tier-2 recompilation.
   /// Called from jit_tier_up_notify (JIT code context).
-  /// \param FuncIdx    Module function index (total space: imports + defined).
-  /// \param Mod        Shared pointer to the full parsed AST::Module. The
-  ///                   tier-2 worker walks this to build per-batch synthetic
-  ///                   mini-modules and feeds them to WasmEdge::LLVM::Compiler.
-  /// \param FuncTable  Shared pointer to the FuncTable array (for live code
-  ///                   swap). Kept alive by the worker via shared_ptr.
+  /// \param FuncIdx      The function that tripped the tier-up threshold.
+  /// \param Mod          Shared pointer to the full parsed AST::Module.
+  /// \param FuncTable    Shared pointer to the FuncTable array (for live
+  ///                     code swap).
+  /// \param CallCounters Read-only pointer to the tier-1 per-function call
+  ///                     counter array (from JitExecEnv). Used by the
+  ///                     walk-up phase to score ancestor warmth. May be
+  ///                     null; walk-up is skipped in that case.
   void enqueue(uint32_t FuncIdx,
                std::shared_ptr<const AST::Module> Mod,
-               std::shared_ptr<void *[]> FuncTable) noexcept;
+               std::shared_ptr<void *[]> FuncTable,
+               const uint32_t *CallCounters) noexcept;
 
   /// Number of functions successfully recompiled to tier-2.
   uint32_t tier2Count() const noexcept {
@@ -62,22 +67,70 @@ public:
   }
 
 private:
+  /// Static per-module forward+reverse call graph, built once and cached.
+  struct ModuleCG {
+    uint32_t ImportFuncNum = 0;
+    /// Indexed by defined-function index (funcIdx - ImportFuncNum).
+    /// Each entry is the list of direct Call targets (module-wide funcIdx).
+    std::vector<std::vector<uint32_t>> Callees;
+    /// Reverse edges: callers[defined_idx] = list of module-wide funcIdx
+    /// that directly Call this function.
+    std::vector<std::vector<uint32_t>> Callers;
+  };
+
+  /// A batch request carries the fully-resolved set of funcIdxs to compile
+  /// together. The worker does no further expansion.
   struct Request {
-    uint32_t FuncIdx;
+    uint32_t HotFuncIdx;        // function that tripped the threshold
+    uint32_t RootFuncIdx;       // chosen batch anchor (may equal HotFuncIdx)
+    uint32_t WalkupHops;        // telemetry
+    std::vector<uint32_t> Batch;
     std::shared_ptr<const AST::Module> Mod;
     std::shared_ptr<void *[]> FuncTable;
   };
 
   void workerLoop();
 
+  /// Build (or return cached) call graph for \p Mod. Caller must hold Mu_.
+  const ModuleCG &getOrBuildCGLocked(const AST::Module &Mod) noexcept;
+
+  /// Walk up the call graph from HotFuncIdx, picking the hottest warm
+  /// ancestor at each step. Returns (root, hops). Caller must hold Mu_.
+  std::pair<uint32_t, uint32_t>
+  walkUpRootLocked(const AST::Module &Mod, const ModuleCG &CG,
+                   uint32_t HotFuncIdx, uintptr_t FTKey,
+                   const uint32_t *CallCounters) noexcept;
+
+  /// BFS down from Root collecting scalar-promotable descendants not yet
+  /// in Seen_, bounded by BfsMaxDepth_ and MaxBatchSize_. Ensures
+  /// HotFuncIdx appears in the result. Caller must hold Mu_.
+  std::vector<uint32_t>
+  bfsDownBatchLocked(const AST::Module &Mod, const ModuleCG &CG,
+                     uint32_t Root, uint32_t HotFuncIdx,
+                     uintptr_t FTKey) noexcept;
+
   std::thread Worker_;
   std::mutex Mu_;
   std::condition_variable CV_;
   std::queue<Request> Queue_;
   std::set<std::pair<uintptr_t, uint32_t>> Seen_;
+  std::unordered_map<const AST::Module *, ModuleCG> CGCache_;
   std::atomic<bool> Shutdown_{false};
   std::atomic<bool> WorkerDone_{false};
   std::atomic<uint32_t> Tier2Count_{0};
+
+  // Batching knobs loaded from env vars in the constructor.
+  uint32_t Tier2Threshold_ = 10000;     // matches WASMEDGE_TIER2_THRESHOLD
+  uint32_t WarmDivisor_ = 256;          // WASMEDGE_TIER2_WARM_DIVISOR
+  uint32_t WalkupMaxDepth_ = 1;         // WASMEDGE_TIER2_WALKUP_DEPTH
+  uint32_t BfsMaxDepth_ = 2;            // WASMEDGE_TIER2_BFS_DEPTH
+  static constexpr uint32_t MaxBatchSize_ = 12;
+
+  // Telemetry aggregates (dumped at shutdown).
+  uint64_t StatBatches_ = 0;
+  uint64_t StatSingletons_ = 0;
+  uint64_t StatWalkupHits_ = 0;
+  uint64_t StatBatchMemberSum_ = 0;
 };
 
 } // namespace VM

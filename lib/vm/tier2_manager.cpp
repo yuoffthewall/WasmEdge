@@ -10,7 +10,10 @@
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <cstdlib>
+#include <deque>
+#include <sstream>
 #include <unordered_set>
 #include <vector>
 
@@ -50,6 +53,17 @@ bool isPromotable(const AST::Module &Mod, uint32_t FuncIdx,
   if (TypeIdx >= TypeSec.size()) {
     return false;
   }
+  // Skip trap stubs: bodies that begin with `unreachable` are not emitted by
+  // the LLVM frontend, so including them in a tier-2 batch would produce a
+  // missing `f<Idx>` symbol when emitFwdThunk looks it up.
+  const auto &CodeSec = Mod.getCodeSection().getContent();
+  if (DefinedIdx < CodeSec.size()) {
+    const auto Instrs = CodeSec[DefinedIdx].getExpr().getInstrs();
+    auto It = Instrs.begin();
+    if (It != Instrs.end() && It->getOpCode() == OpCode::Unreachable) {
+      return false;
+    }
+  }
   const auto &FT = TypeSec[TypeIdx].getCompositeType().getFuncType();
   if (FT.getReturnTypes().size() > 1) {
     return false; // multi-return: skipped for MVP
@@ -67,36 +81,33 @@ bool isPromotable(const AST::Module &Mod, uint32_t FuncIdx,
   return true;
 }
 
-/// Walk the hot function's instruction stream and collect direct Call
-/// target indices (module-wide funcIdx space).
-std::vector<uint32_t> extractCalleeIndices(const AST::Module &Mod,
-                                           uint32_t FuncIdx,
-                                           uint32_t ImportFuncNum) noexcept {
-  std::vector<uint32_t> Result;
-  if (FuncIdx < ImportFuncNum) {
-    return Result;
+uint32_t envAsU32(const char *Name, uint32_t Default) noexcept {
+  if (const char *E = ::getenv(Name)) {
+    int V = std::atoi(E);
+    if (V >= 0)
+      return static_cast<uint32_t>(V);
   }
-  const auto &CodeSec = Mod.getCodeSection().getContent();
-  const uint32_t DefinedIdx = FuncIdx - ImportFuncNum;
-  if (DefinedIdx >= CodeSec.size()) {
-    return Result;
-  }
-  const auto Instrs = CodeSec[DefinedIdx].getExpr().getInstrs();
-  std::unordered_set<uint32_t> Seen;
-  for (auto It = Instrs.begin(); It != Instrs.end(); ++It) {
-    if (It->getOpCode() == OpCode::Call) {
-      uint32_t Target = It->getTargetIndex();
-      if (Seen.insert(Target).second) {
-        Result.push_back(Target);
-      }
-    }
-  }
-  return Result;
+  return Default;
 }
 
 } // namespace
 
 Tier2Manager::Tier2Manager() noexcept {
+  Tier2Threshold_ = envAsU32("WASMEDGE_TIER2_THRESHOLD", 10000);
+  // Default 256 (warm floor = Threshold/256 = ~39 calls) picked empirically
+  // from a WARM_DIVISOR sweep on the loss cluster. The fix's walk-up path
+  // only fires when a hot leaf's direct caller has already been called
+  // >= warm floor times. Leaves with call fan-out N from their parent hit
+  // the tier-up threshold while the parent sits at ~threshold/N calls;
+  // crypto field ops and ctype byte predicates measured fanouts of 20-60x,
+  // so the previous default (divisor=2, floor=5000) was ~30x too strict
+  // and walk-up fired on 0/4 ctype batches, 1/10 ed25519, 1/25 blind-sig.
+  // At divisor=256 walk-up reliably batches {root,hot,siblings} and
+  // unlocks +3-13% WT on the loss cluster. See
+  // notes/benchmarking/tier2_v2_vs_llvm_jit_benchmark.md.
+  WarmDivisor_ = envAsU32("WASMEDGE_TIER2_WARM_DIVISOR", 256);
+  WalkupMaxDepth_ = envAsU32("WASMEDGE_TIER2_WALKUP_DEPTH", 1);
+  BfsMaxDepth_ = envAsU32("WASMEDGE_TIER2_BFS_DEPTH", 2);
   Worker_ = std::thread([this] { workerLoop(); });
 }
 
@@ -104,6 +115,14 @@ Tier2Manager::~Tier2Manager() noexcept {
   shutdown();
   if (Worker_.joinable())
     Worker_.join();
+  if (StatBatches_ > 0) {
+    double MeanSize =
+        static_cast<double>(StatBatchMemberSum_) / StatBatches_;
+    spdlog::info(
+        "tier2: shutdown stats: batches={} singletons={} walkup_hits={} "
+        "mean_size={:.2f}",
+        StatBatches_, StatSingletons_, StatWalkupHits_, MeanSize);
+  }
 }
 
 void Tier2Manager::shutdown() noexcept {
@@ -114,20 +133,231 @@ void Tier2Manager::shutdown() noexcept {
   CV_.notify_one();
 }
 
+const Tier2Manager::ModuleCG &
+Tier2Manager::getOrBuildCGLocked(const AST::Module &Mod) noexcept {
+  // Count imports + code size up front so we can validate any cached entry.
+  // AST::Module* addresses may be reused across kernels when old modules
+  // are destroyed and new ones allocate at the same heap slot; a stale hit
+  // returns a CG sized for the wrong module and corrupts batching.
+  uint32_t ImportFuncNum = 0;
+  for (const auto &ImpDesc : Mod.getImportSection().getContent()) {
+    if (ImpDesc.getExternalType() == ExternalType::Function) {
+      ++ImportFuncNum;
+    }
+  }
+  const auto &CodeSec = Mod.getCodeSection().getContent();
+
+  auto It = CGCache_.find(&Mod);
+  if (It != CGCache_.end()) {
+    const auto &Existing = It->second;
+    if (Existing.ImportFuncNum == ImportFuncNum &&
+        Existing.Callees.size() == CodeSec.size()) {
+      return Existing;
+    }
+    CGCache_.erase(It);
+  }
+
+  ModuleCG CG;
+  CG.ImportFuncNum = ImportFuncNum;
+  CG.Callees.resize(CodeSec.size());
+  CG.Callers.resize(CodeSec.size());
+  for (size_t DefinedIdx = 0; DefinedIdx < CodeSec.size(); ++DefinedIdx) {
+    const uint32_t CallerFuncIdx =
+        static_cast<uint32_t>(DefinedIdx) + CG.ImportFuncNum;
+    const auto Instrs = CodeSec[DefinedIdx].getExpr().getInstrs();
+    std::unordered_set<uint32_t> Seen;
+    for (auto It2 = Instrs.begin(); It2 != Instrs.end(); ++It2) {
+      if (It2->getOpCode() != OpCode::Call)
+        continue;
+      const uint32_t Target = It2->getTargetIndex();
+      if (!Seen.insert(Target).second)
+        continue;
+      CG.Callees[DefinedIdx].push_back(Target);
+      // Record reverse edge only if target is a defined (not imported) func.
+      if (Target >= CG.ImportFuncNum) {
+        const uint32_t TargetDef = Target - CG.ImportFuncNum;
+        if (TargetDef < CG.Callers.size()) {
+          CG.Callers[TargetDef].push_back(CallerFuncIdx);
+        }
+      }
+    }
+  }
+  auto [It2, _] = CGCache_.emplace(&Mod, std::move(CG));
+  return It2->second;
+}
+
+std::pair<uint32_t, uint32_t>
+Tier2Manager::walkUpRootLocked(const AST::Module &Mod, const ModuleCG &CG,
+                               uint32_t HotFuncIdx, uintptr_t FTKey,
+                               const uint32_t *CallCounters) noexcept {
+  if (CallCounters == nullptr) {
+    return {HotFuncIdx, 0};
+  }
+  // A caller only counts as "warm" if it's itself within a fraction of
+  // the tier-up threshold — i.e., it would realistically tier up on its
+  // own. A looser floor (e.g. 1 invocation) would drag cold one-shot
+  // parents into the batch and ruin inlining quality.
+  const uint32_t WarmThreshold =
+      std::max<uint32_t>(1, Tier2Threshold_ / std::max<uint32_t>(1, WarmDivisor_));
+  uint32_t Root = HotFuncIdx;
+  uint32_t Hops = 0;
+  std::unordered_set<uint32_t> Visited;
+  Visited.insert(Root);
+  while (Hops < WalkupMaxDepth_) {
+    if (Root < CG.ImportFuncNum)
+      break;
+    const uint32_t RootDef = Root - CG.ImportFuncNum;
+    if (RootDef >= CG.Callers.size())
+      break;
+    const auto &Callers = CG.Callers[RootDef];
+    uint32_t Best = UINT32_MAX;
+    uint32_t BestCount = 0;
+    for (uint32_t C : Callers) {
+      if (C == Root)
+        continue;
+      if (Visited.count(C))
+        continue;
+      if (Seen_.count(std::make_pair(FTKey, C)))
+        continue;
+      if (!isPromotable(Mod, C, CG.ImportFuncNum))
+        continue;
+      uint32_t CCount = CallCounters[C];
+      // Saturated sentinel means already-tier-upped; skip.
+      if (CCount == UINT32_MAX)
+        continue;
+      if (CCount < WarmThreshold)
+        continue;
+      if (Best == UINT32_MAX || CCount > BestCount) {
+        Best = C;
+        BestCount = CCount;
+      }
+    }
+    if (Best == UINT32_MAX)
+      break;
+    Root = Best;
+    Visited.insert(Root);
+    ++Hops;
+  }
+  return {Root, Hops};
+}
+
+std::vector<uint32_t>
+Tier2Manager::bfsDownBatchLocked(const AST::Module &Mod, const ModuleCG &CG,
+                                 uint32_t Root, uint32_t HotFuncIdx,
+                                 uintptr_t FTKey) noexcept {
+  std::vector<uint32_t> Batch;
+  Batch.reserve(MaxBatchSize_);
+  std::unordered_set<uint32_t> InBatch;
+
+  auto TryAdd = [&](uint32_t F) -> bool {
+    if (Batch.size() >= MaxBatchSize_)
+      return false;
+    if (InBatch.count(F))
+      return false;
+    if (!isPromotable(Mod, F, CG.ImportFuncNum))
+      return false;
+    if (Seen_.count(std::make_pair(FTKey, F)))
+      return false;
+    Batch.push_back(F);
+    InBatch.insert(F);
+    return true;
+  };
+
+  // Dual-source BFS from Root AND HotFuncIdx. Root expansion captures
+  // the parent + its direct callees (hot's siblings). Hot expansion
+  // captures hot's own direct callees. Together they form the
+  // inlining neighborhood of the hot function. Seeding both at depth 0
+  // means both sources get equal BFS budget.
+  std::deque<std::pair<uint32_t, uint32_t>> Frontier; // (funcIdx, depth)
+  Frontier.push_back({Root, 0});
+  if (HotFuncIdx != Root)
+    Frontier.push_back({HotFuncIdx, 0});
+  while (!Frontier.empty() && Batch.size() < MaxBatchSize_) {
+    auto [F, D] = Frontier.front();
+    Frontier.pop_front();
+    if (!TryAdd(F))
+      continue;
+    if (D >= BfsMaxDepth_)
+      continue;
+    if (F < CG.ImportFuncNum)
+      continue;
+    const uint32_t DefinedIdx = F - CG.ImportFuncNum;
+    if (DefinedIdx >= CG.Callees.size())
+      continue;
+    for (uint32_t C : CG.Callees[DefinedIdx]) {
+      if (Batch.size() >= MaxBatchSize_)
+        break;
+      if (InBatch.count(C))
+        continue;
+      Frontier.push_back({C, D + 1});
+    }
+  }
+
+  // Ensure the originally-hot function is in the batch even if BFS
+  // didn't reach it (root choice + depth cap + batch cap). This
+  // preserves the guarantee that every tier-up request promotes its
+  // trigger function.
+  if (!InBatch.count(HotFuncIdx)) {
+    if (Batch.size() >= MaxBatchSize_ && !Batch.empty()) {
+      // Make room by dropping the last added BFS leaf.
+      uint32_t Dropped = Batch.back();
+      Batch.pop_back();
+      InBatch.erase(Dropped);
+    }
+    TryAdd(HotFuncIdx);
+  }
+  return Batch;
+}
+
 void Tier2Manager::enqueue(uint32_t FuncIdx,
                            std::shared_ptr<const AST::Module> Mod,
-                           std::shared_ptr<void *[]> FuncTable) noexcept {
+                           std::shared_ptr<void *[]> FuncTable,
+                           const uint32_t *CallCounters) noexcept {
   if (!Mod || !FuncTable) {
     return;
   }
+  Request Req;
   {
     std::lock_guard<std::mutex> Lock(Mu_);
-    auto Key = std::make_pair(reinterpret_cast<uintptr_t>(FuncTable.get()),
-                              FuncIdx);
-    if (Seen_.count(Key))
+    const auto FTKey = reinterpret_cast<uintptr_t>(FuncTable.get());
+    if (Seen_.count(std::make_pair(FTKey, FuncIdx)))
       return;
-    Seen_.insert(Key);
-    Queue_.push({FuncIdx, std::move(Mod), std::move(FuncTable)});
+
+    const ModuleCG &CG = getOrBuildCGLocked(*Mod);
+
+    // The hot function itself must be scalar-promotable, otherwise we have
+    // nothing to compile. Mark it Seen_ so we never retry it.
+    if (!isPromotable(*Mod, FuncIdx, CG.ImportFuncNum)) {
+      Seen_.insert(std::make_pair(FTKey, FuncIdx));
+      spdlog::debug("tier2: skip func {} (unsupported signature)", FuncIdx);
+      return;
+    }
+
+    auto [Root, Hops] =
+        walkUpRootLocked(*Mod, CG, FuncIdx, FTKey, CallCounters);
+    auto Batch = bfsDownBatchLocked(*Mod, CG, Root, FuncIdx, FTKey);
+    if (Batch.empty()) {
+      Seen_.insert(std::make_pair(FTKey, FuncIdx));
+      return;
+    }
+
+    // Reserve every batch member against future tier-up triggers.
+    // This is the core anti-fragmentation mechanism: once a function
+    // neighborhood is captured in a batch, sibling leaf trips that
+    // would otherwise become singletons (with no callers to batch
+    // them with) are suppressed because the parent already pulled
+    // them in here.
+    for (uint32_t B : Batch) {
+      Seen_.insert(std::make_pair(FTKey, B));
+    }
+
+    Req.HotFuncIdx = FuncIdx;
+    Req.RootFuncIdx = Root;
+    Req.WalkupHops = Hops;
+    Req.Batch = std::move(Batch);
+    Req.Mod = std::move(Mod);
+    Req.FuncTable = std::move(FuncTable);
+    Queue_.push(std::move(Req));
   }
   CV_.notify_one();
 }
@@ -159,7 +389,7 @@ void Tier2Manager::workerLoop() {
 
     if (CompileCount >= MaxCompilations)
       continue;
-    if (!Req.Mod || !Req.FuncTable)
+    if (!Req.Mod || !Req.FuncTable || Req.Batch.empty())
       continue;
     if (Shutdown_.load(std::memory_order_acquire)) {
       WorkerDone_.store(true, std::memory_order_release);
@@ -167,52 +397,33 @@ void Tier2Manager::workerLoop() {
     }
 
     const AST::Module &Mod = *Req.Mod;
-
-    // Count import functions once per request.
-    uint32_t ImportFuncNum = 0;
-    for (const auto &ImpDesc : Mod.getImportSection().getContent()) {
-      if (ImpDesc.getExternalType() == ExternalType::Function) {
-        ++ImportFuncNum;
-      }
-    }
-
-    // Scope filter: the hot function must itself be scalar-only.
-    if (!isPromotable(Mod, Req.FuncIdx, ImportFuncNum)) {
-      spdlog::debug("tier2: skip func {} (unsupported signature)",
-                    Req.FuncIdx);
-      continue;
-    }
-
-    // Build batch: hot function + direct callees (depth 1, scalar-only).
-    constexpr size_t MaxBatchSize = 12;
     const auto FTKey = reinterpret_cast<uintptr_t>(Req.FuncTable.get());
-    std::vector<uint32_t> Batch;
-    Batch.reserve(MaxBatchSize);
-    Batch.push_back(Req.FuncIdx);
 
-    auto Callees = extractCalleeIndices(Mod, Req.FuncIdx, ImportFuncNum);
-    for (uint32_t C : Callees) {
-      if (Batch.size() >= MaxBatchSize)
-        break;
-      if (C == Req.FuncIdx)
-        continue;
-      if (!isPromotable(Mod, C, ImportFuncNum))
-        continue;
-      {
-        std::lock_guard<std::mutex> Lock(Mu_);
-        if (Seen_.count(std::make_pair(FTKey, C)))
-          continue;
-      }
-      Batch.push_back(C);
+    // Telemetry: format the batch index list compactly.
+    std::ostringstream Idxs;
+    for (size_t I = 0; I < Req.Batch.size(); ++I) {
+      if (I)
+        Idxs << ",";
+      Idxs << Req.Batch[I];
+    }
+    spdlog::info(
+        "tier2: batch compile: root={} hot={} size={} walkup={} [{}]",
+        Req.RootFuncIdx, Req.HotFuncIdx, Req.Batch.size(), Req.WalkupHops,
+        Idxs.str());
+
+    {
+      std::lock_guard<std::mutex> Lock(Mu_);
+      ++StatBatches_;
+      StatBatchMemberSum_ += Req.Batch.size();
+      if (Req.Batch.size() == 1)
+        ++StatSingletons_;
+      if (Req.WalkupHops > 0)
+        ++StatWalkupHits_;
     }
 
-    spdlog::info("tier2: starting batch compile for func {} with {} "
-                 "function(s)",
-                 Req.FuncIdx, Batch.size());
-
-    auto BatchResult = Compiler.compileBatch(Batch, Mod, 2);
+    auto BatchResult = Compiler.compileBatch(Req.Batch, Mod, 2);
     if (!BatchResult) {
-      spdlog::warn("tier2: batch compile failed for func {}", Req.FuncIdx);
+      spdlog::warn("tier2: batch compile failed for func {}", Req.HotFuncIdx);
       continue;
     }
 
