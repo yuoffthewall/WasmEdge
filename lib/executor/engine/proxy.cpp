@@ -118,6 +118,20 @@ void *Executor::getThreadLocalExecutionContextPtr() noexcept {
   return &Executor::ExecutionContext;
 }
 
+// Returns the byte offset of Executor::ExecutionContext from the thread
+// pointer (%fs:0 on x86_64-linux). The offset is fixed once the DSO is
+// loaded and is the same for all threads, so the JIT can hardcode it.
+// Used by tier2_compiler.cpp to emit a direct %fs:OFFSET address
+// computation in fwd_thunks instead of calling through an ORC absolute
+// symbol.
+extern "C" ptrdiff_t wasmedge_tier2_get_exec_ctx_tls_offset(void) {
+  uintptr_t TP;
+  asm volatile("mov %%fs:0, %0" : "=r"(TP));
+  return reinterpret_cast<uintptr_t>(
+             Executor::getThreadLocalExecutionContextPtr()) -
+         TP;
+}
+
 Expect<void> Executor::proxyTrap(Runtime::StackManager &,
                                  const uint32_t Code) noexcept {
   return Unexpect(static_cast<ErrCategory>(Code >> 24), Code);

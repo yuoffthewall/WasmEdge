@@ -36,6 +36,10 @@
 //   in t1_thunks instead of calling through an ORC absolute symbol.
 extern "C" void *wasmedge_tier2_get_jit_env(void);
 extern "C" ptrdiff_t wasmedge_tier2_get_jit_env_tls_offset(void);
+// Returns the byte offset of Executor::ExecutionContext (a thread_local
+// struct) from %fs:0. Used to emit a direct address computation in
+// fwd_thunks instead of calling the ORC-bound wasmedge_tier2_get_exec_ctx.
+extern "C" ptrdiff_t wasmedge_tier2_get_exec_ctx_tls_offset(void);
 
 // Debug helper gated by WASMEDGE_TIER2_TRACE_FUNC env var. Prints
 // (func_idx, arg0..arg3) on each fwd_thunk entry. Bound via ORC absolute
@@ -239,16 +243,6 @@ void emitFwdThunk(LLVMModuleRef LLMod, LLVMContextRef Ctx, uint32_t FuncIdx,
       LLVMAddFunction(LLMod, ThunkName.c_str(), ThunkFTy);
   LLVMSetLinkage(Thunk, LLVMExternalLinkage);
 
-  // Declare the helper that returns &Executor::ExecutionContext. We bind
-  // this to its real address via ORC absolute symbols at JIT time.
-  LLVMValueRef GetCtx = LLVMGetNamedFunction(LLMod, "wasmedge_tier2_get_exec_ctx");
-  if (!GetCtx) {
-    LLVMTypeRef GetCtxFTy = LLVMFunctionType(PtrTy, nullptr, 0, 0);
-    GetCtx = LLVMAddFunction(LLMod, "wasmedge_tier2_get_exec_ctx", GetCtxFTy);
-    LLVMSetLinkage(GetCtx, LLVMExternalLinkage);
-  }
-  LLVMTypeRef GetCtxFTy = LLVMFunctionType(PtrTy, nullptr, 0, 0);
-
   // Look up the target function `f<FuncIdx>` already in the module.
   const std::string CalleeName = "f" + std::to_string(FuncIdx);
   LLVMValueRef Callee = LLVMGetNamedFunction(LLMod, CalleeName.c_str());
@@ -263,9 +257,27 @@ void emitFwdThunk(LLVMModuleRef LLMod, LLVMContextRef Ctx, uint32_t FuncIdx,
   LLVMBuilderRef B = LLVMCreateBuilderInContext(Ctx);
   LLVMPositionBuilderAtEnd(B, Entry);
 
-  // %exec_ctx = call ptr @wasmedge_tier2_get_exec_ctx()
+  // Compute &Executor::ExecutionContext directly from TLS via inline asm.
+  // ExecutionContext is a thread_local struct (not a pointer), so we need
+  // its address = thread_pointer + offset. Two instructions:
+  //   movq %fs:0, %reg    — get thread pointer
+  //   addq $OFFSET, %reg  — add fixed offset to get struct address
+  // This replaces the previous call to the ORC-bound
+  // wasmedge_tier2_get_exec_ctx accessor, eliminating a function-call
+  // round-trip per fwd_thunk entry.
+  static const ptrdiff_t ExecCtxTlsOff =
+      wasmedge_tier2_get_exec_ctx_tls_offset();
+  LLVMTypeRef AsmFTy = LLVMFunctionType(PtrTy, nullptr, 0, /*IsVarArg=*/0);
+  std::string AsmStr =
+      "movq %fs:0, $0\n\taddq $$" + std::to_string(ExecCtxTlsOff) + ", $0";
+  std::string AsmCon = "=r";
+  LLVMValueRef AsmVal = LLVMGetInlineAsm(
+      AsmFTy, AsmStr.c_str(), AsmStr.size(),
+      AsmCon.c_str(), AsmCon.size(),
+      /*HasSideEffects=*/0, /*IsAlignStack=*/0,
+      LLVMInlineAsmDialectATT, /*CanThrow=*/0);
   LLVMValueRef ExecCtx =
-      LLVMBuildCall2(B, GetCtxFTy, GetCtx, nullptr, 0, "exec_ctx");
+      LLVMBuildCall2(B, AsmFTy, AsmVal, nullptr, 0, "exec_ctx");
 
   // Unmarshal params from args[] scratch buffer.
   LLVMValueRef Args = LLVMGetParam(Thunk, 1);
@@ -766,32 +778,21 @@ Tier2Compiler::compileBatch(Span<const uint32_t> BatchIdx,
   LLVMOrcExecutionSessionRef ES = LLVMOrcLLJITGetExecutionSession(JIT);
 
   // Define tier-2 helpers as absolute symbols:
-  //   - wasmedge_tier2_get_exec_ctx: returns &Executor::ExecutionContext,
-  //     used by fwd_thunks to build a valid ExecCtxPtrTy when tier-1
-  //     dispatches into tier-2 code via the FuncTable.
   //   - wasmedge_tier2_trace_thunk: debug trace for thunk entry.
-  // Note: wasmedge_tier2_get_jit_env was removed — t1_thunks now load the
-  // JitExecEnv* directly from TLS via inline asm (%fs:OFFSET).
+  // Note: wasmedge_tier2_get_jit_env and wasmedge_tier2_get_exec_ctx were
+  // removed — both t1_thunks and fwd_thunks now compute their TLS values
+  // directly via inline asm (%fs:OFFSET).
   {
-    LLVMOrcCSymbolMapPair Pairs[2];
+    LLVMOrcCSymbolMapPair Pairs[1];
     Pairs[0].Name =
-        LLVMOrcExecutionSessionIntern(ES, "wasmedge_tier2_get_exec_ctx");
+        LLVMOrcExecutionSessionIntern(ES, "wasmedge_tier2_trace_thunk");
     Pairs[0].Sym.Address = reinterpret_cast<LLVMOrcJITTargetAddress>(
-        reinterpret_cast<void *>(
-            &Executor::Executor::getThreadLocalExecutionContextPtr));
+        reinterpret_cast<void *>(&wasmedge_tier2_trace_thunk));
     Pairs[0].Sym.Flags.GenericFlags =
         LLVMJITSymbolGenericFlagsExported | LLVMJITSymbolGenericFlagsCallable;
     Pairs[0].Sym.Flags.TargetFlags = 0;
 
-    Pairs[1].Name =
-        LLVMOrcExecutionSessionIntern(ES, "wasmedge_tier2_trace_thunk");
-    Pairs[1].Sym.Address = reinterpret_cast<LLVMOrcJITTargetAddress>(
-        reinterpret_cast<void *>(&wasmedge_tier2_trace_thunk));
-    Pairs[1].Sym.Flags.GenericFlags =
-        LLVMJITSymbolGenericFlagsExported | LLVMJITSymbolGenericFlagsCallable;
-    Pairs[1].Sym.Flags.TargetFlags = 0;
-
-    LLVMOrcMaterializationUnitRef MU = LLVMOrcAbsoluteSymbols(Pairs, 2);
+    LLVMOrcMaterializationUnitRef MU = LLVMOrcAbsoluteSymbols(Pairs, 1);
     if (LLVMErrorRef Err = LLVMOrcJITDylibDefine(MainJD, MU)) {
       char *Msg = LLVMGetErrorMessage(Err);
       spdlog::error("tier2: define absolute symbols failed: {}",
