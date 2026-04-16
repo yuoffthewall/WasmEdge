@@ -688,20 +688,54 @@ thunk path, not less. The fix has a genuine failure mode on this kernel.
   faster LLVM compilation, or eliminating the forward-thunk path
   (`wasmedge_tier2_get_exec_ctx`) symmetrically.
 
-**P1b — next: inline `wasmedge_tier2_get_exec_ctx` (symmetric fix):**
+**P1b — shipped: inline `wasmedge_tier2_get_exec_ctx` via `%fs:offset`
+asm (2026-04-16):**
 
-- The forward thunks (`fN_fwd_thunk`) call
-  `wasmedge_tier2_get_exec_ctx` via the same ORC-absolute-symbol
-  pattern. Identical implementation: expose `Executor::ExecutionContext`
-  TLS, compute offset, emit inline asm in `emitFwdThunk`. Mechanical
-  follow-up now that the pattern is proven on the jit_env side.
-- Expected to help ctype (where forward thunks dominate) and further
-  narrow ed25519.
+- Replaced the `call @wasmedge_tier2_get_exec_ctx()` (ORC absolute
+  symbol) in every `fwd_thunk` with a two-instruction inline asm
+  sequence: `movq %fs:0, %reg; addq $OFFSET, %reg`. The offset is the
+  byte distance from the thread pointer to `Executor::ExecutionContext`
+  (a TLS struct, not a pointer — hence `lea`-style address computation
+  instead of the single `movq` used for jit_env).
+- Files changed: `lib/executor/engine/proxy.cpp` (added
+  `wasmedge_tier2_get_exec_ctx_tls_offset()`),
+  `lib/vm/tier2_compiler.cpp` (emit inline asm in `emitFwdThunk`,
+  removed ORC absolute-symbol binding — only `trace_thunk` remains).
+- All 33 sightglass-strong kernels pass correctness at tier-2
+  `THRESHOLD=10`.
+- Verified in IR dumps: zero `call @wasmedge_tier2_get_exec_ctx`,
+  27 inline asm instances with `%fs:0` in a single ed25519 batch.
+  LLVM optimized fwd_thunks to `tail call` with `nocapture readnone`
+  on unused tier-1 ABI params.
+- **Loss-cluster WT results** (3 runs/cell, `WARM_DIVISOR=256`,
+  `THRESHOLD=10000`, median µs):
 
-**P1c — collapse `fN_fwd_thunk` / `fN_t1_thunk`:**
+  | Kernel | Tier-1 only | Pre (P1a only) | **Post (P1a+P1b)** | Δ vs pre | vs tier-1 |
+  |---|---:|---:|---:|---:|---:|
+  | shootout-ctype | 8,247,228 | 16,421,569 | **8,988,644** | **−45.3%** | 1.09× |
+  | shootout-ed25519 | 8,791,976 | 10,244,926 | **8,755,025** | **−14.5%** | **0.99×** |
+  | blind-sig | 9,808,226 | 9,147,245 | **8,313,517** | **−9.1%** | **0.85×** |
+
+- **All three loss-cluster kernels now at or near tier-1 parity.**
+  ctype collapsed from 1.99× to 1.09× — the largest single-commit
+  improvement in the tier-2 project. ed25519 reached parity (0.99×).
+  blind-sig extended its lead to 0.85× (15% faster than tier-1).
+- The exec_ctx inline had a dramatically larger effect than the
+  jit_env inline (P1a) on ctype because ctype's workload is
+  dominated by fwd_thunk entries (tier-1 → tier-2 dispatch), not
+  t1_thunk entries (tier-2 → tier-1 dispatch). P1a helped the
+  t1_thunk path; P1b helps the fwd_thunk path. ctype's tiny
+  predicates are called millions of times through fwd_thunks, so
+  even ~10-15 cycles saved per entry compounds massively.
+
+**P1c — next: collapse `fN_fwd_thunk` / `fN_t1_thunk`:**
 
 - Fold FuncTable indirection into the call site so the call is direct.
-  Highest-effort item; deferred until P1a/P1b results are measured.
+  With P1a+P1b shipped, the remaining fwd_thunk overhead is arg
+  unmarshalling + extra indirect call (~15 cycles). Eliminating the
+  thunk entirely would make tier-2 at least as fast as tier-1 for every
+  promoted function. Deferred until a use case demands closing the
+  remaining 1.09× gap on ctype.
 
 **P2 — investigate the rhr regression independently:**
 
@@ -724,9 +758,10 @@ correct and necessary piece of the eventual fast path. Reverting would
 also revert the small but real wins on rust-protobuf / rust-compression /
 richards / seqhash / switch / gcc-loops from the aggregate sweep. What
 the fix cannot do — *and was never going to do alone* — is close the
-cross-batch thunk tax. P1a (TLS inline) takes the first bite: −20% on
-blind-sig, −10.5% on ed25519. P1b (exec_ctx inline) and P1c (thunk
-collapse) are the remaining levers.
+cross-batch thunk tax. P1a+P1b (TLS inline on both t1_thunks and
+fwd_thunks) closed the gap dramatically: ctype 1.99× → 1.09×,
+ed25519 1.33× → 0.99×, blind-sig 1.20× → 0.85×. P1c (thunk collapse)
+is the remaining lever for the last ~9% on ctype.
 
 ### Parameter cheat sheet (post-revision)
 
