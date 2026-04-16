@@ -23,16 +23,31 @@ extern "C" {
 
 namespace {
 static thread_local jmp_buf g_termination_buf;
-// Thread-local current JitExecEnv*, set by IRJitEngine::invoke before
-// dispatching into tier-1 JIT code. Tier-2 code reads it via the helper
-// `wasmedge_tier2_get_jit_env` when its t1_thunks need to dispatch back
-// into tier-1 via FuncTable[idx] — the tier-1 calling convention needs
-// the JitExecEnv* as arg0, which is not otherwise available to tier-2.
-static thread_local WasmEdge::VM::JitExecEnv *g_tier2_current_env = nullptr;
 } // namespace
 
+// Thread-local JitExecEnv pointer, published by IRJitEngine::invoke before
+// dispatching into tier-1 JIT code. Tier-2 t1_thunks read this to get the
+// JitExecEnv* needed for the tier-1 ABI (arg0). Exposed with external C
+// linkage so tier2_compiler.cpp can compute its TLS offset at JIT compile
+// time and emit a direct %fs:OFFSET load instead of a function call.
+extern "C" {
+thread_local WasmEdge::VM::JitExecEnv *wasmedge_tier2_jit_env_tls;
+}
+
+// Legacy accessor — the hot path now uses a direct %fs:offset inline asm
+// emitted by tier2_compiler.cpp. Kept for the ORC absolute-symbol fallback
+// and any out-of-tree consumers.
 extern "C" void *wasmedge_tier2_get_jit_env(void) {
-  return g_tier2_current_env;
+  return wasmedge_tier2_jit_env_tls;
+}
+
+// Returns the byte offset of wasmedge_tier2_jit_env_tls from the thread
+// pointer (%fs:0 on x86_64-linux). The offset is fixed once the DSO is
+// loaded and is the same for all threads, so the JIT can hardcode it.
+extern "C" ptrdiff_t wasmedge_tier2_get_jit_env_tls_offset(void) {
+  uintptr_t TP;
+  asm volatile("mov %%fs:0, %0" : "=r"(TP));
+  return reinterpret_cast<uintptr_t>(&wasmedge_tier2_jit_env_tls) - TP;
 }
 
 namespace {
@@ -240,11 +255,11 @@ Expect<void> IRJitEngine::invoke(void *NativeFunc,
   // dispatch tier-2 → tier-1 calls via FuncTable[idx], which require a
   // JitExecEnv* as arg0 that is not otherwise reachable from tier-2 code.
   // Save/restore for re-entrancy (e.g. a host callback re-enters invoke).
-  WasmEdge::VM::JitExecEnv *SavedTlsEnv = g_tier2_current_env;
-  g_tier2_current_env = &Env;
+  WasmEdge::VM::JitExecEnv *SavedTlsEnv = wasmedge_tier2_jit_env_tls;
+  wasmedge_tier2_jit_env_tls = &Env;
   struct TlsRestore {
     WasmEdge::VM::JitExecEnv *Prev;
-    ~TlsRestore() { g_tier2_current_env = Prev; }
+    ~TlsRestore() { wasmedge_tier2_jit_env_tls = Prev; }
   } TlsRestore_{SavedTlsEnv};
 
   void *termBuf = wasmedge_ir_jit_get_termination_buf();
