@@ -728,14 +728,52 @@ asm (2026-04-16):**
   predicates are called millions of times through fwd_thunks, so
   even ~10-15 cycles saved per entry compounds massively.
 
-**P1c — next: collapse `fN_fwd_thunk` / `fN_t1_thunk`:**
+**P1c — shipped: collapse fwd_thunk via `alwaysinline` (2026-04-16):**
 
-- Fold FuncTable indirection into the call site so the call is direct.
-  With P1a+P1b shipped, the remaining fwd_thunk overhead is arg
-  unmarshalling + extra indirect call (~15 cycles). Eliminating the
-  thunk entirely would make tier-2 at least as fast as tier-1 for every
-  promoted function. Deferred until a use case demands closing the
-  remaining 1.09× gap on ctype.
+- **Root cause of the remaining 1.09× gap on ctype:** LLVM's O2
+  inliner was not inlining `f<idx>` into `f<idx>_fwd_thunk` despite
+  both being in the same module. The LLVM frontend emits every
+  function as `define protected dllexport external`, which tells the
+  inliner the definition must be preserved for external callers —
+  penalizing inlining even for tiny functions.
+- **Fix:** After the LLVM frontend compiles the mini-module and after
+  all thunks are emitted, mark each batch function:
+  `LLVMInternalLinkage` + `LLVMDefaultVisibility` +
+  `LLVMDefaultStorageClass` + `alwaysinline` attribute. This tells
+  LLVM no external caller exists and forces inlining into the
+  fwd_thunk. After inlining, DCE removes the original `f<idx>`.
+- **Blocker discovered and fixed:** LLVM refused `alwaysinline` across
+  a `strictfp` attribute mismatch — batch functions have `strictfp`
+  (set by the LLVM frontend) but fwd_thunks did not. Fixed by adding
+  `strictfp` + `uwtable` to fwd_thunks in `emitFwdThunk`.
+- Files changed: `lib/vm/tier2_compiler.cpp` only — added
+  `strictfp`+`uwtable` to fwd_thunks in `emitFwdThunk`, added
+  `internal`+`alwaysinline` loop in `compileBatch` before opt pass.
+- All 33 sightglass-strong kernels pass correctness.
+- Verified in IR dumps: `f22_fwd_thunk` now contains the fully inlined
+  body of `f22` (arithmetic ops directly in the thunk, no call). Only
+  4 calls to `@f<N>` remain in the ctype batch (larger functions where
+  LLVM's cost model decided not to inline transitively).
+- **Loss-cluster WT results** (3 runs/cell, `WARM_DIVISOR=256`,
+  `THRESHOLD=10000`, median µs):
+
+  | Kernel | Tier-1 only | Pre (P1a+P1b) | **Post (P1c)** | Δ vs pre | vs tier-1 |
+  |---|---:|---:|---:|---:|---:|
+  | shootout-ctype | 8,199,220 | 8,988,644 | **8,177,972** | **−9.0%** | **0.997×** |
+  | shootout-ed25519 | 8,449,602 | 8,755,025 | **7,799,682** | **−10.9%** | **0.923×** |
+  | blind-sig | 9,493,974 | 8,313,517 | **7,992,502** | **−3.9%** | **0.842×** |
+
+- **The loss cluster no longer exists.** All three kernels now match or
+  beat tier-1:
+  - ctype: 1.99× → 1.09× → **0.997×** (parity)
+  - ed25519: 1.33× → 0.99× → **0.92×** (8% faster than tier-1)
+  - blind-sig: 1.20× → 0.85× → **0.84×** (16% faster than tier-1)
+- The full P1 arc (P1a+P1b+P1c) took tier-2 from **actively
+  regressing** the loss cluster (2× slower than tier-1) to **matching
+  or beating** it. The combined mechanism: P1a inlined the t1_thunk
+  TLS accessor, P1b inlined the fwd_thunk TLS accessor, P1c collapsed
+  the fwd_thunk call boundary so LLVM can optimize the unmarshal +
+  function body as a single unit.
 
 **P2 — investigate the rhr regression independently:**
 
@@ -753,15 +791,14 @@ asm (2026-04-16):**
   that the loss-cluster gains carry into the aggregate and that the rhr
   regression doesn't blow out the geomean.
 
-**Do not give up the fix.** The empirical picture is that walk-up is a
-correct and necessary piece of the eventual fast path. Reverting would
-also revert the small but real wins on rust-protobuf / rust-compression /
-richards / seqhash / switch / gcc-loops from the aggregate sweep. What
-the fix cannot do — *and was never going to do alone* — is close the
-cross-batch thunk tax. P1a+P1b (TLS inline on both t1_thunks and
-fwd_thunks) closed the gap dramatically: ctype 1.99× → 1.09×,
-ed25519 1.33× → 0.99×, blind-sig 1.20× → 0.85×. P1c (thunk collapse)
-is the remaining lever for the last ~9% on ctype.
+**The loss cluster is closed.** The full P1 arc (P1a: t1_thunk TLS
+inline, P1b: fwd_thunk TLS inline, P1c: fwd_thunk collapse via
+`alwaysinline`) took tier-2 from 2× slower than tier-1 on ctype to
+parity (0.997×), and from 1.33× slower on ed25519 to 8% faster
+(0.92×). blind-sig improved from 1.20× to 0.84×. The root-anchored
+BFS batching fix remains a correct and necessary building block — it
+ensures hot functions land in the same batch, which P1c then exploits
+by letting LLVM inline them into a single optimized entry point.
 
 ### Parameter cheat sheet (post-revision)
 
