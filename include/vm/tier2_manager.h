@@ -102,12 +102,14 @@ private:
                    const uint32_t *CallCounters) noexcept;
 
   /// BFS down from Root collecting scalar-promotable descendants not yet
-  /// in Seen_, bounded by BfsMaxDepth_ and MaxBatchSize_. Ensures
-  /// HotFuncIdx appears in the result. Caller must hold Mu_.
+  /// in Seen_, bounded by BfsMaxDepth_ and MaxBatchSize_. Callees with
+  /// zero call count are excluded (never actually called at runtime).
+  /// Ensures HotFuncIdx appears in the result. Caller must hold Mu_.
   std::vector<uint32_t>
   bfsDownBatchLocked(const AST::Module &Mod, const ModuleCG &CG,
                      uint32_t Root, uint32_t HotFuncIdx,
-                     uintptr_t FTKey) noexcept;
+                     uintptr_t FTKey,
+                     const uint32_t *CallCounters) noexcept;
 
   std::thread Worker_;
   std::mutex Mu_;
@@ -119,11 +121,15 @@ private:
   std::atomic<bool> WorkerDone_{false};
   std::atomic<uint32_t> Tier2Count_{0};
 
-  // Batching knobs loaded from env vars in the constructor.
-  uint32_t Tier2Threshold_ = 10000;     // matches WASMEDGE_TIER2_THRESHOLD
-  uint32_t WarmDivisor_ = 256;          // WASMEDGE_TIER2_WARM_DIVISOR
-  uint32_t WalkupMaxDepth_ = 1;         // WASMEDGE_TIER2_WALKUP_DEPTH
-  uint32_t BfsMaxDepth_ = 2;            // WASMEDGE_TIER2_BFS_DEPTH
+  // Threshold loaded from env var; batching geometry is fixed.
+  uint32_t Tier2Threshold_ = 1000;      // WASMEDGE_TIER2_THRESHOLD
+  // Warm floor = Threshold/256 ≈ 39 calls. Picked empirically from a
+  // WARM_DIVISOR sweep on the loss cluster (divisor 2 was ~30x too strict;
+  // 256 reliably batches {root,hot,siblings}). See
+  // notes/benchmarking/tier2_v2_vs_llvm_jit_benchmark.md.
+  static constexpr uint32_t WarmDivisor_ = 256;
+  static constexpr uint32_t WalkupMaxDepth_ = 1;
+  static constexpr uint32_t BfsMaxDepth_ = 2;
   static constexpr uint32_t MaxBatchSize_ = 12;
 
   // Telemetry aggregates (dumped at shutdown).

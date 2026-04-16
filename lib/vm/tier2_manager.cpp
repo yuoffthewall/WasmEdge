@@ -93,21 +93,7 @@ uint32_t envAsU32(const char *Name, uint32_t Default) noexcept {
 } // namespace
 
 Tier2Manager::Tier2Manager() noexcept {
-  Tier2Threshold_ = envAsU32("WASMEDGE_TIER2_THRESHOLD", 10000);
-  // Default 256 (warm floor = Threshold/256 = ~39 calls) picked empirically
-  // from a WARM_DIVISOR sweep on the loss cluster. The fix's walk-up path
-  // only fires when a hot leaf's direct caller has already been called
-  // >= warm floor times. Leaves with call fan-out N from their parent hit
-  // the tier-up threshold while the parent sits at ~threshold/N calls;
-  // crypto field ops and ctype byte predicates measured fanouts of 20-60x,
-  // so the previous default (divisor=2, floor=5000) was ~30x too strict
-  // and walk-up fired on 0/4 ctype batches, 1/10 ed25519, 1/25 blind-sig.
-  // At divisor=256 walk-up reliably batches {root,hot,siblings} and
-  // unlocks +3-13% WT on the loss cluster. See
-  // notes/benchmarking/tier2_v2_vs_llvm_jit_benchmark.md.
-  WarmDivisor_ = envAsU32("WASMEDGE_TIER2_WARM_DIVISOR", 256);
-  WalkupMaxDepth_ = envAsU32("WASMEDGE_TIER2_WALKUP_DEPTH", 1);
-  BfsMaxDepth_ = envAsU32("WASMEDGE_TIER2_BFS_DEPTH", 2);
+  Tier2Threshold_ = envAsU32("WASMEDGE_TIER2_THRESHOLD", 1000);
   Worker_ = std::thread([this] { workerLoop(); });
 }
 
@@ -244,7 +230,8 @@ Tier2Manager::walkUpRootLocked(const AST::Module &Mod, const ModuleCG &CG,
 std::vector<uint32_t>
 Tier2Manager::bfsDownBatchLocked(const AST::Module &Mod, const ModuleCG &CG,
                                  uint32_t Root, uint32_t HotFuncIdx,
-                                 uintptr_t FTKey) noexcept {
+                                 uintptr_t FTKey,
+                                 const uint32_t *CallCounters) noexcept {
   std::vector<uint32_t> Batch;
   Batch.reserve(MaxBatchSize_);
   std::unordered_set<uint32_t> InBatch;
@@ -289,6 +276,14 @@ Tier2Manager::bfsDownBatchLocked(const AST::Module &Mod, const ModuleCG &CG,
         break;
       if (InBatch.count(C))
         continue;
+      // Skip callees that were never actually called at runtime.
+      // Static call edges include cold paths (error handlers, init
+      // routines) that waste batch slots and LLVM compile time.
+      if (CallCounters) {
+        uint32_t CCount = CallCounters[C];
+        if (CCount == 0)
+          continue;
+      }
       Frontier.push_back({C, D + 1});
     }
   }
@@ -335,7 +330,8 @@ void Tier2Manager::enqueue(uint32_t FuncIdx,
 
     auto [Root, Hops] =
         walkUpRootLocked(*Mod, CG, FuncIdx, FTKey, CallCounters);
-    auto Batch = bfsDownBatchLocked(*Mod, CG, Root, FuncIdx, FTKey);
+    auto Batch =
+        bfsDownBatchLocked(*Mod, CG, Root, FuncIdx, FTKey, CallCounters);
     if (Batch.empty()) {
       Seen_.insert(std::make_pair(FTKey, FuncIdx));
       return;
