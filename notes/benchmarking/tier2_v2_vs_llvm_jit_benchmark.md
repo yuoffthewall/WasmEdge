@@ -640,28 +640,68 @@ thunk path, not less. The fix has a genuine failure mode on this kernel.
 
 ### Action items (revised, prioritized)
 
-**P0 — ship now, in this investigation:**
+**P0 — shipped:**
 
 - **Change `WASMEDGE_TIER2_WARM_DIVISOR` default from 2 → 256.** Direct
   consequence of Finding 2/3 above. Loss cluster reclaims 3–13% WT per
   kernel at the cost of ~1% additional rhr regression on top of the
-  larger rhr regression that already exists at `d=2`. (Already applied
-  in `lib/vm/tier2_manager.cpp`.)
+  larger rhr regression that already exists at `d=2`. (Applied in
+  `lib/vm/tier2_manager.cpp`.)
 - `WALKUP_DEPTH=1`, `BFS_DEPTH=2` are unchanged — no evidence in the
   measured kernels that either knob matters at the shipped value.
 
-**P1 — critical path (elevated from "orthogonal" in the original plan):**
+**P1a — shipped: inline TLS accessor via `%fs:offset` asm
+(2026-04-16):**
 
-- **Inline `wasmedge_tier2_get_jit_env`** (TLS accessor, currently an
-  ORC absolute symbol, uninlinable) by replacing it with an
-  `alwaysinline` shim baked into every batch module.
-- **Collapse `fN_fwd_thunk` / `fN_t1_thunk` where possible** — at least
-  for the common in-process case, fold the FuncTable indirection into
-  the call site so the call is direct.
-- **Success criterion:** tier-2 enabled WT ≤ tier-1-only WT on the
-  loss cluster. Finding 4 makes this the *minimum bar* — currently
-  tier-2 is net-negative. Only after this bar is met can we
-  meaningfully compare tier-2 to LLVM O2.
+- Replaced the `call @wasmedge_tier2_get_jit_env()` (ORC absolute
+  symbol, opaque to LLVM) in every `t1_thunk` with a hardcoded
+  `movq %fs:OFFSET, %reg` inline asm. The TLS offset is computed once
+  at JIT compile time and baked into the asm string. LLVM inlines the
+  t1_thunk body into batch callers, so the TLS load folds into the
+  surrounding code — verified in IR dumps (60 inlined instances in a
+  single-function ed25519 batch).
+- Files changed: `lib/vm/ir_jit_engine.cpp` (exposed
+  `wasmedge_tier2_jit_env_tls` with `extern "C"` linkage, added
+  `wasmedge_tier2_get_jit_env_tls_offset()`),
+  `lib/vm/tier2_compiler.cpp` (emit inline asm in `emitT1ThunkInPlace`,
+  removed the ORC absolute-symbol binding for the accessor).
+- All 33 sightglass-strong kernels pass correctness at tier-2
+  `THRESHOLD=10, LOOP_THRESHOLD=5`.
+- **Loss-cluster WT results** (3 runs/cell, `WARM_DIVISOR=256`,
+  `THRESHOLD=10000`, median µs):
+
+  | Kernel | Tier-1 only | Pre (d=256) | **Post (TLS inline)** | Δ vs pre | vs tier-1 |
+  |---|---:|---:|---:|---:|---:|
+  | shootout-ctype | 8,241,394 | 16,415,051 | 16,421,569 | +0.0% | 1.99× |
+  | shootout-ed25519 | 8,630,537 | 11,441,281 | **10,244,926** | **−10.5%** | 1.19× |
+  | blind-sig | 9,503,289 | 11,431,619 | **9,147,245** | **−20.0%** | **0.96×** |
+
+- **blind-sig now beats tier-1 alone** (0.96×). ed25519 improved from
+  1.33× to 1.19× overhead vs tier-1. ctype is flat — at `d=256` the
+  batch already captures most callees, so there are few cross-batch
+  calls for the TLS inline to help. ctype's 2× overhead is dominated
+  by compilation latency eating into wall time, not cross-batch call
+  cost.
+- The P1 success criterion (tier-2 WT ≤ tier-1 WT on all three
+  loss-cluster kernels) is met on blind-sig, narrowed on ed25519,
+  and unchanged on ctype. ctype needs a different lever — either
+  faster LLVM compilation, or eliminating the forward-thunk path
+  (`wasmedge_tier2_get_exec_ctx`) symmetrically.
+
+**P1b — next: inline `wasmedge_tier2_get_exec_ctx` (symmetric fix):**
+
+- The forward thunks (`fN_fwd_thunk`) call
+  `wasmedge_tier2_get_exec_ctx` via the same ORC-absolute-symbol
+  pattern. Identical implementation: expose `Executor::ExecutionContext`
+  TLS, compute offset, emit inline asm in `emitFwdThunk`. Mechanical
+  follow-up now that the pattern is proven on the jit_env side.
+- Expected to help ctype (where forward thunks dominate) and further
+  narrow ed25519.
+
+**P1c — collapse `fN_fwd_thunk` / `fN_t1_thunk`:**
+
+- Fold FuncTable indirection into the call site so the call is direct.
+  Highest-effort item; deferred until P1a/P1b results are measured.
 
 **P2 — investigate the rhr regression independently:**
 
@@ -675,19 +715,18 @@ thunk path, not less. The fix has a genuine failure mode on this kernel.
 
 **P3 — suite-wide re-sweep at the new default:**
 
-- Full sightglass-strong at `WARM_DIVISOR=256` to confirm that the
-  loss-cluster gains on ed25519 / blind-sig / ctype carry into the
-  aggregate and that the rhr regression doesn't blow out the geomean.
-  Expected: WT geomean moves from 0.819× → ~0.84–0.87×. P1 (thunk
-  inlining) is what pushes it further toward 1.0×.
+- Full sightglass-strong at `WARM_DIVISOR=256` + TLS inline to confirm
+  that the loss-cluster gains carry into the aggregate and that the rhr
+  regression doesn't blow out the geomean.
 
 **Do not give up the fix.** The empirical picture is that walk-up is a
 correct and necessary piece of the eventual fast path. Reverting would
 also revert the small but real wins on rust-protobuf / rust-compression /
 richards / seqhash / switch / gcc-loops from the aggregate sweep. What
 the fix cannot do — *and was never going to do alone* — is close the
-cross-batch thunk tax. That is a separate lever, and it is now the
-gating work item.
+cross-batch thunk tax. P1a (TLS inline) takes the first bite: −20% on
+blind-sig, −10.5% on ed25519. P1b (exec_ctx inline) and P1c (thunk
+collapse) are the remaining levers.
 
 ### Parameter cheat sheet (post-revision)
 
@@ -712,3 +751,6 @@ WASMEDGE_TIER2_BFS_DEPTH=2          # BFS down from {root, hot}, depth 2
   rest on directly measured batch counts and WT sweeps.
 - The knob sweep covers the loss cluster plus rhr. A full
   sightglass-strong re-sweep at the new default is scheduled as P3.
+- P1a TLS inline numbers were captured on a quiet machine session
+  separate from the aggregate sweep. Tier-1 baselines were re-measured
+  in the same session for valid comparison.
