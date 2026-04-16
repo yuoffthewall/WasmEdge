@@ -104,13 +104,12 @@ for wasm in ../test/ir/testdata/sightglass/*.wasm; do
   WASMEDGE_IR_JIT_OPT_LEVEL=2 \
   WASMEDGE_TIER2_ENABLE=1 \
   WASMEDGE_TIER2_THRESHOLD=10 \
-  WASMEDGE_TIER2_LOOP_THRESHOLD=5 \
   stdbuf -oL timeout 60 ./test/ir/wasmedgeIRBenchmarkTests --gtest_filter='*SightglassSuite*' 2>&1
 done | tee /tmp/wasm-tier2-test.log
 ```
 
 Notes:
-- Thresholds are set aggressively low (`THRESHOLD=10`, `LOOP_THRESHOLD=5`) so even short kernels trip tier-2 quickly. Defaults are 10000 / 1000.
+- Threshold is set aggressively low (`THRESHOLD=10`) so even short kernels trip tier-2 quickly. Default is 1000.
 - Timeout is bumped to 60s to give the background worker room to finish recompiles on slower kernels.
 
 # Debugging with GDB
@@ -170,9 +169,8 @@ Tier-2 promotes hot IR-JIT functions to an LLVM-compiled version on a background
 
 | Variable | Purpose |
 |----------|---------|
-| `WASMEDGE_TIER2_ENABLE=1` | Master switch. **Only `1` enables it**; any other value is ignored. Sets default thresholds (`THRESHOLD=10000`, `LOOP_THRESHOLD=1000`). |
-| `WASMEDGE_TIER2_THRESHOLD=N` | Function-entry hotness count that triggers tier-2 compile (default 10000, only read when `ENABLE=1`). |
-| `WASMEDGE_TIER2_LOOP_THRESHOLD=N` | Loop back-edge hotness count that triggers tier-2 compile (default 1000, only read when `ENABLE=1`). |
+| `WASMEDGE_TIER2_ENABLE=1` | Master switch. **Only `1` enables it**; any other value is ignored. Default threshold is 1000. |
+| `WASMEDGE_TIER2_THRESHOLD=N` | Function-entry hotness count that triggers tier-2 compile (default 1000, only read when `ENABLE=1`). All functions use the same threshold (the former `LOOP_THRESHOLD` split was removed). |
 | `WASMEDGE_TIER2_MAX_COMPILE=N` | Debug: cap total tier-2 compilations the worker will perform in this process (default unlimited). |
 | `WASMEDGE_TIER2_TRACE_FUNC=idx` | Trace a single wasm function index through the tier-2 compiler (verbose logging). |
 | `WASMEDGE_TIER2_DUMP_IR=dir` | Dump each tier-2 LLVM module to `<dir>/tier2_f<idx>.ll` before codegen. Directory must exist. |

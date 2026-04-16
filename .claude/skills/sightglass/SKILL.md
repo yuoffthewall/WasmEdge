@@ -89,7 +89,6 @@ for wasm in ../test/ir/testdata/sightglass/*.wasm; do
   WASMEDGE_IR_JIT_OPT_LEVEL=2 \
   WASMEDGE_TIER2_ENABLE=1 \
   WASMEDGE_TIER2_THRESHOLD=10 \
-  WASMEDGE_TIER2_LOOP_THRESHOLD=5 \
   stdbuf -oL timeout 60 ./test/ir/wasmedgeIRBenchmarkTests --gtest_filter='*SightglassSuite*' 2>&1
 done | tee /tmp/wasm-tier2-test.log 2>&1
 ```
@@ -100,7 +99,7 @@ Sightglass harness: `MODE` (Interpreter/JIT/IR_JIT/AOT), `DIR`, `KERNEL`, `QUICK
 
 IR JIT: `WASMEDGE_IR_JIT_OPT_LEVEL` (0/1/2, default 2), `WASMEDGE_IR_JIT_DUMP` (writes `/tmp/wasmedge_ir_NNN_{before,after}.ir`), `WASMEDGE_IR_JIT_BOUND_CHECK`.
 
-Tier-2: `WASMEDGE_TIER2_ENABLE=1` (only `1` works), `THRESHOLD` (default 10000), `LOOP_THRESHOLD` (default 1000), `MAX_COMPILE`, `TRACE_FUNC`, `DUMP_IR=<dir>`.
+Tier-2: `WASMEDGE_TIER2_ENABLE=1` (only `1` works), `THRESHOLD` (default 1000), `MAX_COMPILE`, `TRACE_FUNC`, `DUMP_IR=<dir>`. Batching geometry (warm divisor, walk-up depth, BFS depth) is hardcoded.
 
 ## Debugging a JIT crash
 

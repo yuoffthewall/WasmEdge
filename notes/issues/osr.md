@@ -415,6 +415,23 @@ implementation.
 
 ---
 
+## Complementary change: caller-driven promotion
+
+OSR fixes the *entry mechanism* (replacing the running loop body with
+LLVM code). A separate improvement fixes *batch composition* (which
+callees land in the same LLVM module): change the promotion trigger
+from callee-driven to caller-driven. Instead of the leaf tripping
+first and being promoted alone, the caller trips and pulls its hot
+callees into the batch.
+
+The same back-edge counter that triggers OSR can also trigger
+caller-driven batch compilation. First trip: enqueue the caller + hot
+callees for LLVM compilation. Second trip (after compilation): OSR
+transition into the compiled loop body. See
+`notes/issues/caller_driven_promotion.md` for the full design.
+
+---
+
 ## What OSR does NOT help
 
 - **Kernels where tier-1 already matches LLVM** (nestedloop, richards,
