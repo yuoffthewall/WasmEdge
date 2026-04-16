@@ -243,6 +243,22 @@ void emitFwdThunk(LLVMModuleRef LLMod, LLVMContextRef Ctx, uint32_t FuncIdx,
       LLVMAddFunction(LLMod, ThunkName.c_str(), ThunkFTy);
   LLVMSetLinkage(Thunk, LLVMExternalLinkage);
 
+  // Match the strictfp+uwtable attributes the LLVM frontend sets on
+  // batch functions. Without strictfp on the thunk, LLVM refuses to
+  // inline a strictfp callee into a non-strictfp caller — blocking P1c.
+  {
+    unsigned StrictFPKind = LLVMGetEnumAttributeKindForName(
+        "strictfp", static_cast<unsigned>(std::strlen("strictfp")));
+    LLVMAddAttributeAtIndex(
+        Thunk, LLVMAttributeFunctionIndex,
+        LLVMCreateEnumAttribute(Ctx, StrictFPKind, 0));
+    unsigned UWTableKind = LLVMGetEnumAttributeKindForName(
+        "uwtable", static_cast<unsigned>(std::strlen("uwtable")));
+    LLVMAddAttributeAtIndex(
+        Thunk, LLVMAttributeFunctionIndex,
+        LLVMCreateEnumAttribute(Ctx, UWTableKind, 0));
+  }
+
   // Look up the target function `f<FuncIdx>` already in the module.
   const std::string CalleeName = "f" + std::to_string(FuncIdx);
   LLVMValueRef Callee = LLVMGetNamedFunction(LLMod, CalleeName.c_str());
@@ -715,10 +731,32 @@ Tier2Compiler::compileBatch(Span<const uint32_t> BatchIdx,
                   NonBatchCallees.size());
   }
 
+  // P1c: Mark batch functions internal+alwaysinline so the O2 inliner
+  // merges them into their fwd_thunks, eliminating the call overhead.
+  // The LLVM frontend emits functions as `protected dllexport external`,
+  // which prevents inlining; we override that here before the opt pass.
+  {
+    unsigned AlwaysInlineKind = LLVMGetEnumAttributeKindForName(
+        "alwaysinline", static_cast<unsigned>(std::strlen("alwaysinline")));
+    for (uint32_t FuncIdx : BatchIdx) {
+      std::string Name = "f" + std::to_string(FuncIdx);
+      LLVMValueRef Fn = LLVMGetNamedFunction(LLMod, Name.c_str());
+      if (!Fn)
+        continue;
+      LLVMSetLinkage(Fn, LLVMInternalLinkage);
+      LLVMSetVisibility(Fn, LLVMDefaultVisibility);
+      LLVMSetDLLStorageClass(Fn, LLVMDefaultStorageClass);
+      LLVMAttributeRef Attr =
+          LLVMCreateEnumAttribute(LLCtx, AlwaysInlineKind, 0);
+      LLVMAddAttributeAtIndex(Fn, LLVMAttributeFunctionIndex, Attr);
+    }
+  }
+
   // Run LLVM opt on the post-processed module now that all thunks and
   // stub rewrites are in place. The WasmEdge frontend was invoked at O0,
   // so call sites to non-batch stubs (now t1_thunks) are still intact.
-  // Opt here is free to inline t1_thunks where profitable.
+  // Opt here is free to inline t1_thunks where profitable, and batch
+  // functions (now alwaysinline) get merged into their fwd_thunks.
   if (P->TM && OptLevel > 0) {
     const char *Pipeline = OptLevel >= 3 ? "default<O3>"
                             : OptLevel == 2 ? "default<O2>"
