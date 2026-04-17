@@ -191,6 +191,19 @@ Tier2Manager::walkUpRootLocked(const AST::Module &Mod, const ModuleCG &CG,
   // parents into the batch and ruin inlining quality.
   const uint32_t WarmThreshold =
       std::max<uint32_t>(1, Tier2Threshold_ / std::max<uint32_t>(1, WarmDivisor_));
+  // Additional ratio gate: candidate ancestor must be at least
+  // 1/RootHotRatioDen_ as hot as the leaf that tripped tier-up. Falls
+  // through to (HotFuncIdx, 0) when nothing qualifies, letting BFS-down
+  // anchor on the leaf itself.
+  //
+  // The leaf's counter has already been saturated to UINT32_MAX by
+  // jit_tier_up_notify before we get here. We know it just crossed
+  // Tier2Threshold_, so use that as the effective leaf count: it's a
+  // lower bound (actual may have been higher before saturation) and
+  // keeps the ratio arithmetic inside a sensible range.
+  uint32_t LeafCount = CallCounters[HotFuncIdx];
+  if (LeafCount == UINT32_MAX)
+    LeafCount = Tier2Threshold_;
   uint32_t Root = HotFuncIdx;
   uint32_t Hops = 0;
   std::unordered_set<uint32_t> Visited;
@@ -218,6 +231,10 @@ Tier2Manager::walkUpRootLocked(const AST::Module &Mod, const ModuleCG &CG,
       if (CCount == UINT32_MAX)
         continue;
       if (CCount < WarmThreshold)
+        continue;
+      // Ratio gate: CCount * RootHotRatioDen_ >= LeafCount.
+      // Using uint64_t to avoid overflow at extreme leaf counts.
+      if (static_cast<uint64_t>(CCount) * RootHotRatioDen_ < LeafCount)
         continue;
       if (Best == UINT32_MAX || CCount > BestCount) {
         Best = C;
@@ -436,15 +453,18 @@ void Tier2Manager::workerLoop() {
         WorkerDone_.store(true, std::memory_order_release);
         return;
       }
-      // Prefer regular batches first for fairness; OSR drains after.
-      if (!Queue_.empty()) {
-        Req = std::move(Queue_.front());
-        Queue_.pop();
-        HaveBatch = true;
-      } else if (!OsrQueue_.empty()) {
+      // OSR drains first: it's the only mechanism that can transfer a
+      // mid-execution frame into tier-2, so delaying it behind a ~2s O2
+      // batch can make the compile arrive after the frame has returned
+      // (one-shot mains like ed25519 `_start → f8`).
+      if (!OsrQueue_.empty()) {
         OsrReq = std::move(OsrQueue_.front());
         OsrQueue_.pop();
         HaveOsr = true;
+      } else if (!Queue_.empty()) {
+        Req = std::move(Queue_.front());
+        Queue_.pop();
+        HaveBatch = true;
       }
     }
 

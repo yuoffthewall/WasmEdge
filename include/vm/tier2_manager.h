@@ -161,6 +161,12 @@ private:
   // 256 reliably batches {root,hot,siblings}). See
   // notes/benchmarking/tier2_v2_vs_llvm_jit_benchmark.md.
   static constexpr uint32_t WarmDivisor_ = 256;
+  // Walk-up rejects an ancestor whose runtime counter is less than
+  // 1/RootHotRatioDen_ of the leaf's counter. Prevents one-shot callers
+  // (e.g. ed25519 `_start → f8`, f8 called exactly once) from anchoring
+  // an expensive batch compile when only the leaf is genuinely hot.
+  // Applied on top of the WarmDivisor_ floor.
+  static constexpr uint32_t RootHotRatioDen_ = 10;
   static constexpr uint32_t WalkupMaxDepth_ = 1;
   static constexpr uint32_t BfsMaxDepth_ = 2;
   static constexpr uint32_t MaxBatchSize_ = 12;
