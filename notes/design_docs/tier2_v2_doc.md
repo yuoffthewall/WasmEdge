@@ -338,6 +338,119 @@ Direct calls only — transitive callees wait for their own tier-up events.
 
 ---
 
+## Batch selection: walk-up root + down-BFS
+
+`Tier2Manager::enqueue` runs two graph passes before handing the request
+off to the worker. Both live under `Mu_` and consult the static call
+graph cached in `ModuleCG` (forward edges with static call frequency,
+reverse edges for walk-up).
+
+### 1. `walkUpRootLocked` — pick the batch anchor
+
+Starting from `HotFuncIdx` (the leaf that tripped the counter), walk up
+the reverse call graph to the hottest ancestor that passes **two**
+gates. Bounded by `WalkupMaxDepth_ = 1` (at most one hop up).
+
+**Gate A — warm floor.**
+`CallCounters[C] >= max(1, Tier2Threshold_ / WarmDivisor_)`. With
+`WarmDivisor_ = 256` this floor is a fraction of the tier-up threshold;
+at `Tier2Threshold_ = 10` it collapses to `>= 1` and does nothing on
+its own. Its real job is to keep walk-up from anchoring on stone-cold
+ancestors at production thresholds (1000+).
+
+**Gate B — ratio gate.**
+`CallCounters[C] * RootHotRatioDen_ >= LeafCount`, i.e. the ancestor
+must be at least `1/RootHotRatioDen_ = 1/10` as hot as the leaf. This is
+the gate that matters at low thresholds and matches the intuition
+"anchor on something that actually justifies the compile".
+
+`LeafCount` needs an extra fix-up: `jit_tier_up_notify` saturates
+`CallCounters[HotFuncIdx]` to `UINT32_MAX` *before* calling `enqueue`,
+so the naive read makes the ratio arithmetic overflow and rejects every
+ancestor. We substitute `Tier2Threshold_` as a lower bound — the leaf
+just crossed it.
+
+If no ancestor passes both gates, walk-up returns `(HotFuncIdx, 0)` and
+BFS anchors on the leaf itself. This fallback is the common case for
+one-shot outer callers (`_start` / `main` variants) whose counter is
+effectively 1.
+
+### 2. `bfsDownBatchLocked` — fan out from the anchor
+
+From the chosen root, BFS depth-first down the forward call graph
+bounded by `BfsMaxDepth_ = 2` and `MaxBatchSize_ = 12`. Both `Root` and
+`HotFuncIdx` are seeded at depth 0 so the batch always covers the
+leaf's inlining neighborhood, not just the root's. A callee `C` is
+included iff:
+
+- `CallCounters[C] != 0`                     — already executed, **or**
+- `static_freq(caller → C) >= StaticFreqHot_` (= 2) — hot by structure.
+
+The static-freq branch closes the "bootstrap window" where one helper
+trips the threshold long before its siblings have run (e.g. ed25519
+where `f19 = __multi3` reaches count 10 on iteration 2 but `f12/f10/f11`
+are still at 0). Without it, the batch collapses to `[root, leaf]` and
+every sibling compiles as a later singleton, fragmenting the inlining
+neighborhood.
+
+`HotFuncIdx` is force-added at the end (dropping the last BFS leaf if
+necessary) so the request always includes its triggering function.
+
+---
+
+## Worker queue priority
+
+`workerLoop` maintains two queues — `Queue_` (regular tier-up batches
+from `enqueue`) and `OsrQueue_` (OSR continuation compiles from
+`enqueueOsr`). **OSR drains first**: the worker grabs the next OSR
+request before pulling from the regular queue.
+
+The reason is the shape of the ed25519-class problem. OSR is the only
+transport that can migrate a *mid-execution* frame into tier-2; a
+regular batch's FuncTable swap only helps *future* calls. On a one-shot
+main (`_start → f8` invoked exactly once), an OSR that lands during the
+hot loop is the entire win — delaying it behind a 2 s LLVM O2 batch
+makes it land after the frame has already returned, and the batch
+becomes a no-op.
+
+OSR requests are self-rate-limited by `SeenOsr_` dedup
+(`(FuncTable, funcIdx<<16 | loopIdx)`) so strict priority doesn't
+starve regular batches in practice — a program has `O(#hot loops)` OSR
+requests total, one per `(func, loop)` pair.
+
+---
+
+## Known failure modes (2026-04-18)
+
+Full-sweep runs of `sightglass-strong` at `TIER2_THRESHOLD=10` surface
+eight kernels that do not complete cleanly:
+
+| Kernel             | Arm             | Failure                                                |
+|---                 |---              |---                                                     |
+| shootout-base64    | tier-2          | core dump inside tier-2 compile/install                |
+| shootout-minicsv   | tier-2          | core dump inside tier-2 compile/install                |
+| shootout-ratelimit | tier-2          | core dump inside tier-2 compile/install                |
+| quicksort          | tier-2          | mini-module validation: value-stack underflow at `call`|
+| regex              | tier-2          | mini-module validation: type mismatch (i64 vs i32)     |
+| shootout-fib2      | tier-2          | mini-module validation: value-stack underflow at `call`|
+| blind-sig          | tier-1 + tier-2 | kernel traps during execution (pre-existing)           |
+| rust-compression   | tier-1          | unreachable trap at runtime (pre-existing)             |
+
+The three validation errors share a shape — a synthesized `call` site
+whose operand stack or types do not match the callee signature.
+Suspected location: `synthesizeMiniModule` / `emitT1ThunkInPlace`
+handling of functions whose original body led with `Unreachable` (these
+are filtered by `isPromotable` but may still appear as non-batch stubs
+referenced by batch bodies). Enlarged batches from P1e exposed the
+latent cases.
+
+At production thresholds (e.g. 1000), most of these do not reproduce
+because the hot functions never trip. They are documented here as
+follow-up items, not as active blockers for the tier-2 pipeline's
+design.
+
+---
+
 ## File layout
 
 ### Changed
