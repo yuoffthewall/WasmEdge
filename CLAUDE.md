@@ -24,6 +24,7 @@ Apply to any test run in this repo.
    - **No signal/error-handler fallbacks** to a lower tier. If every failure falls back, the higher tier contributes nothing.
    - **No pass-shuffling across opt levels.** Disabling a pass at O2 while leaving it at O1 (or flattening all levels) makes the opt-level knob meaningless.
    - **No per-kernel skips** or shape-based early returns.
+   - **No frontend workarounds for backend bugs.** If a bug originates in the IR backend, fix it in the backend. Keep the IR JIT frontend's implementation correct and canonical — do not distort frontend IR emission to dodge a backend defect.
 
    Root-cause workflow:
    1. Shrink the repro (kernel, IR, or single wasm function).

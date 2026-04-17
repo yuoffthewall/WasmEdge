@@ -75,6 +75,18 @@ public:
   /// Set the tier-up call count threshold. 0 disables counter instrumentation.
   void setTierUpThreshold(uint32_t T) noexcept { TierUpThreshold = T; }
 
+  /// Set the OSR back-edge threshold. 0 disables back-edge counter
+  /// instrumentation. When set, every outermost-loop back-edge increments a
+  /// per-loop counter; on threshold hit it calls jit_osr_notify().
+  void setOsrThreshold(uint32_t T) noexcept { OsrThreshold = T; }
+
+  /// Debug filter: restrict OSR instrumentation to loops with LoopIdx in
+  /// [Min, Max] (inclusive). UINT32_MAX max = no upper bound.
+  void setOsrLoopFilter(uint32_t Min, uint32_t Max) noexcept {
+    OsrMinLoop = Min;
+    OsrMaxLoop = Max;
+  }
+
   /// Set module types from the type section (indexed by type index).
   /// Used for call_indirect type resolution.
   void setModuleTypes(Span<const AST::FunctionType *> Types) noexcept {
@@ -133,7 +145,11 @@ private:
     // For loops: collected back-edge ENDs (finalized at loop end)
     std::vector<ir_ref> LoopBackEdgeEnds;
     std::vector<std::map<uint32_t, ir_ref>> LoopBackEdgeLocals;
-    
+
+    // For loops: monotonic loop index within the function (0..N-1).
+    // Used to flat-index per-loop OSR back-edge counters.
+    uint32_t LoopIdx = 0;
+
     // For if: locals state at the start of if (before any branch executes)
     std::map<uint32_t, ir_ref> PreIfLocals;    // LocalIdx -> value before if
   };
@@ -288,6 +304,15 @@ private:
   uint32_t TierUpThreshold = 0;   // Call count threshold (0 = disabled)
   ir_ref CallCountersPtr;         // Loaded from JitExecEnv::CallCounters
   ir_ref TierUpNotifyFnPtr;       // Loaded from JitExecEnv::TierUpNotifyFn
+
+  // OSR profiling
+  uint32_t OsrThreshold = 0;      // Back-edge count threshold (0 = disabled)
+  uint32_t CurrLoopIdx = 0;       // Monotonic outermost-loop counter per function
+  uint32_t OsrMinLoop = 0;        // Debug filter: only instrument loops >= this
+  uint32_t OsrMaxLoop = UINT32_MAX; // Debug filter: only instrument loops <= this
+  ir_ref BackEdgeCountersPtr;     // Loaded from JitExecEnv::BackEdgeCounters
+  ir_ref OsrLocalsFramePtr;       // Loaded from JitExecEnv::OsrLocalsFrame
+  ir_ref OsrEntryTablePtr;        // Loaded from JitExecEnv::OsrEntryTable
 };
 
 } // namespace VM

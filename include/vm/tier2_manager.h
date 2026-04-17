@@ -61,6 +61,16 @@ public:
                std::shared_ptr<void *[]> FuncTable,
                const uint32_t *CallCounters) noexcept;
 
+  /// Enqueue an OSR (on-stack replacement) compilation request for a
+  /// (FuncIdx, LoopIdx) pair. Called from jit_osr_notify when a tier-1
+  /// loop's back-edge counter saturates. The worker compiles an OSR
+  /// entry point and writes its native address into
+  /// `OsrEntryTable[FuncIdx * OSR_MAX_LOOPS_PER_FUNC + LoopIdx]`.
+  void enqueueOsr(uint32_t FuncIdx, uint32_t LoopIdx,
+                  std::shared_ptr<const AST::Module> Mod,
+                  std::shared_ptr<void *[]> FuncTable,
+                  std::shared_ptr<void *[]> OsrEntryTable) noexcept;
+
   /// Number of functions successfully recompiled to tier-2.
   uint32_t tier2Count() const noexcept {
     return Tier2Count_.load(std::memory_order_relaxed);
@@ -89,6 +99,17 @@ private:
     std::shared_ptr<void *[]> FuncTable;
   };
 
+  /// OSR-specific request. Compiled independently of the regular batch
+  /// path; lands the native entry pointer in OsrEntryTable instead of
+  /// FuncTable.
+  struct OsrRequest {
+    uint32_t FuncIdx;
+    uint32_t LoopIdx;
+    std::shared_ptr<const AST::Module> Mod;
+    std::shared_ptr<void *[]> FuncTable;
+    std::shared_ptr<void *[]> OsrEntryTable;
+  };
+
   void workerLoop();
 
   /// Build (or return cached) call graph for \p Mod. Caller must hold Mu_.
@@ -115,7 +136,12 @@ private:
   std::mutex Mu_;
   std::condition_variable CV_;
   std::queue<Request> Queue_;
+  std::queue<OsrRequest> OsrQueue_;
   std::set<std::pair<uintptr_t, uint32_t>> Seen_;
+  /// Dedup key for OSR compiles: (FuncTablePtr, FuncIdx<<16 | LoopIdx).
+  /// Separate from Seen_ so regular tier-2 promotion and OSR compilation
+  /// don't block each other.
+  std::set<std::pair<uintptr_t, uint64_t>> SeenOsr_;
   std::unordered_map<const AST::Module *, ModuleCG> CGCache_;
   std::atomic<bool> Shutdown_{false};
   std::atomic<bool> WorkerDone_{false};

@@ -14,6 +14,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <string_view>
 
 namespace WasmEdge {
@@ -193,6 +194,41 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
         spdlog::debug("IR JIT tier-2 enabled: threshold={}", Tier2Threshold);
       }
     }
+    // OSR: read back-edge threshold. 0 disables OSR profiling entirely.
+    uint32_t OsrThreshold = 0;
+    if (const char *T = std::getenv("WASMEDGE_OSR_THRESHOLD")) {
+      OsrThreshold = static_cast<uint32_t>(std::atoi(T));
+      if (OsrThreshold > 0)
+        spdlog::debug("IR JIT OSR enabled: back-edge threshold={}",
+                      OsrThreshold);
+    }
+    // OSR bisection filter: restrict OSR instrumentation to FuncIdx within
+    // [MIN, MAX] (inclusive). Used to isolate a function that triggers a
+    // miscompile with OSR IR. UINT32_MAX sentinel = no upper bound.
+    uint32_t OsrMinFunc = 0;
+    uint32_t OsrMaxFunc = UINT32_MAX;
+    if (const char *T = std::getenv("WASMEDGE_OSR_MIN_FUNC")) {
+      OsrMinFunc = static_cast<uint32_t>(std::atoi(T));
+    }
+    if (const char *T = std::getenv("WASMEDGE_OSR_MAX_FUNC")) {
+      OsrMaxFunc = static_cast<uint32_t>(std::atoi(T));
+    }
+    if (OsrMinFunc != 0 || OsrMaxFunc != UINT32_MAX) {
+      spdlog::info("IR JIT OSR filter: FuncIdx in [{}, {}]", OsrMinFunc,
+                   OsrMaxFunc);
+    }
+    uint32_t OsrMinLoop = 0;
+    uint32_t OsrMaxLoop = UINT32_MAX;
+    if (const char *T = std::getenv("WASMEDGE_OSR_MIN_LOOP")) {
+      OsrMinLoop = static_cast<uint32_t>(std::atoi(T));
+    }
+    if (const char *T = std::getenv("WASMEDGE_OSR_MAX_LOOP")) {
+      OsrMaxLoop = static_cast<uint32_t>(std::atoi(T));
+    }
+    if (OsrMinLoop != 0 || OsrMaxLoop != UINT32_MAX) {
+      spdlog::info("IR JIT OSR filter: LoopIdx in [{}, {}]", OsrMinLoop,
+                   OsrMaxLoop);
+    }
 
     const auto &CodeSegs = CodeSec.getContent();
     // ----------------------------------------------------------------
@@ -290,6 +326,17 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
         // help one-shot callers (which need OSR, not a lower threshold).
         if (Tier2Threshold > 0) {
           IRBuilder.setTierUpThreshold(Tier2Threshold);
+        }
+        // OsrThreshold persists across reset() by design, so we must explicitly
+        // set it every iteration (to 0 when outside the filter range, else to
+        // OsrThreshold). Otherwise a previously-set threshold leaks into
+        // filtered-out functions.
+        if (OsrThreshold > 0 && FuncIdx >= OsrMinFunc &&
+            FuncIdx <= OsrMaxFunc) {
+          IRBuilder.setOsrThreshold(OsrThreshold);
+          IRBuilder.setOsrLoopFilter(OsrMinLoop, OsrMaxLoop);
+        } else {
+          IRBuilder.setOsrThreshold(0);
         }
 
         auto InitRes = IRBuilder.initialize(FuncType, Locals);

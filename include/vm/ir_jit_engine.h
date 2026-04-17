@@ -79,7 +79,36 @@ struct JitExecEnv {
   uint32_t *CallCounters;
   /// Tier-2 profiling: pointer to tier_up_notify(JitExecEnv*, uint32_t funcIdx).
   void *TierUpNotifyFn;
+  /// OSR profiling: per-loop back-edge counters, indexed by funcIdx*MaxLoops+loopIdx.
+  /// MaxLoops is fixed at 16 for MVP (sufficient for all sightglass kernels).
+  uint32_t *BackEdgeCounters;
+  /// OSR profiling: pointer to jit_osr_notify(JitExecEnv*, funcIdx, loopIdx).
+  void *OsrNotifyFn;
+  /// OSR: flat buffer for serialized wasm locals at the threshold-hit point.
+  /// Written once per (funcIdx, loopIdx) crossing, read by the OSR entry
+  /// thunk when it unmarshals locals back into LLVM-compiled code.
+  /// Size is fixed at OSR_LOCALS_FRAME_SLOTS (256 u64 slots = 2 KiB), which
+  /// is ample for all sightglass kernels and most real programs.
+  uint64_t *OsrLocalsFrame;
+  uint32_t OsrLocalsFrameSize;
+  uint32_t _pad3;
+  /// OSR: per-(funcIdx, loopIdx) native entry pointers, indexed as
+  /// `funcIdx * OSR_MAX_LOOPS_PER_FUNC + loopIdx`. NULL means the
+  /// tier-2 OSR entry for this loop is not yet compiled. Written by the
+  /// tier-2 worker thread, read atomically by tier-1 JIT code on every
+  /// back-edge iteration after the counter saturates.
+  void **OsrEntryTable;
 };
+
+/// Maximum number of outermost loops per function for OSR back-edge counters.
+/// Counters are flat-indexed as `funcIdx * OSR_MAX_LOOPS_PER_FUNC + loopIdx`.
+static constexpr uint32_t OSR_MAX_LOOPS_PER_FUNC = 16;
+
+/// Fixed-size OSR locals-frame buffer (slots, each u64 = 8 bytes).
+/// Over-allocates to keep the build simple: each tier-1 function serialises
+/// its wasm locals here on threshold crossing; the OSR entry thunk reads
+/// them back. Sightglass kernels top out near 20 locals, so 256 is generous.
+static constexpr uint32_t OSR_LOCALS_FRAME_SLOTS = 256;
 
 /// Host call trampoline: dispatches calls to non-JIT functions (imports)
 /// through the WasmEdge executor.  For direct `call` instructions to imports.
@@ -158,6 +187,12 @@ extern "C" void jit_data_drop(JitExecEnv *env, uint32_t dataIdx);
 /// the function for LLVM AOT recompilation (once Tier2Manager is wired up).
 extern "C" void jit_tier_up_notify(JitExecEnv *env, uint32_t funcIdx,
                                    uint32_t counterVal);
+/// OSR back-edge notification: called from a tier-1 loop back-edge when its
+/// per-loop counter hits the OSR threshold. Saturates the counter to prevent
+/// re-triggering. (Phase 1: logging stub. Later phases enqueue an OSR
+/// compilation request.)
+extern "C" void jit_osr_notify(JitExecEnv *env, uint32_t funcIdx,
+                               uint32_t loopIdx);
 
 /// IR JIT Engine - compiles and executes IR code
 class IRJitEngine {
@@ -187,7 +222,9 @@ public:
                       void *MemoryBase = nullptr, uint64_t MemorySize = 0,
                       DispatchEntry *Table0Dispatch = nullptr,
                       uint32_t Table0DispatchSize = 0,
-                      uint32_t *CallCounters = nullptr);
+                      uint32_t *CallCounters = nullptr,
+                      uint32_t *BackEdgeCounters = nullptr,
+                      void **OsrEntryTable = nullptr);
 
   /// Release compiled code
   void release(void *NativeFunc, size_t CodeSize) noexcept;
@@ -221,6 +258,9 @@ private:
   std::vector<CodeBuffer> CodeBuffers; // Track allocated code buffers
   /// Reusable buffer for marshalling args in invoke() (avoids per-call allocation)
   mutable std::vector<uint64_t> ArgsBuffer_;
+  /// Over-allocated buffer for OSR local serialisation. Sized to
+  /// OSR_LOCALS_FRAME_SLOTS on first invoke and reused across invocations.
+  mutable std::vector<uint64_t> OsrLocalsFrame_;
 };
 
 } // namespace VM
