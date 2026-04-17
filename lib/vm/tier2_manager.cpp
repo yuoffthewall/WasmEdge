@@ -6,6 +6,7 @@
 #if defined(WASMEDGE_BUILD_IR_JIT) && defined(WASMEDGE_USE_LLVM)
 
 #include "ast/module.h"
+#include "vm/ir_jit_engine.h"
 #include "vm/tier2_compiler.h"
 
 #include <spdlog/spdlog.h>
@@ -358,6 +359,42 @@ void Tier2Manager::enqueue(uint32_t FuncIdx,
   CV_.notify_one();
 }
 
+void Tier2Manager::enqueueOsr(
+    uint32_t FuncIdx, uint32_t LoopIdx,
+    std::shared_ptr<const AST::Module> Mod,
+    std::shared_ptr<void *[]> FuncTable,
+    std::shared_ptr<void *[]> OsrEntryTable) noexcept {
+  if (!Mod || !FuncTable || !OsrEntryTable) {
+    return;
+  }
+  if (LoopIdx >= OSR_MAX_LOOPS_PER_FUNC) {
+    return;
+  }
+  OsrRequest Req;
+  {
+    std::lock_guard<std::mutex> Lock(Mu_);
+    const auto FTKey = reinterpret_cast<uintptr_t>(FuncTable.get());
+    const uint64_t OsrKey =
+        (static_cast<uint64_t>(FuncIdx) << 32) | LoopIdx;
+    if (SeenOsr_.count(std::make_pair(FTKey, OsrKey)))
+      return;
+    SeenOsr_.insert(std::make_pair(FTKey, OsrKey));
+
+    // If the target function has already been tier-2 promoted at its
+    // entry, the tier-1 body is dead — OSR into it would waste cycles.
+    if (Seen_.count(std::make_pair(FTKey, FuncIdx)))
+      return;
+
+    Req.FuncIdx = FuncIdx;
+    Req.LoopIdx = LoopIdx;
+    Req.Mod = std::move(Mod);
+    Req.FuncTable = std::move(FuncTable);
+    Req.OsrEntryTable = std::move(OsrEntryTable);
+    OsrQueue_.push(std::move(Req));
+  }
+  CV_.notify_one();
+}
+
 void Tier2Manager::workerLoop() {
   Tier2Compiler Compiler;
   Compiler.setShutdownFlag(&Shutdown_);
@@ -370,69 +407,117 @@ void Tier2Manager::workerLoop() {
 
   while (true) {
     Request Req;
+    OsrRequest OsrReq;
+    bool HaveBatch = false;
+    bool HaveOsr = false;
     {
       std::unique_lock<std::mutex> Lock(Mu_);
       CV_.wait(Lock, [this] {
-        return !Queue_.empty() || Shutdown_.load(std::memory_order_acquire);
+        return !Queue_.empty() || !OsrQueue_.empty() ||
+               Shutdown_.load(std::memory_order_acquire);
       });
       if (Shutdown_.load(std::memory_order_acquire)) {
         WorkerDone_.store(true, std::memory_order_release);
         return;
       }
-      Req = std::move(Queue_.front());
-      Queue_.pop();
+      // Prefer regular batches first for fairness; OSR drains after.
+      if (!Queue_.empty()) {
+        Req = std::move(Queue_.front());
+        Queue_.pop();
+        HaveBatch = true;
+      } else if (!OsrQueue_.empty()) {
+        OsrReq = std::move(OsrQueue_.front());
+        OsrQueue_.pop();
+        HaveOsr = true;
+      }
     }
 
     if (CompileCount >= MaxCompilations)
-      continue;
-    if (!Req.Mod || !Req.FuncTable || Req.Batch.empty())
       continue;
     if (Shutdown_.load(std::memory_order_acquire)) {
       WorkerDone_.store(true, std::memory_order_release);
       return;
     }
 
-    const AST::Module &Mod = *Req.Mod;
-    const auto FTKey = reinterpret_cast<uintptr_t>(Req.FuncTable.get());
+    if (HaveBatch) {
+      if (!Req.Mod || !Req.FuncTable || Req.Batch.empty())
+        continue;
 
-    // Telemetry: format the batch index list compactly.
-    std::ostringstream Idxs;
-    for (size_t I = 0; I < Req.Batch.size(); ++I) {
-      if (I)
-        Idxs << ",";
-      Idxs << Req.Batch[I];
-    }
-    spdlog::info(
-        "tier2: batch compile: root={} hot={} size={} walkup={} [{}]",
-        Req.RootFuncIdx, Req.HotFuncIdx, Req.Batch.size(), Req.WalkupHops,
-        Idxs.str());
+      const AST::Module &Mod = *Req.Mod;
+      const auto FTKey = reinterpret_cast<uintptr_t>(Req.FuncTable.get());
 
-    {
-      std::lock_guard<std::mutex> Lock(Mu_);
-      ++StatBatches_;
-      StatBatchMemberSum_ += Req.Batch.size();
-      if (Req.Batch.size() == 1)
-        ++StatSingletons_;
-      if (Req.WalkupHops > 0)
-        ++StatWalkupHits_;
-    }
+      std::ostringstream Idxs;
+      for (size_t I = 0; I < Req.Batch.size(); ++I) {
+        if (I)
+          Idxs << ",";
+        Idxs << Req.Batch[I];
+      }
+      spdlog::info(
+          "tier2: batch compile: root={} hot={} size={} walkup={} [{}]",
+          Req.RootFuncIdx, Req.HotFuncIdx, Req.Batch.size(), Req.WalkupHops,
+          Idxs.str());
 
-    auto BatchResult = Compiler.compileBatch(Req.Batch, Mod, 2);
-    if (!BatchResult) {
-      spdlog::warn("tier2: batch compile failed for func {}", Req.HotFuncIdx);
+      {
+        std::lock_guard<std::mutex> Lock(Mu_);
+        ++StatBatches_;
+        StatBatchMemberSum_ += Req.Batch.size();
+        if (Req.Batch.size() == 1)
+          ++StatSingletons_;
+        if (Req.WalkupHops > 0)
+          ++StatWalkupHits_;
+      }
+
+      auto BatchResult = Compiler.compileBatch(Req.Batch, Mod, 2);
+      if (!BatchResult) {
+        spdlog::warn("tier2: batch compile failed for func {}",
+                     Req.HotFuncIdx);
+        continue;
+      }
+
+      for (auto &[FIdx, NativePtr] : *BatchResult) {
+        {
+          std::lock_guard<std::mutex> Lock(Mu_);
+          Seen_.insert(std::make_pair(FTKey, FIdx));
+        }
+        Req.FuncTable.get()[FIdx] = NativePtr;
+        Tier2Count_.fetch_add(1, std::memory_order_relaxed);
+        ++CompileCount;
+        spdlog::info("tier2: upgraded func {} → tier-2 ({:#x})", FIdx,
+                     reinterpret_cast<uintptr_t>(NativePtr));
+      }
       continue;
     }
 
-    for (auto &[FIdx, NativePtr] : *BatchResult) {
-      {
-        std::lock_guard<std::mutex> Lock(Mu_);
-        Seen_.insert(std::make_pair(FTKey, FIdx));
+    if (HaveOsr) {
+      if (!OsrReq.Mod || !OsrReq.FuncTable || !OsrReq.OsrEntryTable)
+        continue;
+      spdlog::info("tier2: OSR compile: func={} loop={}", OsrReq.FuncIdx,
+                   OsrReq.LoopIdx);
+      unsigned OsrOpt = 2;
+      if (const char *E = ::getenv("WASMEDGE_OSR_OPT_LEVEL")) {
+        OsrOpt = static_cast<unsigned>(std::atoi(E));
       }
-      Req.FuncTable.get()[FIdx] = NativePtr;
-      Tier2Count_.fetch_add(1, std::memory_order_relaxed);
+      auto OsrResult = Compiler.compileOsrEntry(OsrReq.FuncIdx,
+                                                OsrReq.LoopIdx,
+                                                *OsrReq.Mod, OsrOpt);
+      if (!OsrResult) {
+        spdlog::warn("tier2: OSR compile failed for func {} loop {}",
+                     OsrReq.FuncIdx, OsrReq.LoopIdx);
+        continue;
+      }
+      void *Entry = *OsrResult;
+      // Atomic store: the tier-1 IR polls this slot on each iteration
+      // and the memory-order-release here pairs with the memory-order-
+      // acquire load in emitLoopBackEdge().
+      auto *Slot = reinterpret_cast<std::atomic<void *> *>(
+          &OsrReq.OsrEntryTable.get()[OsrReq.FuncIdx *
+                                          OSR_MAX_LOOPS_PER_FUNC +
+                                      OsrReq.LoopIdx]);
+      Slot->store(Entry, std::memory_order_release);
       ++CompileCount;
-      spdlog::info("tier2: upgraded func {} → tier-2 ({:#x})", FIdx,
-                   reinterpret_cast<uintptr_t>(NativePtr));
+      spdlog::info("tier2: OSR entry installed: func={} loop={} ({:#x})",
+                   OsrReq.FuncIdx, OsrReq.LoopIdx,
+                   reinterpret_cast<uintptr_t>(Entry));
     }
   }
 }

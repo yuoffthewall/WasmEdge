@@ -218,6 +218,15 @@ public:
       return It->second.FullModule;
     return nullptr;
   }
+
+  /// Get shared OSR entry table for tier-2 background compilation.
+  std::shared_ptr<void *[]> getJitOsrEntryTable(
+      const Runtime::Instance::ModuleInstance *ModInst) const {
+    auto It = IRJitEnvCache_.find(ModInst);
+    if (It != IRJitEnvCache_.end())
+      return It->second.OsrEntryTable;
+    return nullptr;
+  }
 #endif
 
   /// Instantiate a WASM Module into an anonymous module instance.
@@ -1241,6 +1250,14 @@ private:
     std::vector<uint32_t> CallCounters;
     /// Tier-2 state: 0=tier1, 1=enqueued, 2=tier2.
     std::vector<uint8_t> TierState;
+    /// OSR profiling: per-loop back-edge counters
+    /// (indexed funcIdx * OSR_MAX_LOOPS_PER_FUNC + loopIdx).
+    std::vector<uint32_t> BackEdgeCounters;
+    /// OSR: per-loop native entry pointers, indexed identically to
+    /// BackEdgeCounters. shared_ptr so the tier-2 background worker can
+    /// safely write to it even if this Cache is destroyed first.
+    std::shared_ptr<void *[]> OsrEntryTable;
+    uint32_t OsrEntryTableSize = 0;
     /// Full AST::Module preserved for tier-2 recompilation through the
     /// WasmEdge LLVM frontend. Populated at instantiation time; kept alive
     /// for the module's lifetime so late tier-ups can still see it.

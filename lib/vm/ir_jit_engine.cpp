@@ -192,6 +192,13 @@ IRJitEngine::compile(ir_ctx *Ctx) {
     snprintf(fname, sizeof(fname), "/tmp/wasmedge_ir_%03d_after.ir", _dbg_cur_id);
     FILE *f = fopen(fname, "w");
     if (f) { ir_save(Ctx, IR_SAVE_CFG, f); fclose(f); }
+    // Dump machine code bytes for objdump
+    snprintf(fname, sizeof(fname), "/tmp/wasmedge_ir_%03d.bin", _dbg_cur_id);
+    FILE *bf = fopen(fname, "wb");
+    if (bf) {
+      fwrite(NativeCode, 1, CodeSize, bf);
+      fclose(bf);
+    }
   }
 
   // Track the code buffer
@@ -220,7 +227,9 @@ Expect<void> IRJitEngine::invoke(void *NativeFunc,
                                   void *MemoryBase, uint64_t MemorySize,
                                   DispatchEntry *Table0Dispatch,
                                   uint32_t Table0DispatchSize,
-                                  uint32_t *CallCounters) {
+                                  uint32_t *CallCounters,
+                                  uint32_t *BackEdgeCounters,
+                                  void **OsrEntryTable) {
   if (!NativeFunc) {
     return Unexpect(ErrCode::Value::RuntimeError);
   }
@@ -245,6 +254,15 @@ Expect<void> IRJitEngine::invoke(void *NativeFunc,
   Env._pad2 = 0;
   Env.CallCounters = CallCounters;
   Env.TierUpNotifyFn = reinterpret_cast<void *>(&jit_tier_up_notify);
+  Env.BackEdgeCounters = BackEdgeCounters;
+  Env.OsrNotifyFn = reinterpret_cast<void *>(&jit_osr_notify);
+
+  if (OsrLocalsFrame_.size() < OSR_LOCALS_FRAME_SLOTS)
+    OsrLocalsFrame_.assign(OSR_LOCALS_FRAME_SLOTS, 0);
+  Env.OsrLocalsFrame = OsrLocalsFrame_.data();
+  Env.OsrLocalsFrameSize = OSR_LOCALS_FRAME_SLOTS;
+  Env._pad3 = 0;
+  Env.OsrEntryTable = OsrEntryTable;
 
   ArgsBuffer_.resize(ParamTypes.size());
   for (size_t i = 0; i < ParamTypes.size(); ++i)

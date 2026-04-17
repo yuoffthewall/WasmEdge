@@ -140,10 +140,14 @@ void WasmToIRBuilder::reset() noexcept {
   ModuleGlobalTypes.clear();
   FuncInstrs = Span<const AST::Instruction>();
   CurInstrIdx = 0;
-  // Note: FuncIdx and TierUpThreshold are NOT reset here — they are set
-  // before initialize() and must survive the reset() call inside initialize().
+  // Note: FuncIdx, TierUpThreshold and OsrThreshold are NOT reset here — they
+  // are set before initialize() and must survive the reset() call inside it.
   CallCountersPtr = 0;
   TierUpNotifyFnPtr = 0;
+  CurrLoopIdx = 0;
+  BackEdgeCountersPtr = 0;
+  OsrLocalsFramePtr = 0;
+  OsrEntryTablePtr = 0;
 }
 
 Expect<void> WasmToIRBuilder::initialize(
@@ -275,6 +279,18 @@ Expect<void> WasmToIRBuilder::initialize(
   MemoryGrowFnPtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, MemoryGrowFn))));
   MemorySizeFnPtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, MemorySizeFn))));
   CallIndirectFnPtr = ir_LOAD_A(ir_ADD_A(EnvPtr, ir_CONST_ADDR(offsetof(JitExecEnv, CallIndirectFn))));
+
+  // OSR profiling: cache base pointers for back-edge counters and the
+  // locals-frame buffer. Both are used only on the threshold-hit path
+  // inside emitLoopBackEdge(), so the loads are hoisted out of the loop.
+  if (OsrThreshold > 0) {
+    BackEdgeCountersPtr = ir_LOAD_A(ir_ADD_A(EnvPtr,
+        ir_CONST_ADDR(offsetof(JitExecEnv, BackEdgeCounters))));
+    OsrLocalsFramePtr = ir_LOAD_A(ir_ADD_A(EnvPtr,
+        ir_CONST_ADDR(offsetof(JitExecEnv, OsrLocalsFrame))));
+    OsrEntryTablePtr = ir_LOAD_A(ir_ADD_A(EnvPtr,
+        ir_CONST_ADDR(offsetof(JitExecEnv, OsrEntryTable))));
+  }
 
   // Initialize additional locals to zero
   uint32_t localIdx = static_cast<uint32_t>(ParamTypes.size());
@@ -2257,6 +2273,130 @@ void WasmToIRBuilder::emitLoopBackEdge(LabelInfo &Target) {
     BackEdgeLocals[LocalIdx] = coerceToType(it->second, getLocalType(LocalIdx));
   }
 
+  // OSR back-edge instrumentation. Two-level diamond:
+  //   outer: if (OsrEntryTable[funcIdx*16+loopIdx] != NULL)
+  //            TRUE  -> serialise locals, tail-call the OSR entry, RETURN
+  //            FALSE -> counter diamond (existing Phase 1/2 behaviour)
+  //          MERGE (false path only; true path returned out of the fn)
+  // The OSR-entry poll + branch-not-taken is the only added per-iteration
+  // cost while waiting for tier-2 to land the entry.
+  if (OsrThreshold > 0 && Target.LoopIdx != UINT32_MAX &&
+      Target.LoopIdx >= OsrMinLoop && Target.LoopIdx <= OsrMaxLoop) {
+    const uintptr_t CounterByteOffset =
+        (static_cast<uintptr_t>(FuncIdx) * OSR_MAX_LOOPS_PER_FUNC +
+         Target.LoopIdx) *
+        sizeof(uint32_t);
+    const uintptr_t EntrySlotByteOffset =
+        (static_cast<uintptr_t>(FuncIdx) * OSR_MAX_LOOPS_PER_FUNC +
+         Target.LoopIdx) *
+        sizeof(void *);
+
+    ir_ref EntrySlot =
+        ir_ADD_A(OsrEntryTablePtr, ir_CONST_ADDR(EntrySlotByteOffset));
+    ir_ref EntryVal = ir_LOAD_A(EntrySlot);
+    ir_ref EntryReady =
+        ir_NE(EntryVal, ir_CONST_ADDR(static_cast<uintptr_t>(0)));
+    // Shared bisection gate: SKIP_STORES disables the locals snapshot on
+    // BOTH the transition path and the threshold-hit path (same class of
+    // IR that trips Bug 2). When set the transition still runs but reads
+    // stale locals, so outputs may be wrong; used only for IR-shape
+    // bisection.
+    const char *SkipStoresEnv = std::getenv("WASMEDGE_OSR_SKIP_STORES");
+    const bool SkipStores = SkipStoresEnv && SkipStoresEnv[0] != '0';
+
+    ir_ref TransitionIf = ir_IF(EntryReady);
+    ir_IF_TRUE(TransitionIf);
+
+    // Fresh snapshot of locals into OsrLocalsFrame. Each slot is 8 bytes,
+    // but we write type-native widths: i32/f32 → 4-byte store into the low
+    // half of the slot (upper 4 bytes hold stale data, but the OSR thunk
+    // reads u64 and truncates to i32/f32, so high bits are ignored). This
+    // avoids emitting per-local ZEXT/BITCAST ops whose foldable-op CSE
+    // previously deduped across sibling OSR diamonds — producing a single
+    // SSA def reused in disjoint control branches. GCM could clone that
+    // def, but the resulting shape tripped downstream codegen and SIGSEGV'd
+    // ~13 sightglass kernels at O2. Native-width stores remove the CSE
+    // substrate entirely.
+    if (!SkipStores) {
+      for (const auto &[LocalIdx, Val] : Locals) {
+        if (LocalIdx >= OSR_LOCALS_FRAME_SLOTS)
+          break;
+        ir_ref SlotAddr = ir_ADD_A(
+            OsrLocalsFramePtr,
+            ir_CONST_ADDR(static_cast<uintptr_t>(LocalIdx) *
+                          sizeof(uint64_t)));
+        ir_STORE(SlotAddr, Val);
+      }
+    }
+
+    // OSR thunks share the tier-1 ABI: ret thunk(JitExecEnv*, uint64_t*).
+    uint8_t OsrParams[2] = {IR_ADDR, IR_ADDR};
+    const ir_type OsrRet =
+        (Ctx.ret_type == static_cast<ir_type>(-1)) ? IR_VOID : Ctx.ret_type;
+    ir_ref OsrProto =
+        ir_proto(ctx, IR_FASTCALL_FUNC, OsrRet, 2, OsrParams);
+    ir_ref TypedEntry =
+        ir_emit2(ctx, IR_OPT(IR_PROTO, IR_ADDR), EntryVal, OsrProto);
+    ir_ref OsrArgs[2] = {EnvPtr, OsrLocalsFramePtr};
+    if (OsrRet == IR_VOID) {
+      ir_CALL_N(IR_VOID, TypedEntry, 2, OsrArgs);
+      ir_RETURN(IR_UNUSED);
+    } else {
+      ir_ref OsrCall = ir_CALL_N(OsrRet, TypedEntry, 2, OsrArgs);
+      ir_RETURN(OsrCall);
+    }
+
+    // FALSE path: counter diamond. Gate the increment on `counter <
+    // threshold` so once jit_osr_notify saturates the counter to
+    // UINT32_MAX, the per-iteration cost collapses to one load + one
+    // compare + one branch. Without this gate the counter wraps through
+    // UINT32_MAX back to 0 each iteration and re-fires notify every
+    // `threshold` iterations — catastrophic in a hot inner loop.
+    // No MERGE with TRUE — TRUE returned.
+    ir_IF_FALSE(TransitionIf);
+
+    ir_ref CounterAddr =
+        ir_ADD_A(BackEdgeCountersPtr, ir_CONST_ADDR(CounterByteOffset));
+    ir_ref CounterVal = ir_LOAD_U32(CounterAddr);
+    ir_ref ShouldCount = ir_LT(CounterVal, ir_CONST_U32(OsrThreshold));
+    ir_ref CountIf = ir_IF(ShouldCount);
+    ir_IF_TRUE(CountIf);
+    ir_ref Incremented = ir_ADD_U32(CounterVal, ir_CONST_U32(1));
+    ir_STORE(CounterAddr, Incremented);
+    ir_ref Cmp = ir_EQ(Incremented, ir_CONST_U32(OsrThreshold));
+    ir_ref NotifyIf = ir_IF(Cmp);
+    ir_IF_TRUE(NotifyIf);
+
+    // The threshold-hit path used to re-serialize locals into OsrLocalsFrame
+    // here (Phase 2 behavior). That snapshot is now redundant — Phase 4
+    // re-stores locals fresh on every iteration once the OSR entry is ready,
+    // so nothing downstream reads from the pre-entry snapshot. Keeping the
+    // stores here was actively harmful: the frontend's foldable-op CSE
+    // (_ir_fold_cse) dedupes identical ZEXT/BITCAST ops across the
+    // transition-path and threshold-hit-path stores, producing a single SSA
+    // definition reused in two disjoint control-flow branches. GCM then
+    // hoists the definition to a common dominator upstream of every loop on
+    // the OSR path, ballooning live ranges and regressing post-GCM passes
+    // into miscompiles (SIGSEGV on bz2 and others). Emit only the notify
+    // call here; the transition path owns the snapshot.
+
+    uint8_t NotifyParams[3] = {IR_ADDR, IR_U32, IR_U32};
+    ir_ref NotifyProto =
+        ir_proto(ctx, IR_FASTCALL_FUNC, IR_VOID, 3, NotifyParams);
+    ir_ref NotifyFn =
+        ir_const_func_addr(ctx, (uintptr_t)&jit_osr_notify, NotifyProto);
+    ir_CALL_3(IR_VOID, NotifyFn, EnvPtr, ir_CONST_U32(FuncIdx),
+              ir_CONST_U32(Target.LoopIdx));
+    ir_ref NotifyEnd = ir_END();
+    ir_IF_FALSE(NotifyIf);
+    ir_ref NoNotifyEnd = ir_END();
+    ir_MERGE_2(NotifyEnd, NoNotifyEnd);
+    ir_ref CountIfTrueEnd = ir_END();
+    ir_IF_FALSE(CountIf);
+    ir_ref CountIfFalseEnd = ir_END();
+    ir_MERGE_2(CountIfTrueEnd, CountIfFalseEnd);
+  }
+
   ir_ref BackEnd = ir_END();
   Target.LoopBackEdgeEnds.push_back(BackEnd);
   Target.LoopBackEdgeLocals.push_back(std::move(BackEdgeLocals));
@@ -2321,6 +2461,33 @@ Expect<void> WasmToIRBuilder::visitLoop(const AST::Instruction &Instr) {
   Label.HasElse = false;
   Label.TrueBranchTerminated = false;
   Label.ElseBranchTerminated = false;
+
+  // OSR: assign per-function loop index only for Loops that are not
+  // enclosed by another Loop AND whose enclosing Block chain contains no
+  // If (conditions required by synthesizeOsrModule, which rebuilds the
+  // enclosing Block scopes but cannot mid-enter an If's then/else arm).
+  // CurrLoopIdx advances in lockstep with findOsrLoopStart's enumeration
+  // over the same criteria: a counter over the instruction stream that
+  // matches this predicate. The OsrMinLoop/OsrMaxLoop filter suppresses
+  // instrumentation without disturbing the counter.
+  bool EnclosedByLoopOrIf = false;
+  for (const auto &L : LabelStack) {
+    if (L.Kind == ControlKind::Loop || L.Kind == ControlKind::If) {
+      EnclosedByLoopOrIf = true;
+      break;
+    }
+  }
+  if (OsrThreshold > 0 && !EnclosedByLoopOrIf &&
+      CurrLoopIdx < OSR_MAX_LOOPS_PER_FUNC) {
+    const uint32_t Idx = CurrLoopIdx++;
+    if (Idx >= OsrMinLoop && Idx <= OsrMaxLoop) {
+      Label.LoopIdx = Idx;
+    } else {
+      Label.LoopIdx = UINT32_MAX; // filtered out
+    }
+  } else {
+    Label.LoopIdx = UINT32_MAX; // sentinel: not an OSR candidate
+  }
 
   // PHI + COPY only for locals written (local.set / local.tee) in the loop
   // body; others keep the pre-loop SSA value for all iterations.

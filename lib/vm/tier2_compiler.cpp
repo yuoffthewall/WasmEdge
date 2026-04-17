@@ -10,6 +10,7 @@
 #include "executor/executor.h"
 #include "llvm/compiler.h"
 #include "llvm/data.h"
+#include "validator/validator.h"
 
 #include <spdlog/spdlog.h>
 
@@ -560,6 +561,231 @@ void emitT1ThunkInPlace(LLVMModuleRef LLMod, LLVMContextRef Ctx,
   LLVMDisposeBuilder(B);
 }
 
+/// Find the instruction index of the \p LoopIdx-th OSR-eligible Loop in
+/// \p Seg's body, matching WasmToIRBuilder::visitLoop's enumeration:
+/// increment the counter for a Loop whose enclosing scope stack contains
+/// no Loop and no If (intervening Blocks are allowed; the OSR synthesiser
+/// rebuilds them). Returns `Instrs.size()` if not found.
+uint32_t findOsrLoopStart(const AST::CodeSegment &Seg,
+                          uint32_t LoopIdx) noexcept {
+  const auto Instrs = Seg.getExpr().getInstrs();
+  std::vector<OpCode> Stack;
+  uint32_t Count = 0;
+  auto enclosedByLoopOrIf = [&]() {
+    for (OpCode O : Stack) {
+      if (O == OpCode::Loop || O == OpCode::If) {
+        return true;
+      }
+    }
+    return false;
+  };
+  for (size_t I = 0; I < Instrs.size(); ++I) {
+    OpCode Op = Instrs[I].getOpCode();
+    switch (Op) {
+    case OpCode::Loop:
+      if (!enclosedByLoopOrIf()) {
+        if (Count == LoopIdx)
+          return static_cast<uint32_t>(I);
+        ++Count;
+      }
+      Stack.push_back(Op);
+      break;
+    case OpCode::Block:
+    case OpCode::If:
+      Stack.push_back(Op);
+      break;
+    case OpCode::End:
+      if (!Stack.empty()) {
+        Stack.pop_back();
+      }
+      break;
+    default:
+      break;
+    }
+  }
+  return static_cast<uint32_t>(Instrs.size());
+}
+
+/// Build a synthetic mini AST::Module for an OSR entry point.
+///
+/// The target function at \p FuncIdx is rewritten so that:
+///   - Its signature is (local0, local1, ..., localN-1) -> original_return,
+///     where locals[0..P) are the original parameters followed by
+///     declared locals. A brand-new FunctionType is appended to the
+///     TypeSection to hold this signature.
+///   - Its CodeSegment has zero declared locals (all locals become
+///     function parameters) and its instruction body is the tail of the
+///     original body starting at the target Loop. Any Block instructions
+///     that originally enclosed the target Loop are re-emitted at the
+///     front of the OSR body so that `br N` depths inside the Loop still
+///     resolve to valid scopes (the scopes' closing `End`s already live
+///     in the copied tail).
+///
+/// Every other defined function in the module gets the usual
+/// stack-polymorphic stub body; non-batch callees will be rewritten as
+/// tier-2 → tier-1 bridges by emitT1ThunkInPlace() after LLVM codegen.
+///
+/// Returns true on success, false if the target loop was not found, the
+/// enclosing scope chain contains an If (unsupported — would require
+/// mid-entering a then/else arm), or validation prerequisites are not met.
+bool synthesizeOsrModule(AST::Module &Mini, uint32_t FuncIdx,
+                          uint32_t LoopIdx,
+                          uint32_t ImportFuncNum) noexcept {
+  if (FuncIdx < ImportFuncNum) {
+    return false;
+  }
+  const uint32_t DefinedIdx = FuncIdx - ImportFuncNum;
+  auto &CodeSec = Mini.getCodeSection().getContent();
+  auto &FuncSec = Mini.getFunctionSection().getContent();
+  auto &TypeSec = Mini.getTypeSection().getContent();
+  if (DefinedIdx >= CodeSec.size() || DefinedIdx >= FuncSec.size()) {
+    return false;
+  }
+
+  // Look up the original function type to build the OSR signature.
+  const uint32_t OrigTypeIdx = FuncSec[DefinedIdx];
+  if (OrigTypeIdx >= TypeSec.size()) {
+    return false;
+  }
+  const auto &OrigFT = TypeSec[OrigTypeIdx].getCompositeType().getFuncType();
+  const auto &OrigParams = OrigFT.getParamTypes();
+  const auto &OrigRets = OrigFT.getReturnTypes();
+
+  auto &Seg = CodeSec[DefinedIdx];
+
+  // Find the target loop start index.
+  const uint32_t LoopStart = findOsrLoopStart(Seg, LoopIdx);
+  const auto &Instrs = Seg.getExpr().getInstrs();
+  if (LoopStart >= Instrs.size()) {
+    return false;
+  }
+  // The target Loop itself must have an empty BlockType. A typed Loop
+  // (loop (param t) ... or loop (result t) ...) expects t-valued stack
+  // entry and produces a t-valued stack result — neither is available
+  // when the OSR function begins execution right at the Loop header.
+  {
+    const auto &LT = Instrs[LoopStart].getBlockType();
+    if (!LT.isEmpty()) {
+      return false;
+    }
+  }
+
+  // Collect the enclosing Block openers whose matching `End`s live in the
+  // tail [LoopStart, Instrs.size()). Walk [0, LoopStart) tracking a stack;
+  // what remains on the stack at position LoopStart is the enclosing chain
+  // (outermost at index 0). If any entry is an If, bail out — mid-entering
+  // an If's then-arm would break wasm's structured control-flow invariants.
+  std::vector<size_t> EnclosingOpeners;
+  for (size_t I = 0; I < LoopStart; ++I) {
+    OpCode Op = Instrs[I].getOpCode();
+    if (Op == OpCode::Block || Op == OpCode::Loop || Op == OpCode::If) {
+      EnclosingOpeners.push_back(I);
+    } else if (Op == OpCode::End) {
+      if (!EnclosingOpeners.empty()) {
+        EnclosingOpeners.pop_back();
+      }
+    }
+  }
+  for (size_t Idx : EnclosingOpeners) {
+    OpCode Op = Instrs[Idx].getOpCode();
+    if (Op == OpCode::If || Op == OpCode::Loop) {
+      // Enclosing If or Loop — cannot synthesize safely.
+      return false;
+    }
+    // Enclosing Block must have empty BlockType. A typed Block demands
+    // values on the stack at entry AND at End; neither is available when
+    // the OSR function starts execution at the Loop header. (br N targets
+    // into such a Block require the expected result values on the operand
+    // stack at the br site, so merely rewriting the Block's type to Empty
+    // would break wasm validation for those br's.)
+    const auto &BT = Instrs[Idx].getBlockType();
+    if (!BT.isEmpty()) {
+      return false;
+    }
+  }
+
+  // Build OSR signature params: originalParams ++ declaredLocals (flattened).
+  std::vector<ValType> OsrParams;
+  OsrParams.reserve(OrigParams.size() + 8);
+  for (const auto &P : OrigParams) {
+    OsrParams.push_back(P);
+  }
+  for (const auto &[Cnt, VT] : Seg.getLocals()) {
+    for (uint32_t I = 0; I < Cnt; ++I) {
+      OsrParams.push_back(VT);
+    }
+  }
+
+  // Append a new FunctionType for the OSR signature.
+  AST::FunctionType OsrFT(OsrParams, OrigRets);
+  AST::SubType OsrSub(OsrFT);
+  const uint32_t NewTypeIdx = static_cast<uint32_t>(TypeSec.size());
+  TypeSec.push_back(std::move(OsrSub));
+
+  // Rewrite the CodeSegment to be the OSR body:
+  //   [enclosing Block openers (outermost first)]
+  //   [Instrs[LoopStart .. end]]  (includes matching Ends of the openers)
+  std::vector<AST::Instruction> OsrBody;
+  OsrBody.reserve(EnclosingOpeners.size() + (Instrs.size() - LoopStart));
+  for (size_t Idx : EnclosingOpeners) {
+    OsrBody.push_back(Instrs[Idx]);
+  }
+  for (size_t I = LoopStart; I < Instrs.size(); ++I) {
+    OsrBody.push_back(Instrs[I]);
+  }
+
+  Seg.getLocals().clear();
+  Seg.getExpr().getInstrs() = std::move(OsrBody);
+
+  // Repoint this function to the new type index.
+  FuncSec[DefinedIdx] = NewTypeIdx;
+
+  // Optional dump for debugging. WASMEDGE_OSR_DUMP=<dir> writes one file
+  // per OSR body, named `osr_<funcIdx>_<loopIdx>.txt`, so subsequent
+  // crashes don't eat the output before it's flushed.
+  if (const char *Dir = std::getenv("WASMEDGE_OSR_DUMP")) {
+    std::string Path = std::string(Dir) + "/osr_" +
+                       std::to_string(FuncIdx) + "_" +
+                       std::to_string(LoopIdx) + ".txt";
+    if (FILE *F = std::fopen(Path.c_str(), "w")) {
+      const auto &Body = Seg.getExpr().getInstrs();
+      std::fprintf(F, "func=%u loop=%u body_size=%zu rets=%zu params=%zu\n",
+                   FuncIdx, LoopIdx, Body.size(), OrigRets.size(),
+                   OsrParams.size());
+      int Depth = 0;
+      for (size_t I = 0; I < Body.size(); ++I) {
+        OpCode Op = Body[I].getOpCode();
+        if (Op == OpCode::End)
+          Depth = std::max(0, Depth - 1);
+        std::fprintf(F, "  [%5zu] ", I);
+        for (int D = 0; D < Depth; ++D)
+          std::fputs("  ", F);
+        auto OpName = OpCodeStr[Op];
+        std::fprintf(F, "%.*s", static_cast<int>(OpName.size()),
+                     OpName.data());
+        if (Op == OpCode::Block || Op == OpCode::Loop || Op == OpCode::If) {
+          const auto &BT = Body[I].getBlockType();
+          if (BT.isEmpty()) {
+            std::fputs(" [empty]", F);
+          } else if (BT.isValType()) {
+            std::fputs(" [valtype]", F);
+          } else {
+            std::fprintf(F, " [typeidx=%u]", BT.getTypeIndex());
+          }
+        } else if (Op == OpCode::Br || Op == OpCode::Br_if) {
+          std::fprintf(F, " depth=%u", Body[I].getJump().TargetIndex);
+        }
+        std::fputc('\n', F);
+        if (Op == OpCode::Block || Op == OpCode::Loop || Op == OpCode::If)
+          ++Depth;
+      }
+      std::fclose(F);
+    }
+  }
+
+  return true;
+}
+
 /// Walk the bodies of every function in \p BatchSet and collect all direct
 /// `call` targets that are (a) defined (not imports) and (b) not already
 /// in the batch. These are the non-batch functions for which we must
@@ -905,6 +1131,322 @@ Tier2Compiler::compileBatch(Span<const uint32_t> BatchIdx,
   spdlog::info("tier2: step-5 ORC done for func {} (emitted {} thunks)",
                BatchIdx.front(), Result.size());
   return Result;
+}
+
+Expect<void *>
+Tier2Compiler::compileOsrEntry(uint32_t FuncIdx, uint32_t LoopIdx,
+                                const AST::Module &Mod, unsigned OptLevel) {
+  if (isShutdown()) {
+    return nullptr;
+  }
+
+  uint32_t ImportFuncNum = 0;
+  for (const auto &ImpDesc : Mod.getImportSection().getContent()) {
+    if (ImpDesc.getExternalType() == ExternalType::Function) {
+      ++ImportFuncNum;
+    }
+  }
+  if (FuncIdx < ImportFuncNum) {
+    spdlog::warn("tier2-osr: func {} is an import; cannot OSR", FuncIdx);
+    return nullptr;
+  }
+
+  // Start from a copy of the module so we can surgically rewrite the OSR
+  // function without mutating the shared parsed module.
+  AST::Module Mini(Mod);
+
+  // Rewrite the target function into its OSR form (locals-as-params,
+  // body = [loop..end]). Must be done before stubbing non-OSR bodies so
+  // synthesizeMiniModule doesn't zero the Instrs vector we care about.
+  if (!synthesizeOsrModule(Mini, FuncIdx, LoopIdx, ImportFuncNum)) {
+    spdlog::warn("tier2-osr: synth failed for func {} loop {}", FuncIdx,
+                 LoopIdx);
+    return nullptr;
+  }
+
+  // Stub every other defined function with default-value returns. The
+  // OSR function is treated as a singleton batch — callees are resolved
+  // via tier-2 → tier-1 thunks installed below.
+  std::unordered_set<uint32_t> BatchSet;
+  BatchSet.insert(FuncIdx);
+  {
+    auto &CodeSec = Mini.getCodeSection().getContent();
+    const auto &FuncSec = Mini.getFunctionSection().getContent();
+    const auto &TypeSec = Mini.getTypeSection().getContent();
+    for (size_t I = 0; I < CodeSec.size(); ++I) {
+      const uint32_t Idx = ImportFuncNum + static_cast<uint32_t>(I);
+      if (BatchSet.count(Idx))
+        continue;
+      auto &Seg = CodeSec[I];
+      Seg.getLocals().clear();
+      auto &Instrs = Seg.getExpr().getInstrs();
+      Instrs.clear();
+      const uint32_t TypeIdx = FuncSec[I];
+      const auto &FT = TypeSec[TypeIdx].getCompositeType().getFuncType();
+      for (const auto &RT : FT.getReturnTypes()) {
+        switch (RT.getCode()) {
+        case TypeCode::I32: {
+          AST::Instruction Inst(OpCode::I32__const);
+          Inst.setNum(static_cast<uint32_t>(0));
+          Instrs.push_back(Inst);
+          break;
+        }
+        case TypeCode::I64: {
+          AST::Instruction Inst(OpCode::I64__const);
+          Inst.setNum(static_cast<uint64_t>(0));
+          Instrs.push_back(Inst);
+          break;
+        }
+        case TypeCode::F32: {
+          AST::Instruction Inst(OpCode::F32__const);
+          Inst.setNum(0.0f);
+          Instrs.push_back(Inst);
+          break;
+        }
+        case TypeCode::F64: {
+          AST::Instruction Inst(OpCode::F64__const);
+          Inst.setNum(0.0);
+          Instrs.push_back(Inst);
+          break;
+        }
+        default:
+          Instrs.emplace_back(OpCode::Unreachable);
+          break;
+        }
+      }
+      Instrs.emplace_back(OpCode::End);
+    }
+  }
+  // Unlike the regular batch path, the OSR body is a genuine rewrite of
+  // the function body (locals flattened to params, enclosing Block chain
+  // synthesized). The stubbed non-OSR bodies validate trivially, but the
+  // OSR body itself could fail validation if its operand stack balance
+  // diverges from the original (e.g. the original pushed values before
+  // the Loop that get popped after it — OSR can't reconstruct those).
+  // Run the validator so we catch such cases as a clean reject rather
+  // than an LLVM-backend assertion crash.
+  {
+    Configure ValConf;
+    Validator::Validator V(ValConf);
+    if (auto VR = V.validate(Mini); !VR) {
+      spdlog::warn(
+          "tier2-osr: validator rejected synthesized module "
+          "(func {} loop {}): {}",
+          FuncIdx, LoopIdx, ErrCodeStr[VR.error().getEnum()]);
+      return nullptr;
+    }
+  }
+  Mini.setIsValidated(true);
+
+  if (isShutdown()) {
+    return nullptr;
+  }
+
+  // Compile the synthesized module.
+  Configure Conf;
+  Conf.getCompilerConfigure().setOptimizationLevel(
+      CompilerConfigure::OptimizationLevel::O0);
+  Conf.getCompilerConfigure().setInterruptible(false);
+  Conf.getCompilerConfigure().setGenericBinary(false);
+  Conf.getStatisticsConfigure().setInstructionCounting(false);
+  Conf.getStatisticsConfigure().setCostMeasuring(false);
+  Conf.getStatisticsConfigure().setTimeMeasuring(false);
+
+  LLVM::Compiler LC(Conf);
+  auto CompRes = LC.compile(Mini);
+  if (!CompRes) {
+    spdlog::warn("tier2-osr: frontend compile failed (func {} loop {})",
+                 FuncIdx, LoopIdx);
+    return nullptr;
+  }
+  LLVMModuleRef LLMod = CompRes->getModuleRef();
+  LLVMContextRef LLCtx = CompRes->getContextRef();
+  if (!LLMod || !LLCtx) {
+    spdlog::error("tier2-osr: compiled Data has no LLVM module/context");
+    return nullptr;
+  }
+
+  // Build the OSR function type (must reflect the rewritten signature:
+  // (all locals as params) -> original return). Read from Mini since
+  // that's the source of truth for the new type index.
+  const uint32_t DefinedIdx = FuncIdx - ImportFuncNum;
+  const uint32_t NewTypeIdx =
+      Mini.getFunctionSection().getContent()[DefinedIdx];
+  const auto &OsrFT =
+      Mini.getTypeSection().getContent()[NewTypeIdx].getCompositeType()
+          .getFuncType();
+
+  // Reuse emitFwdThunk: it generates a tier-1 ABI entry
+  // `f<FuncIdx>_fwd_thunk(JitExecEnv*, uint64_t* args)` that unmarshals
+  // args[] into the LLVM function's native param types. Because the OSR
+  // function's params are all wasm locals and the OsrLocalsFrame is laid
+  // out exactly the same way, the locals buffer passed by tier-1 can be
+  // treated as an args[] buffer for ABI purposes.
+  emitFwdThunk(LLMod, LLCtx, FuncIdx, OsrFT);
+
+  // Rewrite every non-OSR defined function referenced by the OSR body
+  // as a tier-2 → tier-1 dispatch bridge. This is the OSR equivalent of
+  // t1_thunks in a regular batch.
+  const auto NonBatchCallees =
+      collectNonBatchCallees(Mini, BatchSet, ImportFuncNum);
+  for (uint32_t CalleeIdx : NonBatchCallees) {
+    // Use the ORIGINAL module's FuncType — Mini's stubbed bodies keep
+    // the original signature, and t1_thunks dispatch by funcIdx at
+    // runtime against the tier-1 FuncTable which uses the original types.
+    const auto &FT = getFuncType(Mod, CalleeIdx, ImportFuncNum);
+    emitT1ThunkInPlace(LLMod, LLCtx, CalleeIdx, FT);
+  }
+  if (!NonBatchCallees.empty()) {
+    spdlog::debug("tier2-osr: rewrote {} non-batch stubs as t1_thunks",
+                  NonBatchCallees.size());
+  }
+
+  // Mark the OSR function alwaysinline so O2 collapses it into the
+  // fwd_thunk, mirroring the batch path.
+  {
+    unsigned AlwaysInlineKind = LLVMGetEnumAttributeKindForName(
+        "alwaysinline", static_cast<unsigned>(std::strlen("alwaysinline")));
+    std::string Name = "f" + std::to_string(FuncIdx);
+    LLVMValueRef Fn = LLVMGetNamedFunction(LLMod, Name.c_str());
+    if (Fn) {
+      LLVMSetLinkage(Fn, LLVMInternalLinkage);
+      LLVMSetVisibility(Fn, LLVMDefaultVisibility);
+      LLVMSetDLLStorageClass(Fn, LLVMDefaultStorageClass);
+      LLVMAttributeRef Attr =
+          LLVMCreateEnumAttribute(LLCtx, AlwaysInlineKind, 0);
+      LLVMAddAttributeAtIndex(Fn, LLVMAttributeFunctionIndex, Attr);
+    }
+  }
+
+  if (P->TM && OptLevel > 0) {
+    const char *Pipeline = OptLevel >= 3 ? "default<O3>"
+                            : OptLevel == 2 ? "default<O2>"
+                                             : "default<O1>";
+    LLVMPassBuilderOptionsRef PBO = LLVMCreatePassBuilderOptions();
+    if (LLVMErrorRef Err = LLVMRunPasses(LLMod, Pipeline, P->TM, PBO)) {
+      char *Msg = LLVMGetErrorMessage(Err);
+      spdlog::warn("tier2-osr: post-opt pipeline failed: {}",
+                   Msg ? Msg : "(null)");
+      LLVMDisposeErrorMessage(Msg);
+    }
+    LLVMDisposePassBuilderOptions(PBO);
+  }
+
+  if (const char *DumpDir = ::getenv("WASMEDGE_TIER2_DUMP_IR")) {
+    std::string Path = std::string(DumpDir);
+    if (!Path.empty() && Path.back() != '/') {
+      Path.push_back('/');
+    }
+    Path += "tier2_osr_f" + std::to_string(FuncIdx) + "_l" +
+            std::to_string(LoopIdx) + ".ll";
+    char *Err = nullptr;
+    if (LLVMPrintModuleToFile(LLMod, Path.c_str(), &Err)) {
+      spdlog::warn("tier2-osr: dump module to {} failed: {}", Path,
+                   Err ? Err : "(null)");
+      LLVMDisposeMessage(Err);
+    } else {
+      spdlog::info("tier2-osr: dumped module to {}", Path);
+    }
+  }
+
+  LLVMModuleRef OwnedMod = CompRes->releaseModule();
+  LLVMOrcThreadSafeContextRef TSCtx = CompRes->releaseTSContext();
+  if (!OwnedMod || !TSCtx) {
+    spdlog::error("tier2-osr: failed to release module/TSContext");
+    if (OwnedMod)
+      LLVMDisposeModule(OwnedMod);
+    if (TSCtx)
+      LLVMOrcDisposeThreadSafeContext(TSCtx);
+    return nullptr;
+  }
+
+  LLVMOrcLLJITBuilderRef Builder = LLVMOrcCreateLLJITBuilder();
+  LLVMOrcLLJITRef JIT = nullptr;
+  if (LLVMErrorRef Err = LLVMOrcCreateLLJIT(&JIT, Builder)) {
+    char *Msg = LLVMGetErrorMessage(Err);
+    spdlog::error("tier2-osr: LLVMOrcCreateLLJIT failed: {}",
+                  Msg ? Msg : "(null)");
+    LLVMDisposeErrorMessage(Msg);
+    LLVMDisposeModule(OwnedMod);
+    LLVMOrcDisposeThreadSafeContext(TSCtx);
+    return nullptr;
+  }
+
+  LLVMOrcJITDylibRef MainJD = LLVMOrcLLJITGetMainJITDylib(JIT);
+  LLVMOrcExecutionSessionRef ES = LLVMOrcLLJITGetExecutionSession(JIT);
+  {
+    LLVMOrcCSymbolMapPair Pairs[1];
+    Pairs[0].Name =
+        LLVMOrcExecutionSessionIntern(ES, "wasmedge_tier2_trace_thunk");
+    Pairs[0].Sym.Address = reinterpret_cast<LLVMOrcJITTargetAddress>(
+        reinterpret_cast<void *>(&wasmedge_tier2_trace_thunk));
+    Pairs[0].Sym.Flags.GenericFlags =
+        LLVMJITSymbolGenericFlagsExported | LLVMJITSymbolGenericFlagsCallable;
+    Pairs[0].Sym.Flags.TargetFlags = 0;
+    LLVMOrcMaterializationUnitRef MU = LLVMOrcAbsoluteSymbols(Pairs, 1);
+    if (LLVMErrorRef Err = LLVMOrcJITDylibDefine(MainJD, MU)) {
+      char *Msg = LLVMGetErrorMessage(Err);
+      spdlog::error("tier2-osr: define absolute symbols failed: {}",
+                    Msg ? Msg : "(null)");
+      LLVMDisposeErrorMessage(Msg);
+      LLVMOrcDisposeLLJIT(JIT);
+      LLVMDisposeModule(OwnedMod);
+      LLVMOrcDisposeThreadSafeContext(TSCtx);
+      return nullptr;
+    }
+  }
+
+  LLVMOrcThreadSafeModuleRef TSM =
+      LLVMOrcCreateNewThreadSafeModule(OwnedMod, TSCtx);
+  OwnedMod = nullptr;
+  if (LLVMErrorRef Err = LLVMOrcLLJITAddLLVMIRModule(JIT, MainJD, TSM)) {
+    char *Msg = LLVMGetErrorMessage(Err);
+    spdlog::error("tier2-osr: addLLVMIRModule failed: {}",
+                  Msg ? Msg : "(null)");
+    LLVMDisposeErrorMessage(Msg);
+    LLVMOrcDisposeLLJIT(JIT);
+    LLVMOrcDisposeThreadSafeContext(TSCtx);
+    return nullptr;
+  }
+
+  // Install intrinsics table.
+  {
+    LLVMOrcJITTargetAddress Addr = 0;
+    if (LLVMErrorRef Err = LLVMOrcLLJITLookup(JIT, &Addr, "intrinsics")) {
+      char *Msg = LLVMGetErrorMessage(Err);
+      spdlog::error("tier2-osr: lookup `intrinsics` failed: {}",
+                    Msg ? Msg : "(null)");
+      LLVMDisposeErrorMessage(Msg);
+      LLVMOrcDisposeLLJIT(JIT);
+      LLVMOrcDisposeThreadSafeContext(TSCtx);
+      return nullptr;
+    }
+    auto **Slot = reinterpret_cast<const Executable::IntrinsicsTable **>(
+        static_cast<uintptr_t>(Addr));
+    *Slot = &Executor::Executor::Intrinsics;
+  }
+
+  // Look up the OSR entry address (same `f<FuncIdx>_fwd_thunk` name the
+  // batch path uses — OSR reuses the tier-1 ABI).
+  const std::string ThunkName = "f" + std::to_string(FuncIdx) + "_fwd_thunk";
+  LLVMOrcJITTargetAddress Addr = 0;
+  if (LLVMErrorRef Err = LLVMOrcLLJITLookup(JIT, &Addr, ThunkName.c_str())) {
+    char *Msg = LLVMGetErrorMessage(Err);
+    spdlog::warn("tier2-osr: lookup {} failed: {}", ThunkName,
+                 Msg ? Msg : "(null)");
+    LLVMDisposeErrorMessage(Msg);
+    LLVMOrcDisposeLLJIT(JIT);
+    LLVMOrcDisposeThreadSafeContext(TSCtx);
+    return nullptr;
+  }
+
+  P->JITs.push_back(JIT);
+  LLVMOrcDisposeThreadSafeContext(TSCtx);
+
+  void *Entry = reinterpret_cast<void *>(static_cast<uintptr_t>(Addr));
+  spdlog::info("tier2-osr: compiled func {} loop {} → {:#x}", FuncIdx,
+               LoopIdx, reinterpret_cast<uintptr_t>(Entry));
+  return Entry;
 }
 
 } // namespace WasmEdge::VM

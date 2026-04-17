@@ -66,6 +66,25 @@ public:
   compileBatch(Span<const uint32_t> BatchIdx, const AST::Module &Mod,
                unsigned OptLevel = 2);
 
+  /// Compile an OSR (on-stack replacement) entry for the given
+  /// (FuncIdx, LoopIdx) pair. The target function is rewritten so its
+  /// entry point is the start of the \p LoopIdx-th outermost loop; all
+  /// wasm locals (params + declared) become function parameters and are
+  /// passed via the tier-1 `(JitExecEnv*, uint64_t*)` ABI just like a
+  /// regular fwd_thunk. Other defined functions in the module are stubbed
+  /// as tier-2 → tier-1 bridges so cross-function calls resolve
+  /// correctly.
+  ///
+  /// \param FuncIdx   Module-wide function index containing the target loop.
+  /// \param LoopIdx   Index of the outermost loop (matches the
+  ///                  `CurrLoopIdx++` assignment in the IR builder).
+  /// \param Mod       Full parsed AST::Module. Kept alive by the manager.
+  /// \param OptLevel  LLVM optimization level (0-3).
+  /// \returns The native OSR entry pointer (tier-1 ABI) on success.
+  Expect<void *> compileOsrEntry(uint32_t FuncIdx, uint32_t LoopIdx,
+                                  const AST::Module &Mod,
+                                  unsigned OptLevel = 2);
+
 private:
   bool isShutdown() const noexcept {
     return ShutdownFlag_ && ShutdownFlag_->load(std::memory_order_acquire);

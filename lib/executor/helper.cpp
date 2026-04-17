@@ -556,6 +556,31 @@ extern "C" void jit_tier_up_notify(WasmEdge::VM::JitExecEnv *env,
   }
 #endif
 }
+
+extern "C" void jit_osr_notify(WasmEdge::VM::JitExecEnv *env,
+                               uint32_t funcIdx, uint32_t loopIdx) {
+  // Saturate the back-edge counter so tier-1 stops incrementing it.
+  // The tier-1 IR still polls OsrEntryTable every iteration: once the
+  // worker thread lands a compiled entry there, the next back-edge
+  // transfers execution out of tier-1.
+  if (env->BackEdgeCounters) {
+    env->BackEdgeCounters[funcIdx * WasmEdge::VM::OSR_MAX_LOOPS_PER_FUNC +
+                          loopIdx] = UINT32_MAX;
+  }
+  spdlog::debug("OSR back-edge triggered: func {} loop {}", funcIdx, loopIdx);
+
+#if defined(WASMEDGE_USE_LLVM)
+  if (g_jitModInst && g_jitExecutor && env->FuncTable) {
+    auto FT = g_jitExecutor->getJitFuncTable(g_jitModInst);
+    auto Mod = g_jitExecutor->getJitFullModule(g_jitModInst);
+    auto OET = g_jitExecutor->getJitOsrEntryTable(g_jitModInst);
+    if (FT && Mod && OET) {
+      getTier2Manager()->enqueueOsr(funcIdx, loopIdx, std::move(Mod),
+                                    std::move(FT), std::move(OET));
+    }
+  }
+#endif
+}
 #endif
 
 namespace WasmEdge {
@@ -1021,6 +1046,24 @@ Executor::enterFunction(Runtime::StackManager &StackMgr,
         Cache.CallCounters.resize(FuncInsts.size(), 0);
         Cache.TierState.resize(FuncInsts.size(), 0);
       }
+      // OSR profiling: per-loop back-edge counters (zero-filled).
+      const size_t OsrBackEdgeSize =
+          static_cast<size_t>(FuncInsts.size()) *
+          WasmEdge::VM::OSR_MAX_LOOPS_PER_FUNC;
+      if (Cache.BackEdgeCounters.size() != OsrBackEdgeSize) {
+        Cache.BackEdgeCounters.resize(OsrBackEdgeSize, 0);
+      }
+      // OSR entry table: one pointer slot per (funcIdx, loopIdx).
+      // shared_ptr so the tier-2 worker can write safely if the cache
+      // outlives the invoke() call.
+      const uint32_t OsrEntrySlots =
+          static_cast<uint32_t>(FuncInsts.size()) *
+          WasmEdge::VM::OSR_MAX_LOOPS_PER_FUNC;
+      if (Cache.OsrEntryTableSize != OsrEntrySlots) {
+        Cache.OsrEntryTable =
+            std::shared_ptr<void *[]>(new void *[OsrEntrySlots]());
+        Cache.OsrEntryTableSize = OsrEntrySlots;
+      }
     }
     void **FuncTable = Cache.FuncTable.get();
     uint32_t FuncTableSize = Cache.FuncTableSize;
@@ -1052,6 +1095,11 @@ Executor::enterFunction(Runtime::StackManager &StackMgr,
     uint32_t DispSize = static_cast<uint32_t>(Cache.Table0Dispatch.size());
     uint32_t *CallCounters =
         Cache.CallCounters.empty() ? nullptr : Cache.CallCounters.data();
+    uint32_t *BackEdgeCounters = Cache.BackEdgeCounters.empty()
+                                     ? nullptr
+                                     : Cache.BackEdgeCounters.data();
+    void **OsrEntryTable =
+        Cache.OsrEntryTable ? Cache.OsrEntryTable.get() : nullptr;
     // Install the thread-local Executor state (This/CurrentStack/
     // ExecutionContext) that the WasmEdge LLVM frontend's intrinsics
     // expect when tier-2 code calls into helpers like memory.grow,
@@ -1064,7 +1112,8 @@ Executor::enterFunction(Runtime::StackManager &StackMgr,
     auto Res = IREngine.invoke(Func.getIRJitNativeFunc(), FuncType, Args, Rets,
                                FuncTable, FuncTableSize, GlobalBase,
                                MemoryBase, MemSizeBytes,
-                               DispTable, DispSize, CallCounters);
+                               DispTable, DispSize, CallCounters,
+                               BackEdgeCounters, OsrEntryTable);
 
     if (!Res) {
       if (Res.error() != ErrCode::Value::Terminated) {
