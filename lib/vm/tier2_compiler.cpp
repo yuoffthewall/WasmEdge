@@ -1073,25 +1073,21 @@ Tier2Compiler::compileBatch(Span<const uint32_t> BatchIdx,
                   NonBatchCallees.size());
   }
 
-  // P1c: Mark batch functions internal+alwaysinline so the O2 inliner
-  // merges them into their fwd_thunks, eliminating the call overhead.
-  // The LLVM frontend emits functions as `protected dllexport external`,
-  // which prevents inlining; we override that here before the opt pass.
-  {
-    unsigned AlwaysInlineKind = LLVMGetEnumAttributeKindForName(
-        "alwaysinline", static_cast<unsigned>(std::strlen("alwaysinline")));
-    for (uint32_t FuncIdx : BatchIdx) {
-      std::string Name = "f" + std::to_string(FuncIdx);
-      LLVMValueRef Fn = LLVMGetNamedFunction(LLMod, Name.c_str());
-      if (!Fn)
-        continue;
-      LLVMSetLinkage(Fn, LLVMInternalLinkage);
-      LLVMSetVisibility(Fn, LLVMDefaultVisibility);
-      LLVMSetDLLStorageClass(Fn, LLVMDefaultStorageClass);
-      LLVMAttributeRef Attr =
-          LLVMCreateEnumAttribute(LLCtx, AlwaysInlineKind, 0);
-      LLVMAddAttributeAtIndex(Fn, LLVMAttributeFunctionIndex, Attr);
-    }
+  // P1c: Demote batch functions from `protected dllexport external` (the
+  // frontend default) to internal. That alone unblocks LLVM's inliner:
+  // the fwd_thunk calls `f<N>` from exactly one site, so the single-
+  // callsite bonus will fold the body in regardless of size. Cross-body
+  // calls between batch members are then judged by the normal cost model
+  // — which correctly declines to inline e.g. a 26k-line f8 at 805 call
+  // sites of __multi3, the explosion we hit under `alwaysinline`.
+  for (uint32_t FuncIdx : BatchIdx) {
+    std::string Name = "f" + std::to_string(FuncIdx);
+    LLVMValueRef Fn = LLVMGetNamedFunction(LLMod, Name.c_str());
+    if (!Fn)
+      continue;
+    LLVMSetLinkage(Fn, LLVMInternalLinkage);
+    LLVMSetVisibility(Fn, LLVMDefaultVisibility);
+    LLVMSetDLLStorageClass(Fn, LLVMDefaultStorageClass);
   }
 
   // Run LLVM opt on the post-processed module now that all thunks and
@@ -1429,27 +1425,23 @@ Tier2Compiler::compileOsrEntry(uint32_t FuncIdx, uint32_t LoopIdx,
                   NonBatchCallees.size());
   }
 
-  // Mark every batch member (OSR function + BFS callees) alwaysinline so
-  // O2 collapses the OSR body into the fwd_thunk AND inlines batched
-  // helpers into the OSR body. Callees that aren't in the batch are
-  // reached via t1_thunks (FuncTable dispatch) — those are opaque to
-  // LLVM and stay as indirect calls.
-  {
-    unsigned AlwaysInlineKind = LLVMGetEnumAttributeKindForName(
-        "alwaysinline", static_cast<unsigned>(std::strlen("alwaysinline")));
-    for (uint32_t BIdx : BatchSet) {
-      std::string Name = "f" + std::to_string(BIdx);
-      LLVMValueRef Fn = LLVMGetNamedFunction(LLMod, Name.c_str());
-      if (!Fn) {
-        continue;
-      }
-      LLVMSetLinkage(Fn, LLVMInternalLinkage);
-      LLVMSetVisibility(Fn, LLVMDefaultVisibility);
-      LLVMSetDLLStorageClass(Fn, LLVMDefaultStorageClass);
-      LLVMAttributeRef Attr =
-          LLVMCreateEnumAttribute(LLCtx, AlwaysInlineKind, 0);
-      LLVMAddAttributeAtIndex(Fn, LLVMAttributeFunctionIndex, Attr);
+  // Demote batch members to internal linkage so O2's inliner is allowed
+  // to fold them. The OSR fwd_thunk's single call to `f<FuncIdx>` is
+  // inlined by the single-callsite bonus; cross-body inlines inside the
+  // batch are judged by the cost model. Using `alwaysinline` here is
+  // what caused the ed25519 blow-up (805× __multi3 + 60× fe25519_mul
+  // unconditionally inlined into f8's 26k-line body). Callees outside
+  // the batch remain reached via t1_thunks (FuncTable dispatch) —
+  // opaque to LLVM and left as indirect calls.
+  for (uint32_t BIdx : BatchSet) {
+    std::string Name = "f" + std::to_string(BIdx);
+    LLVMValueRef Fn = LLVMGetNamedFunction(LLMod, Name.c_str());
+    if (!Fn) {
+      continue;
     }
+    LLVMSetLinkage(Fn, LLVMInternalLinkage);
+    LLVMSetVisibility(Fn, LLVMDefaultVisibility);
+    LLVMSetDLLStorageClass(Fn, LLVMDefaultStorageClass);
   }
 
   if (P->TM && OptLevel > 0) {
