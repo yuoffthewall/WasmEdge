@@ -380,10 +380,15 @@ void Tier2Manager::enqueueOsr(
       return;
     SeenOsr_.insert(std::make_pair(FTKey, OsrKey));
 
-    // If the target function has already been tier-2 promoted at its
-    // entry, the tier-1 body is dead — OSR into it would waste cycles.
-    if (Seen_.count(std::make_pair(FTKey, FuncIdx)))
-      return;
+    // Do NOT short-circuit when the function is already in Seen_: function-
+    // entry swap only redirects *future* calls. The currently-running tier-1
+    // invocation stays in the tier-1 body until its loop exits — that is
+    // precisely the case OSR exists to rescue. The loss cluster (ctype,
+    // shootout-ed25519, blind-sig) is a one-shot caller with a long inner
+    // loop: by the time tier-2 has compiled the caller, the tier-1 frame
+    // is mid-loop and will never be re-called. Skipping OSR here would
+    // leave the in-flight invocation running tier-1 IR with OSR diamond
+    // overhead and no transition.
 
     Req.FuncIdx = FuncIdx;
     Req.LoopIdx = LoopIdx;

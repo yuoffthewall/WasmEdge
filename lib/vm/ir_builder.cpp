@@ -2387,7 +2387,12 @@ void WasmToIRBuilder::emitLoopBackEdge(LabelInfo &Target) {
     ir_ref CounterAddr =
         ir_ADD_A(BackEdgeCountersPtr, ir_CONST_ADDR(CounterByteOffset));
     ir_ref CounterVal = ir_LOAD_U32(CounterAddr);
-    ir_ref ShouldCount = ir_LT(CounterVal, ir_CONST_U32(OsrThreshold));
+    // MUST be unsigned: jit_osr_notify saturates the slot to UINT32_MAX,
+    // which is signed -1. Signed LT(-1, threshold) is TRUE, so the gate
+    // would NOT block the increment — the counter would wrap 0xFFFFFFFF
+    // → 0 every iteration and re-fire notify every `threshold` iterations
+    // (the exact pathology this gate is here to prevent).
+    ir_ref ShouldCount = ir_ULT(CounterVal, ir_CONST_U32(OsrThreshold));
     ir_ref CountIf = ir_IF(ShouldCount);
     ir_IF_TRUE(CountIf);
     ir_ref Incremented = ir_ADD_U32(CounterVal, ir_CONST_U32(1));
