@@ -567,7 +567,7 @@ extern "C" void jit_osr_notify(WasmEdge::VM::JitExecEnv *env,
     env->BackEdgeCounters[funcIdx * WasmEdge::VM::OSR_MAX_LOOPS_PER_FUNC +
                           loopIdx] = UINT32_MAX;
   }
-  spdlog::debug("OSR back-edge triggered: func {} loop {}", funcIdx, loopIdx);
+  spdlog::info("OSR back-edge triggered: func {} loop {}", funcIdx, loopIdx);
 
 #if defined(WASMEDGE_USE_LLVM)
   if (g_jitModInst && g_jitExecutor && env->FuncTable) {
