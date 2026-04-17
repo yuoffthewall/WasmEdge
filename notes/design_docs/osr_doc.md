@@ -524,9 +524,15 @@ is green.
       because its steady-state path is the tier-2 FuncTable fwd_thunk,
       not OSR — the one-shot OSR rescue affects only the first
       in-flight invocation.
-- [ ] Close tier-2 ↔ LLVM-JIT gap for multi-call kernels (ed25519:
-      8,422k vs 5,320k = ~58% slower). Not an OSR problem; lives in
-      the regular tier-2 batch path. Out of scope for this doc.
+- [~] Close tier-2 ↔ LLVM-JIT gap for multi-call kernels (ed25519:
+      8,422k → **7,036k** vs 5,320k = ~32% slower, down from ~58%).
+      2026-04-18 fix in the regular tier-2 batch path closes ~45% of
+      the gap: drop `alwaysinline` on batch bodies (let LLVM's cost
+      model judge cross-body inlining) + include statically-hot
+      siblings in BFS (fix the cold-at-tier-up cascade). See
+      `tier2_v2_vs_llvm_jit_benchmark.md` §"2026-04-18 refinements"
+      for the P1d/P1e analysis. Residual gap is one-shot-caller
+      structural — blocked on OSR beating the fwd_thunk (§12).
 
 ---
 

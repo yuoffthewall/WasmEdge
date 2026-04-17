@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <deque>
 #include <sstream>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -152,14 +153,18 @@ Tier2Manager::getOrBuildCGLocked(const AST::Module &Mod) noexcept {
     const uint32_t CallerFuncIdx =
         static_cast<uint32_t>(DefinedIdx) + CG.ImportFuncNum;
     const auto Instrs = CodeSec[DefinedIdx].getExpr().getInstrs();
-    std::unordered_set<uint32_t> Seen;
+    // First pass: count static call frequency per target (multiset).
+    std::unordered_map<uint32_t, uint32_t> Freq;
     for (auto It2 = Instrs.begin(); It2 != Instrs.end(); ++It2) {
       if (It2->getOpCode() != OpCode::Call)
         continue;
-      const uint32_t Target = It2->getTargetIndex();
-      if (!Seen.insert(Target).second)
-        continue;
-      CG.Callees[DefinedIdx].push_back(Target);
+      ++Freq[It2->getTargetIndex()];
+    }
+    CG.Callees[DefinedIdx].reserve(Freq.size());
+    for (auto &KV : Freq) {
+      const uint32_t Target = KV.first;
+      const uint32_t StaticFreq = KV.second;
+      CG.Callees[DefinedIdx].push_back({Target, StaticFreq});
       // Record reverse edge only if target is a defined (not imported) func.
       if (Target >= CG.ImportFuncNum) {
         const uint32_t TargetDef = Target - CG.ImportFuncNum;
@@ -272,19 +277,25 @@ Tier2Manager::bfsDownBatchLocked(const AST::Module &Mod, const ModuleCG &CG,
     const uint32_t DefinedIdx = F - CG.ImportFuncNum;
     if (DefinedIdx >= CG.Callees.size())
       continue;
-    for (uint32_t C : CG.Callees[DefinedIdx]) {
+    for (const auto &[C, StaticFreq] : CG.Callees[DefinedIdx]) {
       if (Batch.size() >= MaxBatchSize_)
         break;
       if (InBatch.count(C))
         continue;
-      // Skip callees that were never actually called at runtime.
-      // Static call edges include cold paths (error handlers, init
-      // routines) that waste batch slots and LLVM compile time.
-      if (CallCounters) {
-        uint32_t CCount = CallCounters[C];
-        if (CCount == 0)
-          continue;
-      }
+      // Inclusion is the OR of two signals: either the callee has
+      // already run (dynamic counter nonzero) or the body of the
+      // enclosing caller contains enough static call sites to it that
+      // skipping it would leave the hottest caller with indirect
+      // t1_thunk dispatches at those sites. The static gate closes the
+      // bootstrap window where only the first-tripping callee has a
+      // nonzero counter (e.g. ed25519: when f19 saturated first, all of
+      // f8's other helpers were still at 0 and got dropped, yielding
+      // [f8,f19] and then singletons for everyone else).
+      const bool Dynamic =
+          CallCounters != nullptr && CallCounters[C] != 0;
+      const bool Static = StaticFreq >= StaticFreqHot_;
+      if (!Dynamic && !Static)
+        continue;
       Frontier.push_back({C, D + 1});
     }
   }

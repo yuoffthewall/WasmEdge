@@ -80,11 +80,16 @@ private:
   /// Static per-module forward+reverse call graph, built once and cached.
   struct ModuleCG {
     uint32_t ImportFuncNum = 0;
-    /// Indexed by defined-function index (funcIdx - ImportFuncNum).
-    /// Each entry is the list of direct Call targets (module-wide funcIdx).
-    std::vector<std::vector<uint32_t>> Callees;
+    /// Forward edges: callees[defined_idx] = {(targetFuncIdx, staticFreq)}.
+    /// `staticFreq` counts how many times the caller body statically calls
+    /// the target — a structural "how hot would this be if called once"
+    /// signal that complements the runtime counter. BFS uses it to include
+    /// siblings whose runtime count is still cold at the moment of the
+    /// first tier-up (e.g. ed25519: f8 statically calls f19×805 + f6×60 +
+    /// f10×8, but when f19 trips threshold=10 the rest are still at 0).
+    std::vector<std::vector<std::pair<uint32_t, uint32_t>>> Callees;
     /// Reverse edges: callers[defined_idx] = list of module-wide funcIdx
-    /// that directly Call this function.
+    /// that directly Call this function (dedup, no frequency).
     std::vector<std::vector<uint32_t>> Callers;
   };
 
@@ -123,8 +128,10 @@ private:
                    const uint32_t *CallCounters) noexcept;
 
   /// BFS down from Root collecting scalar-promotable descendants not yet
-  /// in Seen_, bounded by BfsMaxDepth_ and MaxBatchSize_. Callees with
-  /// zero call count are excluded (never actually called at runtime).
+  /// in Seen_, bounded by BfsMaxDepth_ and MaxBatchSize_. A callee is
+  /// included if either its runtime counter is nonzero OR its static
+  /// frequency from the enclosing body is >= StaticFreqHot_ (catches
+  /// siblings of the first-tripping function that haven't yet run).
   /// Ensures HotFuncIdx appears in the result. Caller must hold Mu_.
   std::vector<uint32_t>
   bfsDownBatchLocked(const AST::Module &Mod, const ModuleCG &CG,
@@ -157,6 +164,14 @@ private:
   static constexpr uint32_t WalkupMaxDepth_ = 1;
   static constexpr uint32_t BfsMaxDepth_ = 2;
   static constexpr uint32_t MaxBatchSize_ = 12;
+  // Static-frequency inclusion floor. A callee whose body is reached by
+  // >= this many direct Call instructions in the enclosing caller is
+  // batched even when its runtime counter is still 0 at tier-up time.
+  // `2` excludes accidental singletons (error-path stubs called once)
+  // while catching anything the LLVM inliner would obviously want —
+  // sightglass-strong hot-body counts start in the single digits
+  // (ge25519_add: 5 in f8) and reach hundreds (__multi3: 805 in f8).
+  static constexpr uint32_t StaticFreqHot_ = 2;
 
   // Telemetry aggregates (dumped at shutdown).
   uint64_t StatBatches_ = 0;

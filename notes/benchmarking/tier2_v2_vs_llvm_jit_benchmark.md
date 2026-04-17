@@ -227,6 +227,116 @@ WASMEDGE_TIER2_BFS_DEPTH=2          # BFS down from {root, hot}, depth 2
 
 ---
 
+## 2026-04-18 refinements: batch composition + attribute policy
+
+The P1c `alwaysinline` attribute plus Root-anchored BFS batching closed
+the original loss cluster, but two follow-up issues surfaced when trying
+to close the remaining ed25519 gap (8,422k → LLVM-JIT 5,320k, ~58%
+behind). Both are corrections to P1-era choices.
+
+### P1d -- demote batch bodies from `alwaysinline` to `internal` only
+
+`alwaysinline` does two jobs and the cost of mixing them is non-linear
+in batch size:
+
+1. **Fold `f<N>` into its single-caller fwd_thunk.** Always profitable,
+   always cheap — the fwd_thunk is the sole caller of `f<N>`, so
+   inlining removes the call without code duplication.
+2. **Inline `f<N>` at cross-body call sites in the same batch.** This
+   is the win we want for tight helpers (e.g. `__multi3` inlined at
+   ed25519 field-mul sites). But `alwaysinline` ignores LLVM's inline
+   cost model, which is exactly the knob that prevents e.g. a 20-insn
+   body from being unconditionally inlined at 805 call sites inside a
+   26k-line caller.
+
+On ed25519 with the enlarged batch from P1e (see below), `alwaysinline`
+forced 805× `__multi3` + 60× `fe25519_mul` + 8× `ge25519_p2_dbl`
+inlining into `f8`'s 26,620-line wasm body. The resulting LLVM module
+expanded to ~100k lines and the O2 compile took >9s — past the 8s
+benchmark window — so the tier-2 fwd_thunk swap never completed in
+time. Measured as a ~15% WT regression vs baseline.
+
+**Fix.** Drop `alwaysinline` from batch bodies; keep `LLVMInternalLinkage`
+only. LLVM's single-callsite bonus reliably folds each `f<N>` into its
+fwd_thunk (one call site, no duplication cost). Cross-body inlining is
+judged per call site by the normal cost model — tight helpers inline,
+giant bodies correctly decline. The same change applies to the OSR
+batch path (§12.1 of `osr_doc.md`).
+
+Measured on ed25519 alone (3-run median, `TIER2_THRESHOLD=10
+OSR_THRESHOLD=1000`, sightglass-strong O2):
+
+| | WT (µs) | TtV (µs) |
+|---|---:|---:|
+| Pre-P1d baseline | 8,300k | 8,422k |
+| Post-P1d (internal only) | **7,363k** | **7,490k** |
+
+Files: `lib/vm/tier2_compiler.cpp`.
+
+### P1e -- include statically-hot callees in batch BFS
+
+P1c composed a batch via runtime-counter BFS: from the walk-up root,
+include any direct callee whose `CallCounters[C]` was nonzero. That
+filter blocks cold-at-tier-up-time siblings, which creates a bootstrap
+problem for kernels where one helper trips the threshold long before
+its siblings have been called.
+
+Concrete ed25519 sequence under `THRESHOLD=10`:
+
+- `f19` (`__multi3`) reaches entry count 10 first. It's called 805×/iter
+  from `f8`, so it trips on the second iteration.
+- Walk-up picks `f8` as root. BFS fans out from `f8`. But at the moment
+  `f19` tripped, `f8`'s other direct callees (`f12=fe25519_mul`,
+  `f10=ge25519_p2_dbl`, `f11=ge25519_add`, …) are all still at counter
+  0 because the first iteration hadn't yet returned control back up
+  through `f8`'s call stack.
+- Runtime-counter filter drops them all. Batch becomes `[f8, f19]`.
+  `f8` goes into `Seen_` and is permanently reserved — every remaining
+  helper later trips its own threshold and is compiled as a singleton.
+
+**Fix.** Track static call frequency per (caller, callee) pair in
+`ModuleCG::Callees` as a `vector<pair<funcIdx, staticFreq>>`. The BFS
+inclusion predicate becomes:
+
+```
+include callee C iff
+    CallCounters[C] != 0                  // already hot, OR
+  OR static_freq(caller → C) >= StaticFreqHot_   // hot by structure
+```
+
+`StaticFreqHot_ = 2` excludes accidental singletons (error-path stubs
+called once from the caller body) while catching anything LLVM's
+inliner would obviously want. sightglass-strong static-freq counts span
+2-805 on real targets; the threshold is well-separated.
+
+With P1e, ed25519's batch at first tier-up becomes `[8,19,12,11,10,9,6,14]`
+(size 8) — the hot cluster as a single unit, no singleton cascade.
+
+Measured combined (3-run median, same config):
+
+| Stage | ed25519 WT | vs baseline |
+|---|---:|---:|
+| Pre-P1 (§"Loss cluster" baseline) | 8,300k | — |
+| P1d only | 7,363k | **−11%** |
+| **P1d + P1e combined** | **7,036k** | **−15%** |
+
+Files: `include/vm/tier2_manager.h`, `lib/vm/tier2_manager.cpp`.
+
+### Note on the P1c → P1d → P1e interaction
+
+P1d (drop `alwaysinline`) must land before P1e (bigger batches) is
+safe. The static-freq fix was initially tried on top of unchanged P1c
+and produced the ~15% regression described above (`alwaysinline` ×
+`size=8` batch blew up the LLVM module). With the cost model back in
+charge, a size-8 batch is pure upside.
+
+`alwaysinline` was not entirely wrong — on the small batches P1c
+originally targeted (size 1-2), it was equivalent to the cost model's
+decision. The failure mode is specific to the enlarged batches that
+P1e enables.
+
+---
+
 ## Small slowdowns investigation
 
 The 8 kernels at WT 0.72-0.89x split into two categories with different
@@ -307,6 +417,19 @@ inside one-shot callers (the majority of sightglass kernels) are already
 mid-execution when the tier-2 batch compiles. The tier-2-compiled
 version is never invoked. See `notes/issues/osr_for_hot_loops.md` for
 the on-stack replacement design that addresses this.
+
+**Post-2026-04-18 update.** P1d+P1e close ~45% of ed25519's tier-2 →
+LLVM-JIT gap: 8,422k → 7,036k, against the 5,320k LLVM-JIT reference
+(from 58% behind to 32% behind). This is the portion of the gap
+attributable to batch composition (siblings dropped by the cold-at-
+tier-up filter) and over-eager inlining (the `alwaysinline` blowup).
+
+The residual ~32% is structural: ed25519's `f8` is a one-shot outer
+function wrapping a long hot loop. Function-entry tier-2 swap still
+helps only the helper callees (via `fwd_thunk` installs in
+`FuncTable`), not `f8`'s running frame. Closing the rest requires OSR
+to reach `f8`'s active frame *before* the tier-2 fwd_thunks install
+for its helpers — see `osr_doc.md` §12.1 for the track.
 
 ---
 
