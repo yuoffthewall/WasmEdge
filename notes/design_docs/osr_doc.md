@@ -448,14 +448,25 @@ merely re-introduced the CSE substrate. Threshold-hit now only calls
 `jit_osr_notify`.
 
 Result, supported config (`WASMEDGE_TIER2_ENABLE=1
-WASMEDGE_TIER2_THRESHOLD=10 WASMEDGE_OSR_THRESHOLD=5000`, O2,
-sightglass-strong, 60 s per-kernel): **30/33 pass**. Residual:
+WASMEDGE_TIER2_THRESHOLD=10 WASMEDGE_OSR_THRESHOLD=1000`, O2,
+sightglass-strong, 60 s per-kernel, **re-measured 2026-04-17**):
+**30/33 pass**. Residual:
 
-| Kernel             | Symptom                                  |
-|--------------------|------------------------------------------|
-| blind-sig          | timeout (hang under OSR, core dumped)    |
-| shootout-base64    | timeout (hang under OSR, core dumped)    |
-| shootout-ratelimit | timeout (hang under OSR, core dumped)    |
+| Kernel             | OSR off (us)  | OSR on          | Symptom on |
+|--------------------|---------------|-----------------|------------|
+| blind-sig          | WT 8,128k     | **SIGSEGV**     | `wasm_jit_520+492` — tier-1 JIT'd code, SWAR byte-scan (`mov 0x38(%rsp),%r8; xor (%rsi,%r8,1),%ecx`) |
+| shootout-base64    | WT 8,538k     | **SIGSEGV**     | same class |
+| shootout-ratelimit | WT 8,522k     | **SIGSEGV**     | same class |
+
+Update 2026-04-17: the three residual kernels now **SIGSEGV** rather
+than hang — the crash is in **tier-1 JIT'd code** (`wasm_jit_NNN`), not
+in the OSR continuation, so the OSR diamond's locals-store IR is
+corrupting downstream tier-1 codegen on a body whose hot back-edge
+runs before the OSR transition. Register state at crash is sane
+(SWAR broadcast constants like `r15=0x0a0a0a0a` intact), so codegen
+is emitting the load at the wrong schedule point, not dereferencing
+garbage. The type-native-store fix closed the CSE-across-branches
+shape but did not close this second shape.
 
 All three pass with `WASMEDGE_OSR_SKIP_STORES=1`, pointing to a residual
 store-chain interaction in the OSR diamond's hot tier-1 back-edge path.
@@ -501,6 +512,166 @@ is green.
 - [x] `WASMEDGE_IR_SKIP_PHI_DCE` workaround reverted (Bug 1 dormant in
       supported tier2+OSR config).
 - [ ] Bug 2 residual (blind-sig, shootout-base64, shootout-ratelimit)
-      root-caused.
+      root-caused. (2026-04-17: failure class confirmed SIGSEGV, not
+      hang; SKIP_STORES=1 still masks it; still open.)
 - [ ] End-to-end WT measurement on the full loss cluster (needs the
       residual Bug 2 fix to include blind-sig).
+- [x] OSR closes the tier-1 ↔ LLVM-JIT gap on the loss cluster for
+      one-shot-caller kernels. 2026-04-17 §12 follow-up: after §12.1
+      batch-composition fix (`bfsOsrBatch` in `tier2_compiler.cpp`),
+      ctype WT drops 7,554k → 5,166k µs (−32%), closing to within 1.8%
+      of the 5,077k LLVM-JIT reference. ed25519 WT is unchanged
+      because its steady-state path is the tier-2 FuncTable fwd_thunk,
+      not OSR — the one-shot OSR rescue affects only the first
+      in-flight invocation.
+- [ ] Close tier-2 ↔ LLVM-JIT gap for multi-call kernels (ed25519:
+      8,422k vs 5,320k = ~58% slower). Not an OSR problem; lives in
+      the regular tier-2 batch path. Out of scope for this doc.
+
+---
+
+## 12. Investigation: why OSR doesn't close the gap (2026-04-17)
+
+The perf motivation in §1 projected closing most of the tier-1 ↔
+LLVM-JIT gap on `ctype / ed25519 / blind-sig` — theoretical ceilings
+~5.2M / 5.5M / 4.3M WT. Current reality:
+
+| Kernel             | tier-1 only | tier-2 only | **tier-2 + OSR** | LLVM JIT |
+|--------------------|------------:|------------:|-----------------:|---------:|
+| shootout-ctype     |      ~8,200k |       7,857k |       **7,554k** (−4%) |  ~5,000k |
+| shootout-ed25519   |      ~8,550k |       8,364k |       **8,300k** (−1%) |  ~5,230k |
+| blind-sig          |      ~9,500k |       8,245k |       **SIGSEGV**       |  ~3,959k |
+
+Medians of 3, `WASMEDGE_TIER2_THRESHOLD=10 WASMEDGE_OSR_THRESHOLD=1000`,
+O2, sightglass-strong, current branch build. The mechanism is
+mechanically working — `WASMEDGE_TIER2_TRACE_FUNC=9` on ctype confirms
+exactly one fwd_thunk entry (the single transition out of the
+one-shot caller into the OSR continuation). But the win is tiny.
+
+### 12.1 Root cause: singleton OSR batching blocks helper inlining
+
+`compileOsrEntry` treats the OSR function as a batch of one. Every
+non-batch defined function is stubbed and then rewritten in-place as
+a `t1_thunk` by `emitT1ThunkInPlace`, so inside the LLVM module that
+holds the OSR body, every direct `call` to a helper compiles to:
+
+```
+  env        = TLS_LOAD(jit_env_tls_offset)   ; inlined movq %fs:…
+  table_base = *env                           ; FuncTable pointer
+  target     = table_base[<helperIdx>]        ; indirect load
+  ret        = target(env, args[])            ; indirect call, ABI-marshalled
+```
+
+LLVM cannot inline across this boundary — the callee is a pointer
+loaded from runtime memory, not a statically known function.
+
+Dumped OSR modules (`WASMEDGE_TIER2_DUMP_IR=…`) quantify it:
+
+| Kernel          | OSR function | Indirect t1_thunk calls in hot loop body |
+|-----------------|--------------|-----------------------------------------:|
+| shootout-ctype  | `f9_l0`      | 3 per inner iter × 50,000 × 60,000       |
+| shootout-ed25519| `f5_l4`      | **130 per iter**                          |
+
+The ed25519 helpers are the field-arithmetic primitives. The ctype
+helpers are char-class predicates (`isdigit`-like). Both are exactly
+the shapes LLVM AOT-JIT inlines into a tight loop when given the
+whole module; OSR compiling a single function hands LLVM a hot body
+with `@funcTable[22](env, args)` in place of a 5-instruction predicate
+and the O2 pipeline cannot recover.
+
+The singleton design is called out in §5 "Batch composition" with the
+rationale *"loss-cluster kernels have small, self-contained loop
+bodies and don't require cross-function inlining to close most of the
+gap."* The 2026-04-17 measurement shows this premise is wrong for
+ctype and badly wrong for ed25519 (130 indirect calls per iter is not
+a small self-contained body).
+
+The tier-2 batch path already does the right thing: it collects
+direct callees via `collectNonBatchCallees`, filters them through
+`Tier2Manager::isPromotable`, and lowers them with real bodies in the
+same mini-module so LLVM inlines freely. Post-P1c the batch functions
+also carry `alwaysinline` so the body collapses into its fwd_thunk.
+OSR gets the `alwaysinline` step but not the batch-composition step —
+the OSR body folds into `fN_fwd_thunk` but every helper call inside
+it is still an indirect dispatch.
+
+**Fix direction.** Bring OSR's batch composition to parity with the
+function-entry batch path:
+
+1. After `synthesizeOsrModule`, walk the rewritten OSR body for
+   direct `call` targets, same way `collectNonBatchCallees` does.
+2. Filter through `isPromotable` (scalar-only signatures, no imports,
+   no multi-return).
+3. Add them to `BatchSet`; the mini-module now keeps real bodies for
+   those callees instead of stubbing them.
+4. Mark each batch member `alwaysinline` (not just the OSR function)
+   so short helpers fold into the OSR body and longer ones remain
+   callable at the SysV ABI, without the t1_thunk indirection.
+5. Keep the t1_thunk rewrite for the remaining non-batch stubs — that
+   tier is still needed for cold helpers.
+
+**Implemented 2026-04-17**. `bfsOsrBatch` + `isOsrBatchPromotable`
+helpers in `lib/vm/tier2_compiler.cpp` do a BFS over Mini's direct
+`call` edges starting from the OSR function, depth cap 2, size cap
+12 (same geometry as `Tier2Manager::bfsDownBatchLocked`). Every batch
+member gets `internal` linkage + `alwaysinline`. `collectNonBatchCallees`
+is unchanged — it now excludes the enlarged batch so only truly-cold
+helpers become t1_thunks.
+
+Measured effect (medians of 3, sightglass-strong O2,
+`TIER2_THRESHOLD=10 OSR_THRESHOLD=1000`):
+
+| Kernel           | OSR funcs batched | WT before | WT after  | vs LLVM JIT |
+|------------------|------------------:|----------:|----------:|------------:|
+| shootout-ctype   |       1 → 10      |  7,554k µs |  **5,166k µs** |  5,077k µs (+1.8%)  |
+| shootout-ed25519 |       1 → 4       |  8,300k µs |  8,422k µs     |  5,320k µs (+58%)  |
+
+Indirect `t1_thunk` calls in the ctype OSR body dropped from ~3
+per-iter to 0. ed25519 dropped 130 → 9. ed25519 WT didn't move
+because its steady-state path is the tier-2 FuncTable fwd_thunk
+installed before OSR fires — OSR only rescues the first in-flight
+invocation, which is noise in a multi-call benchmark. The remaining
+ed25519 gap is a regular tier-2 compile issue, not an OSR one.
+
+Cost: larger LLVM modules per OSR compile, longer worker latency
+before the entry publishes. Empirically still sub-100 ms for a ~12-
+function batch at O2, well within the tens-of-ms the 1000-backedge
+threshold affords.
+
+### 12.2 Implementation correctness — otherwise clean
+
+Walked `emitLoopBackEdge` (`lib/vm/ir_builder.cpp:2264-2408`),
+`synthesizeOsrModule` / `compileOsrEntry` / `emitFwdThunk`
+(`lib/vm/tier2_compiler.cpp:226-1450`), `enqueueOsr` / `workerLoop`
+(`lib/vm/tier2_manager.cpp:362-528`), `jit_osr_notify`
+(`lib/executor/helper.cpp:560-583`). No additional semantic bugs.
+Specifically verified:
+
+- Counter wrap is guarded (`ir_ULT`, not `ir_LT`) — a signed compare
+  would let the saturated `0xFFFFFFFF` slot pass the gate and re-fire
+  notify every `threshold` iterations.
+- `Seen_` short-circuit in `enqueueOsr` is removed (OSR must run even
+  when function-entry swap has already promoted the same funcIdx —
+  the currently-running frame is the whole reason OSR exists).
+- Atomic publication: release store in worker, plain load in tier-1
+  (acquire on x86-64 at ISA level), slot transitions null → non-null
+  once and never reverts.
+- Validator gate runs on the synthesized module before LLVM codegen;
+  structurally unsynthesizable loops return a clean reject instead of
+  an LLVM-backend assertion.
+- fwd_thunk reuse for the OSR entry is consistent with
+  `OsrLocalsFrame`'s u64-slot layout and the type-native store widths.
+
+### 12.3 Ship posture
+
+Current state is **not shippable as a default-on configuration**:
+three sightglass-strong kernels SIGSEGV at the recommended
+`OSR_THRESHOLD=1000`. Options until §10 Bug 2 and §12.1 land:
+
+- Keep `WASMEDGE_OSR_THRESHOLD=0` as the default (OSR disabled),
+  treat OSR as an opt-in experimental knob.
+- Or: auto-restrict OSR instrumentation to kernels that don't trip
+  Bug 2 — brittle and loses coverage, not recommended.
+
+Neither option recovers the §1 perf ceiling. The ceiling requires
+both §12.1 (batch composition) and §10 Bug 2 (tier-1 miscompile).

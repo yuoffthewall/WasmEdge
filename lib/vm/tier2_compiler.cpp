@@ -25,8 +25,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <string>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 // Tier-2 helpers defined in ir_jit_engine.cpp.
@@ -790,6 +792,120 @@ bool synthesizeOsrModule(AST::Module &Mini, uint32_t FuncIdx,
 /// `call` targets that are (a) defined (not imports) and (b) not already
 /// in the batch. These are the non-batch functions for which we must
 /// emit tier-2 → tier-1 bridges.
+/// Scalar-only MVP promotion filter, mirroring the one used by the batch
+/// planner in Tier2Manager (see lib/vm/tier2_manager.cpp). Duplicated here
+/// because the compiler must make the same decision when expanding the OSR
+/// batch, and there is no cross-TU header for the manager's private helpers.
+/// Rejects: imports, multi-return functions, non-scalar param/ret types,
+/// and trap-stub bodies that start with `unreachable` (the frontend skips
+/// emitting `f<Idx>` for those, which would break emitFwdThunk lookup).
+bool isOsrBatchPromotable(const AST::Module &Mod, uint32_t FuncIdx,
+                           uint32_t ImportFuncNum) noexcept {
+  if (FuncIdx < ImportFuncNum) {
+    return false;
+  }
+  const auto &FuncSec = Mod.getFunctionSection().getContent();
+  const uint32_t DefinedIdx = FuncIdx - ImportFuncNum;
+  if (DefinedIdx >= FuncSec.size()) {
+    return false;
+  }
+  const uint32_t TypeIdx = FuncSec[DefinedIdx];
+  const auto &TypeSec = Mod.getTypeSection().getContent();
+  if (TypeIdx >= TypeSec.size()) {
+    return false;
+  }
+  const auto &CodeSec = Mod.getCodeSection().getContent();
+  if (DefinedIdx < CodeSec.size()) {
+    const auto Instrs = CodeSec[DefinedIdx].getExpr().getInstrs();
+    auto It = Instrs.begin();
+    if (It != Instrs.end() && It->getOpCode() == OpCode::Unreachable) {
+      return false;
+    }
+  }
+  const auto &FT = TypeSec[TypeIdx].getCompositeType().getFuncType();
+  if (FT.getReturnTypes().size() > 1) {
+    return false;
+  }
+  auto Marshalable = [](const ValType &VT) {
+    switch (VT.getCode()) {
+    case TypeCode::I32:
+    case TypeCode::I64:
+    case TypeCode::F32:
+    case TypeCode::F64:
+      return true;
+    default:
+      return false;
+    }
+  };
+  for (const auto &PT : FT.getParamTypes()) {
+    if (!Marshalable(PT))
+      return false;
+  }
+  for (const auto &RT : FT.getReturnTypes()) {
+    if (!Marshalable(RT))
+      return false;
+  }
+  return true;
+}
+
+/// BFS over direct `call` edges in \p Mod starting from \p Root, collecting
+/// promotable defined-function indices up to depth \p MaxDepth and cap
+/// \p MaxSize. Root is always included regardless of promotability (caller
+/// vets the root; for OSR, emitFwdThunk rejects non-scalar params at emit
+/// time and we surface that as a warn+bail). The returned set is used as
+/// the OSR batch: its members keep real bodies in the synthesized mini
+/// module, get marked internal+alwaysinline so O2 inlines helper calls
+/// into the OSR body, and are excluded from the t1_thunk rewrite pass.
+std::unordered_set<uint32_t>
+bfsOsrBatch(const AST::Module &Mod, uint32_t Root, uint32_t ImportFuncNum,
+             uint32_t MaxDepth, uint32_t MaxSize) noexcept {
+  std::unordered_set<uint32_t> Batch;
+  Batch.insert(Root);
+  const auto &CodeSec = Mod.getCodeSection().getContent();
+  std::deque<std::pair<uint32_t, uint32_t>> Frontier;
+  Frontier.push_back({Root, 0});
+  while (!Frontier.empty() && Batch.size() < MaxSize) {
+    auto [F, D] = Frontier.front();
+    Frontier.pop_front();
+    if (D >= MaxDepth) {
+      continue;
+    }
+    if (F < ImportFuncNum) {
+      continue;
+    }
+    const uint32_t DefinedIdx = F - ImportFuncNum;
+    if (DefinedIdx >= CodeSec.size()) {
+      continue;
+    }
+    const auto Instrs = CodeSec[DefinedIdx].getExpr().getInstrs();
+    std::unordered_set<uint32_t> LocalSeen;
+    for (auto It = Instrs.begin(); It != Instrs.end(); ++It) {
+      if (It->getOpCode() != OpCode::Call) {
+        continue;
+      }
+      const uint32_t Tgt = It->getTargetIndex();
+      if (Tgt < ImportFuncNum) {
+        continue;
+      }
+      if (Batch.count(Tgt)) {
+        continue;
+      }
+      if (!LocalSeen.insert(Tgt).second) {
+        continue;
+      }
+      if (!isOsrBatchPromotable(Mod, Tgt, ImportFuncNum)) {
+        continue;
+      }
+      if (Batch.size() >= MaxSize) {
+        break;
+      }
+      Batch.insert(Tgt);
+      Frontier.push_back({Tgt, D + 1});
+    }
+  }
+  return Batch;
+}
+
 std::vector<uint32_t>
 collectNonBatchCallees(const AST::Module &Mod,
                        const std::unordered_set<uint32_t> &BatchSet,
@@ -1164,11 +1280,23 @@ Tier2Compiler::compileOsrEntry(uint32_t FuncIdx, uint32_t LoopIdx,
     return nullptr;
   }
 
-  // Stub every other defined function with default-value returns. The
-  // OSR function is treated as a singleton batch — callees are resolved
-  // via tier-2 → tier-1 thunks installed below.
-  std::unordered_set<uint32_t> BatchSet;
-  BatchSet.insert(FuncIdx);
+  // Expand the batch BFS-style from the OSR function: pull in its direct
+  // (and, up to MaxDepth, transitive) promotable callees so their real
+  // bodies stay in the mini-module. Without this the OSR function is a
+  // singleton and every helper call becomes an indirect FuncTable
+  // dispatch through a t1_thunk — LLVM can't see past the function
+  // pointer, so tight helpers (char-class predicates in shootout-ctype,
+  // 25519 field-arithmetic in shootout-ed25519) never get inlined into
+  // the hot loop. Mirrors the regular batch path's inlining recipe.
+  constexpr uint32_t OsrBatchMaxDepth = 2;
+  constexpr uint32_t OsrBatchMaxSize = 12;
+  std::unordered_set<uint32_t> BatchSet =
+      bfsOsrBatch(Mini, FuncIdx, ImportFuncNum, OsrBatchMaxDepth,
+                   OsrBatchMaxSize);
+  if (BatchSet.size() > 1) {
+    spdlog::info("tier2-osr: batch expanded to {} funcs (root {})",
+                 BatchSet.size(), FuncIdx);
+  }
   {
     auto &CodeSec = Mini.getCodeSection().getContent();
     const auto &FuncSec = Mini.getFunctionSection().getContent();
@@ -1301,14 +1429,20 @@ Tier2Compiler::compileOsrEntry(uint32_t FuncIdx, uint32_t LoopIdx,
                   NonBatchCallees.size());
   }
 
-  // Mark the OSR function alwaysinline so O2 collapses it into the
-  // fwd_thunk, mirroring the batch path.
+  // Mark every batch member (OSR function + BFS callees) alwaysinline so
+  // O2 collapses the OSR body into the fwd_thunk AND inlines batched
+  // helpers into the OSR body. Callees that aren't in the batch are
+  // reached via t1_thunks (FuncTable dispatch) — those are opaque to
+  // LLVM and stay as indirect calls.
   {
     unsigned AlwaysInlineKind = LLVMGetEnumAttributeKindForName(
         "alwaysinline", static_cast<unsigned>(std::strlen("alwaysinline")));
-    std::string Name = "f" + std::to_string(FuncIdx);
-    LLVMValueRef Fn = LLVMGetNamedFunction(LLMod, Name.c_str());
-    if (Fn) {
+    for (uint32_t BIdx : BatchSet) {
+      std::string Name = "f" + std::to_string(BIdx);
+      LLVMValueRef Fn = LLVMGetNamedFunction(LLMod, Name.c_str());
+      if (!Fn) {
+        continue;
+      }
       LLVMSetLinkage(Fn, LLVMInternalLinkage);
       LLVMSetVisibility(Fn, LLVMDefaultVisibility);
       LLVMSetDLLStorageClass(Fn, LLVMDefaultStorageClass);
