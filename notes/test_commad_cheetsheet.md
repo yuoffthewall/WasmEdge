@@ -173,7 +173,44 @@ Tier-2 promotes hot IR-JIT functions to an LLVM-compiled version on a background
 | `WASMEDGE_TIER2_THRESHOLD=N` | Function-entry hotness count that triggers tier-2 compile (default 1000, only read when `ENABLE=1`). All functions use the same threshold (the former `LOOP_THRESHOLD` split was removed). |
 | `WASMEDGE_TIER2_MAX_COMPILE=N` | Debug: cap total tier-2 compilations the worker will perform in this process (default unlimited). |
 | `WASMEDGE_TIER2_TRACE_FUNC=idx` | Trace a single wasm function index through the tier-2 compiler (verbose logging). |
-| `WASMEDGE_TIER2_DUMP_IR=dir` | Dump each tier-2 LLVM module to `<dir>/tier2_f<idx>.ll` before codegen. Directory must exist. |
+| `WASMEDGE_TIER2_DUMP_IR=dir` | Dump each tier-2 LLVM module to `<dir>/tier2_f<idx>.ll` (and OSR entries as `tier2_osr_f<F>_l<L>.ll`) before codegen. Directory must exist. |
+
+# OSR (on-stack replacement, tier-1 → tier-2 mid-loop)
+
+OSR detects hot back-edges in tier-1 IR-JIT code, compiles a tier-2 entry that begins execution *inside* the loop, and transfers control mid-iteration. Architecture: `notes/design_docs/osr_doc.md`.
+
+**OSR is only meaningful with tier-2 enabled** (`WASMEDGE_TIER2_ENABLE=1`). Without tier-2 the continuation entry is never compiled, so the back-edge diamond polls a slot that is never published — sweeps without tier-2 do not verify OSR.
+
+| Variable | Purpose |
+|----------|---------|
+| `WASMEDGE_OSR_THRESHOLD=N` | Outermost-loop back-edge iterations before `jit_osr_notify` enqueues an OSR compile. **`0` disables OSR** (default). Recommended: `1000`; `5000` for the supported sightglass-strong sweep. |
+| `WASMEDGE_OSR_OPT_LEVEL=0..3` | LLVM post-opt pipeline for OSR modules (default `2`). Use `0` to bisect optimizer bugs. |
+| `WASMEDGE_OSR_MIN_FUNC=N` / `WASMEDGE_OSR_MAX_FUNC=N` | Restrict OSR instrumentation to `FuncIdx ∈ [MIN, MAX]` (default `0` / `UINT32_MAX`). Bisection hook; keep unset in production. |
+| `WASMEDGE_OSR_MIN_LOOP=N` / `WASMEDGE_OSR_MAX_LOOP=N` | Restrict to `LoopIdx ∈ [MIN, MAX]` per function (default `0` / `UINT32_MAX`). Per-function bisection. |
+| `WASMEDGE_OSR_SKIP_STORES=1` | Skip locals stores in the transition diamond. **Debug-only**: the OSR entry will then read stale/garbage locals. Used to bisect Bug 2 residuals. |
+| `WASMEDGE_OSR_DUMP=dir` | Dump synthesized OSR bodies to `<dir>/osr_<f>_<l>.txt`. Diagnostic. |
+
+## Supported tier2 + OSR sweep on sightglass-strong
+
+This is the configuration referenced in `osr_doc.md` §11 (30/33 kernels pass at O2; the 3 residuals — blind-sig, shootout-base64, shootout-ratelimit — are tracked in `notes/bugs/osr_bugs.md`).
+
+```shell
+cd build && \
+for wasm in ../test/ir/testdata/sightglass-strong/*.wasm; do
+  kernel="$(basename "$wasm" .wasm)"
+  echo "Testing $kernel:"
+  WASMEDGE_SIGHTGLASS_DIR=sightglass-strong \
+  WASMEDGE_SIGHTGLASS_KERNEL="$kernel" \
+  WASMEDGE_SIGHTGLASS_MODE=IR_JIT \
+  WASMEDGE_IR_JIT_OPT_LEVEL=2 \
+  WASMEDGE_TIER2_ENABLE=1 \
+  WASMEDGE_TIER2_THRESHOLD=10 \
+  WASMEDGE_OSR_THRESHOLD=5000 \
+  stdbuf -oL timeout 60 ./test/ir/wasmedgeIRBenchmarkTests --gtest_filter='*SightglassSuite*' 2>&1
+done | tee /tmp/wasm-tier2-osr.log
+echo $?
+grep -iE 'dumped|error|failed|mismatch|warning' /tmp/wasm-tier2-osr.log
+```
 
 # Plugin loader
 
