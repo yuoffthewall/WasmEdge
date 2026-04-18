@@ -507,100 +507,128 @@ practice — a program has `O(#hot loops)` OSR requests total.
 
 Files: `include/vm/tier2_manager.h`, `lib/vm/tier2_manager.cpp`.
 
-### Full-sweep results (sightglass-strong, 33 kernels)
+### Full-sweep results (sightglass-strong, 33 kernels, 2026-04-18 refresh)
 
 Config: `WASMEDGE_TIER2_ENABLE=1 WASMEDGE_TIER2_THRESHOLD=10
-WASMEDGE_OSR_THRESHOLD=1000 WASMEDGE_IR_JIT_OPT_LEVEL=2`, one sample
+WASMEDGE_OSR_THRESHOLD=5000 WASMEDGE_IR_JIT_OPT_LEVEL=2`, one sample
 per cell. All WT values in µs.
 
-**Failures (8/33).** P1f surfaced or retained these; none are caused
-by the P1f changes themselves (they reproduce on the pre-P1f commit
-when the same threshold is used).
+This refresh runs on top of two root-cause fixes landed after the
+P1f sweep:
 
-| Kernel             | Arm             | Failure                                                |
-|---                 |---              |---                                                     |
-| shootout-base64    | tier-2          | core dump inside tier-2 compile/install                |
-| shootout-minicsv   | tier-2          | core dump inside tier-2 compile/install                |
-| shootout-ratelimit | tier-2          | core dump inside tier-2 compile/install                |
-| quicksort          | tier-2          | mini-module validation: value-stack underflow at `call`|
-| regex              | tier-2          | mini-module validation: type mismatch (i64 vs i32)     |
-| shootout-fib2      | tier-2          | mini-module validation: value-stack underflow at `call`|
-| blind-sig          | tier-1 + tier-2 | kernel trap during execution (pre-existing)            |
-| rust-compression   | tier-1          | unreachable trap at runtime (pre-existing)             |
+- **OSR synthesis appends a new function slot** instead of overwriting
+  `FuncSec[DefinedIdx]`. Closes the three mini-module validation
+  crashes (quicksort, regex, shootout-fib2).
+- **`call_indirect` null-path allocas hoisted to the entry block** in
+  the LLVM frontend. Closes the stack-exhaustion SEGVs on
+  shootout-base64, shootout-minicsv, shootout-ratelimit (non-entry
+  allocas accumulated 500k× per call; 8 MB thread stack filled mid-run).
 
-**Aggregates on the 25 kernels where tier-1, tier-2, and LLVM all
-complete.**
+**Failures (1/33).** Only the pre-existing blind-sig tier-2 SEGV
+remains; tracked in `notes/bugs/osr_bugs.md` and follow-up #7 in
+`tier2_v2_doc.md`.
+
+| Kernel    | Arm    | Failure                                                  |
+|---        |---     |---                                                       |
+| blind-sig | tier-2 | core dump inside tier-2 execution (pre-existing residual)|
+
+**Aggregates on the 31 kernels where tier-1, tier-2, and LLVM all
+complete** (blind-sig failed; `noop` excluded — WT is below
+measurement noise).
 
 | Aggregate                            | value     |
 |---                                   |---        |
-| Geomean WT speedup tier-2 vs tier-1  | **1.20×** |
-| Geomean WT ratio tier-2 / LLVM JIT   | **0.93×** |
-| Best tier-2 vs tier-1                | shootout-ackermann **5.32×** |
-| Best tier-2 vs LLVM JIT              | shootout-ackermann **1.71×** |
-| Worst tier-2 vs LLVM JIT             | rust-json 0.58×              |
+| Geomean WT speedup tier-2 vs tier-1  | **1.02×** |
+| Geomean WT ratio tier-2 / LLVM JIT   | **0.87×** |
+| Best tier-2 vs tier-1                | shootout-random **1.58×** |
+| Best tier-2 vs LLVM JIT              | shootout-ackermann **1.88×** |
+| Worst tier-2 vs tier-1               | shootout-ratelimit 0.33×     |
+| Worst tier-2 vs LLVM JIT             | shootout-ratelimit 0.26×     |
+| Tier-2 ≥ LLVM JIT (wins)             | 13 / 31                      |
 
 **Per-kernel WT (µs), sorted by tier-2-vs-tier-1 speedup.**
 
 | Kernel | Tier-1 WT | Tier-2 WT | LLVM WT | vs T1 | vs LLVM |
 |---|---:|---:|---:|---:|---:|
-| shootout-ackermann | 14,716,544 | 2,766,884 | 4,729,725 | **5.32×** | **1.71×** |
-| shootout-ctype | 8,477,750 | 5,116,635 | 4,981,451 | 1.66× | 0.97× |
-| shootout-random | 6,933,863 | 4,391,172 | 4,376,049 | 1.58× | 1.00× |
-| shootout-matrix | 9,963,422 | 6,689,167 | 6,818,511 | 1.49× | 1.02× |
-| shootout-gimli | 10,161,820 | 8,041,672 | 7,774,984 | 1.26× | 0.97× |
-| shootout-ed25519 | 8,219,307 | 6,640,923 | 4,981,327 | **1.24×** | 0.75× |
-| shootout-xblabla20 | 3,114,872 | 2,621,212 | 2,646,738 | 1.19× | 1.01× |
-| shootout-keccak | 8,227,066 | 6,974,522 | 6,878,483 | 1.18× | 0.99× |
-| pulldown-cmark | 3,204,318 | 2,746,499 | 2,168,996 | 1.17× | 0.79× |
-| bz2 | 8,293,503 | 7,491,223 | 7,098,919 | 1.11× | 0.95× |
-| hashset | 6,805,306 | 6,136,454 | 5,375,595 | 1.11× | 0.88× |
-| rust-protobuf | 3,198,551 | 2,927,933 | 1,998,903 | 1.09× | 0.68× |
-| shootout-heapsort | 8,962,877 | 8,363,460 | 8,066,146 | 1.07× | 0.96× |
-| shootout-xchacha20 | 8,414,520 | 8,033,511 | 8,101,397 | 1.05× | 1.01× |
-| shootout-memmove | 2,798,553 | 2,674,899 | 2,633,328 | 1.05× | 0.98× |
-| shootout-switch | 9,030,089 | 8,794,297 | 9,034,148 | 1.03× | 1.03× |
-| blake3-scalar | 5,356,416 | 5,277,479 | 5,455,521 | 1.01× | 1.03× |
-| gcc-loops | 10,077,801 | 10,098,224 | 6,592,944 | 1.00× | 0.65× |
-| shootout-nestedloop | 5,427,974 | 5,428,434 | 8,839,150 | 1.00× | 1.63× |
-| rust-json | 3,629,523 | 3,668,737 | 2,136,883 | 0.99× | 0.58× |
-| richards | 916,170 | 933,496 | 747,190 | 0.98× | 0.80× |
-| shootout-seqhash | 5,432,619 | 5,557,004 | 5,563,611 | 0.98× | 1.00× |
-| rust-html-rewriter | 1,466,474 | 1,504,861 | 900,962 | 0.97× | 0.60× |
-| shootout-sieve | 8,163,649 | 8,891,090 | 6,756,967 | 0.92× | 0.76× |
+| shootout-random | 6,938,756 | 4,384,896 | 4,399,482 | **1.58×** | 1.00× |
+| shootout-ctype | 8,275,231 | 5,280,808 | 4,985,145 | **1.57×** | 0.94× |
+| shootout-ackermann | 6,508,647 | 4,319,264 | 8,122,937 | **1.51×** | **1.88×** |
+| shootout-ed25519 | 8,252,066 | 6,797,125 | 4,890,048 | 1.21× | 0.72× |
+| quicksort | 8,142,324 | 6,723,162 | 6,939,293 | 1.21× | **1.03×** |
+| shootout-matrix | 8,124,571 | 6,774,046 | 6,841,628 | 1.20× | **1.01×** |
+| shootout-keccak | 8,222,692 | 6,917,951 | 6,928,693 | 1.19× | **1.00×** |
+| shootout-base64 | 7,986,416 | 6,907,853 | 6,731,822 | 1.16× | 0.98× |
+| rust-compression | 10,041,242 | 8,972,407 | 6,981,733 | 1.12× | 0.78× |
+| shootout-xblabla20 | 2,881,312 | 2,661,441 | 2,698,871 | 1.08× | **1.01×** |
+| shootout-fib2 | 7,987,352 | 7,377,091 | 5,659,938 | 1.08× | 0.77× |
+| pulldown-cmark | 2,906,712 | 2,717,982 | 2,162,092 | 1.07× | 0.80× |
+| shootout-xchacha20 | 8,252,248 | 7,728,464 | 7,781,707 | 1.07× | **1.01×** |
+| shootout-heapsort | 8,435,022 | 8,036,120 | 8,409,795 | 1.05× | **1.05×** |
+| bz2 | 7,803,006 | 7,484,680 | 6,986,598 | 1.04× | 0.93× |
+| shootout-gimli | 8,252,771 | 7,914,959 | 7,979,579 | 1.04× | **1.01×** |
+| blake3-scalar | 5,357,855 | 5,220,394 | 5,224,070 | 1.03× | **1.00×** |
+| richards | 954,359 | 936,555 | 739,461 | 1.02× | 0.79× |
+| regex | 9,308,332 | 9,246,822 | 8,560,919 | 1.01× | 0.93× |
+| shootout-memmove | 2,716,765 | 2,714,568 | 2,631,809 | 1.00× | 0.97× |
+| shootout-nestedloop | 5,434,416 | 5,460,573 | 8,872,890 | 1.00× | **1.63×** |
+| shootout-seqhash | 5,442,141 | 5,472,838 | 5,731,767 | 0.99× | **1.05×** |
+| hashset | 5,771,890 | 5,909,855 | 5,402,911 | 0.98× | 0.91× |
+| rust-protobuf | 2,769,865 | 2,852,633 | 2,034,322 | 0.97× | 0.71× |
+| shootout-switch | 8,622,406 | 8,893,076 | 9,075,140 | 0.97× | **1.02×** |
+| rust-html-rewriter | 1,281,588 | 1,424,317 | 864,209 | 0.90× | 0.61× |
+| rust-json | 3,274,844 | 3,687,180 | 2,200,692 | 0.89× | 0.60× |
+| shootout-sieve | 8,050,577 | 9,529,635 | 7,229,899 | 0.85× | 0.76× |
+| gcc-loops | 7,632,344 | 9,548,988 | 8,845,790 | 0.80× | 0.93× |
+| shootout-minicsv | 2,032,065 | 3,070,110 | 1,407,522 | 0.66× | 0.46× |
+| shootout-ratelimit | 1,085,648 | 3,316,136 | 857,856 | 0.33× | 0.26× |
 
-(`noop` omitted — WT in the single-µs range is below measurement noise.)
+(`noop` omitted — WT in the single-µs range is below measurement noise.
+`blind-sig` omitted — tier-2 core dump, see Failures above.)
 
 ### Observations
 
-- **shootout-ackermann** is the headline: 5.32× over tier-1 and 1.71×
-  over LLVM JIT. P1f's ratio gate keeps the recursive hot body as the
-  batch root instead of wandering into `_start`, and the OSR priority
-  lets the tier-2 frame take over deep in the call stack while the
-  recursion is still unwinding.
-- **ed25519** moves from ~1.11× vs tier-1 (pre-P1f) to **1.24×**
-  (8,219k → 6,641k). The gap to LLVM JIT narrows to 0.75× — the
-  residual is bounded by f8's OSR compile alone taking ~2.4s and
-  landing only after the six `f5` OSRs that fire first. A per-OSR
-  hotness priority (see next step) would close more.
-- **Small regressions (≤8%)** on richards / sieve / seqhash /
-  rust-html-rewriter remain background-compile noise on already-fast
-  kernels; unchanged from the pre-P1f baseline.
-- **Tier-2 beats LLVM JIT** on 7 kernels (ackermann, nestedloop, noop,
-  blake3-scalar, switch, xblabla20, xchacha20). nestedloop at 1.63× vs
-  LLVM is worth a future look — tier-1 alone matches LLVM there, so
-  the win is tier-2 avoiding whatever LLVM does wrong on that shape.
+- **shootout-ackermann** still leads vs LLVM JIT at **1.88×** — P1f's
+  ratio gate anchors the batch on the recursive hot body and OSR
+  priority transfers the live frame into tier-2 while the recursion
+  is still unwinding.
+- **shootout-random / shootout-ctype** lead vs tier-1 at 1.58× / 1.57×.
+  Both are tight scalar helpers that LLVM's inliner folds flat once
+  the P1e BFS batch anchors the root at the outer loop.
+- **ed25519** holds at 1.21× vs tier-1 (8,252k → 6,797k). Gap to LLVM
+  JIT is still 0.72× — same structural ceiling as before: f8's OSR
+  compile lands only after the less-valuable inner-loop OSRs. A
+  per-OSR hotness priority would close more.
+- **Tier-2 now matches or beats LLVM JIT on 13 kernels** (ackermann,
+  nestedloop, seqhash, heapsort, switch, quicksort, matrix, xblabla20,
+  xchacha20, gimli, random, keccak, blake3-scalar), nearly double the
+  P1f count. The previously-crashing trio (base64/minicsv/ratelimit)
+  now runs to completion — ratelimit and minicsv are the remaining
+  perf regressions.
+- **shootout-ratelimit 0.33× / shootout-minicsv 0.66×** vs tier-1: the
+  stack-leak fix stopped the crash but the underlying cost is still
+  there. Both kernels spend their time in the `compileIndirectCallOp`
+  null path through `proxyTableGetFuncSymbol` (which returns nullptr
+  for IR-JIT-backed targets, forcing the full `kCallIndirect` slow
+  path every iteration). Follow-up is to inline the hot dispatch in
+  the LLVM frontend (mirror tier-1's shadow-dispatch-table trick from
+  3c8adb49) rather than always bouncing through the proxy.
+- **gcc-loops / shootout-sieve** remain in the category-B bucket
+  (tier-1 structurally slower than LLVM's vectorizer). Tier-2 neither
+  helps nor hurts these by design.
 
 ### Next steps
 
+- **Root-cause blind-sig tier-2 SEGV.** Only residual failure;
+  tracked in `notes/bugs/osr_bugs.md`.
+- **Inline `proxyCallIndirect` hot path in the LLVM frontend.** Mirror
+  the shadow-dispatch-table trick from tier-1 commit 3c8adb49. Closes
+  the ratelimit / minicsv regressions without changing dispatch
+  semantics.
 - **Per-OSR hotness priority.** OSR queue is currently FIFO; on ed25519
   that puts six `f5` loop entries ahead of the single `f8` loop entry
-  that actually covers the hot work. A min-heap keyed on `-BackEdgeCounters`
-  would land high-value OSR first.
+  that actually covers the hot work. A min-heap keyed on
+  `-BackEdgeCounters` would land high-value OSR first.
 - **Dedicated OSR worker.** If a single priority queue still has OSR
   blocked behind a 2s batch compile on higher thresholds, split the
   worker into one regular-batch thread + one OSR thread. Each
   `Tier2Compiler` would need its own `LLVMContextRef`.
-- **Investigate the three validation crashes** (quicksort, regex,
-  shootout-fib2). Shared shape — synthesized `call` whose stack / types
-  do not match — points at `synthesizeMiniModule` or
-  `emitT1ThunkInPlace`.
