@@ -4295,8 +4295,16 @@ private:
 
     std::vector<LLVM::Value> RetsVec;
     {
-      LLVM::Value Args = Builder.createArray(ArgSize, kValSize);
-      LLVM::Value Rets = Builder.createArray(RetSize, kValSize);
+      // Hoist the Args/Rets scratch allocas to the function entry block.
+      // A plain alloca inside a loop body accumulates stack on every
+      // iteration until the function returns (LLVM only folds repeated
+      // allocas when they live in the entry block). For base64's hot
+      // call_indirect, kTableGetFuncSymbol returns null on every
+      // iteration (IR-JIT funcs aren't CompiledFunction), so the null
+      // path runs ~1.2M times — without hoisting, the loop consumes the
+      // whole 8MB thread stack and SEGVs on a deep setjmp in invoke().
+      LLVM::Value Args = createEntryAlloca(ArgSize, kValSize);
+      LLVM::Value Rets = createEntryAlloca(RetSize, kValSize);
       Builder.createArrayPtrStore(
           Span<LLVM::Value>(ArgsVec.begin() + 1, ArgSize), Args, Context.Int8Ty,
           kValSize);
@@ -4331,6 +4339,27 @@ private:
       PHIRet.addIncoming(RetsVec[I], IsNullBB);
       stackPush(PHIRet);
     }
+  }
+
+  // Emit a Builder.createArray()-equivalent alloca in the function entry
+  // block so that repeated use inside a loop does not grow the C stack
+  // on every iteration.
+  LLVM::Value createEntryAlloca(size_t Num, uint32_t Align) noexcept {
+    if (Num == 0) {
+      return LLVM::Value::getConstPointerNull(
+          LLVM::Type(LLVMInt8TypeInContext(LLContext.unwrap())).getPointerTo());
+    }
+    auto SavedBB = Builder.getInsertBlock();
+    LLVMBasicBlockRef EntryBB = LLVMGetFirstBasicBlock(F.Fn.unwrap());
+    LLVMValueRef FirstInstr = LLVMGetFirstInstruction(EntryBB);
+    if (FirstInstr) {
+      LLVMPositionBuilderBefore(Builder.unwrap(), FirstInstr);
+    } else {
+      LLVMPositionBuilderAtEnd(Builder.unwrap(), EntryBB);
+    }
+    LLVM::Value Arr = Builder.createArray(Num, Align);
+    Builder.positionAtEnd(SavedBB);
+    return Arr;
   }
 
   void compileReturnCallOp(const unsigned int FuncIndex) noexcept {
@@ -4491,8 +4520,11 @@ private:
 
     std::vector<LLVM::Value> RetsVec;
     {
-      LLVM::Value Args = Builder.createArray(ArgSize, kValSize);
-      LLVM::Value Rets = Builder.createArray(RetSize, kValSize);
+      // See compileIndirectCallOp: same entry-block hoist required for
+      // the null-path scratch allocas to avoid unbounded stack growth
+      // when call_ref is invoked repeatedly from a loop.
+      LLVM::Value Args = createEntryAlloca(ArgSize, kValSize);
+      LLVM::Value Rets = createEntryAlloca(RetSize, kValSize);
       Builder.createArrayPtrStore(
           Span<LLVM::Value>(ArgsVec.begin() + 1, ArgSize), Args, Context.Int8Ty,
           kValSize);
