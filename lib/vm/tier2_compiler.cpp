@@ -225,8 +225,13 @@ LLVMTypeRef tier1ThunkRetType(LLVMContextRef Ctx,
 ///   3. tail-calls `f<FuncIdx>(exec_ctx, params...)` with the frontend's
 ///      default SysV calling convention,
 ///   4. remarshals the return into tier-1's expected wire type.
-void emitFwdThunk(LLVMModuleRef LLMod, LLVMContextRef Ctx, uint32_t FuncIdx,
-                  const AST::FunctionType &FT) {
+// The thunk is named `f<ThunkIdx>_fwd_thunk` (so the ORC symbol lookup
+// finds it under the tier-1 FuncTable index) and invokes `f<CalleeIdx>`
+// in the module. These are the same for regular batch compiles; the OSR
+// path passes `CalleeIdx` = the synthesized OSR slot so the thunk still
+// hangs off the original tier-1 index but calls the rewritten body.
+void emitFwdThunk(LLVMModuleRef LLMod, LLVMContextRef Ctx, uint32_t ThunkIdx,
+                  const AST::FunctionType &FT, uint32_t CalleeIdx) {
   const auto &Params = FT.getParamTypes();
   const auto &Rets = FT.getReturnTypes();
 
@@ -241,7 +246,7 @@ void emitFwdThunk(LLVMModuleRef LLMod, LLVMContextRef Ctx, uint32_t FuncIdx,
       LLVMFunctionType(ThunkRetTy, ThunkParamTys, 2, /*IsVarArg=*/0);
 
   const std::string ThunkName =
-      "f" + std::to_string(FuncIdx) + "_fwd_thunk";
+      "f" + std::to_string(ThunkIdx) + "_fwd_thunk";
   LLVMValueRef Thunk =
       LLVMAddFunction(LLMod, ThunkName.c_str(), ThunkFTy);
   LLVMSetLinkage(Thunk, LLVMExternalLinkage);
@@ -262,8 +267,8 @@ void emitFwdThunk(LLVMModuleRef LLMod, LLVMContextRef Ctx, uint32_t FuncIdx,
         LLVMCreateEnumAttribute(Ctx, UWTableKind, 0));
   }
 
-  // Look up the target function `f<FuncIdx>` already in the module.
-  const std::string CalleeName = "f" + std::to_string(FuncIdx);
+  // Look up the target function `f<CalleeIdx>` already in the module.
+  const std::string CalleeName = "f" + std::to_string(CalleeIdx);
   LLVMValueRef Callee = LLVMGetNamedFunction(LLMod, CalleeName.c_str());
   if (!Callee) {
     spdlog::error("tier2: fwd_thunk: callee {} not found in module",
@@ -322,7 +327,7 @@ void emitFwdThunk(LLVMModuleRef LLMod, LLVMContextRef Ctx, uint32_t FuncIdx,
     };
     LLVMValueRef Zero64 = LLVMConstInt(Int64Ty, 0, 0);
     LLVMValueRef TArgs[5] = {
-        LLVMConstInt(LLVMInt32TypeInContext(Ctx), FuncIdx, 0),
+        LLVMConstInt(LLVMInt32TypeInContext(Ctx), ThunkIdx, 0),
         Params.size() > 0 ? LoadSlot(0) : Zero64,
         Params.size() > 1 ? LoadSlot(1) : Zero64,
         Params.size() > 2 ? LoadSlot(2) : Zero64,
@@ -356,7 +361,7 @@ void emitFwdThunk(LLVMModuleRef LLMod, LLVMContextRef Ctx, uint32_t FuncIdx,
     default:
       spdlog::error("tier2: fwd_thunk: non-scalar param in f{} — bug in "
                     "promotion filter",
-                    FuncIdx);
+                    ThunkIdx);
       LLVMDisposeBuilder(B);
       return;
     }
@@ -386,7 +391,7 @@ void emitFwdThunk(LLVMModuleRef LLMod, LLVMContextRef Ctx, uint32_t FuncIdx,
     default:
       spdlog::error("tier2: fwd_thunk: non-scalar ret in f{} — bug in "
                     "promotion filter",
-                    FuncIdx);
+                    ThunkIdx);
       LLVMDisposeBuilder(B);
       return;
     }
@@ -623,6 +628,16 @@ uint32_t findOsrLoopStart(const AST::CodeSegment &Seg,
 ///     resolve to valid scopes (the scopes' closing `End`s already live
 ///     in the copied tail).
 ///
+/// The OSR body is appended to the module as a *new* function slot
+/// (OsrFuncIdxOut), leaving the original function at \p FuncIdx with its
+/// original type and body. This matters because the rewritten OSR body
+/// often contains self-recursive `call FuncIdx` instructions (quicksort,
+/// fib2, etc.) — if we clobbered FuncIdx's type with the OSR signature
+/// those calls would fail validation (stack underflow: OSR type has N
+/// flattened-locals params but the call site only pushes the original
+/// param count). Leaving FuncIdx alone lets the non-batch stubbing loop
+/// + emitT1ThunkInPlace route self-recursion back to tier-1.
+///
 /// Every other defined function in the module gets the usual
 /// stack-polymorphic stub body; non-batch callees will be rewritten as
 /// tier-2 → tier-1 bridges by emitT1ThunkInPlace() after LLVM codegen.
@@ -632,7 +647,8 @@ uint32_t findOsrLoopStart(const AST::CodeSegment &Seg,
 /// mid-entering a then/else arm), or validation prerequisites are not met.
 bool synthesizeOsrModule(AST::Module &Mini, uint32_t FuncIdx,
                           uint32_t LoopIdx,
-                          uint32_t ImportFuncNum) noexcept {
+                          uint32_t ImportFuncNum,
+                          uint32_t &OsrFuncIdxOut) noexcept {
   if (FuncIdx < ImportFuncNum) {
     return false;
   }
@@ -653,7 +669,7 @@ bool synthesizeOsrModule(AST::Module &Mini, uint32_t FuncIdx,
   const auto &OrigParams = OrigFT.getParamTypes();
   const auto &OrigRets = OrigFT.getReturnTypes();
 
-  auto &Seg = CodeSec[DefinedIdx];
+  const auto &Seg = CodeSec[DefinedIdx];
 
   // Find the target loop start index.
   const uint32_t LoopStart = findOsrLoopStart(Seg, LoopIdx);
@@ -724,7 +740,7 @@ bool synthesizeOsrModule(AST::Module &Mini, uint32_t FuncIdx,
   const uint32_t NewTypeIdx = static_cast<uint32_t>(TypeSec.size());
   TypeSec.push_back(std::move(OsrSub));
 
-  // Rewrite the CodeSegment to be the OSR body:
+  // Build the OSR body:
   //   [enclosing Block openers (outermost first)]
   //   [Instrs[LoopStart .. end]]  (includes matching Ends of the openers)
   std::vector<AST::Instruction> OsrBody;
@@ -736,11 +752,19 @@ bool synthesizeOsrModule(AST::Module &Mini, uint32_t FuncIdx,
     OsrBody.push_back(Instrs[I]);
   }
 
-  Seg.getLocals().clear();
-  Seg.getExpr().getInstrs() = std::move(OsrBody);
+  // Append the OSR body as a new function slot. Keeps FuncIdx's original
+  // body and type in place so in-body `call FuncIdx` instructions (self-
+  // recursion) validate against the original signature.
+  AST::CodeSegment OsrSeg;
+  OsrSeg.getExpr().getInstrs() = std::move(OsrBody);
+  CodeSec.push_back(std::move(OsrSeg));
+  FuncSec.push_back(NewTypeIdx);
+  OsrFuncIdxOut =
+      ImportFuncNum + static_cast<uint32_t>(CodeSec.size()) - 1;
 
-  // Repoint this function to the new type index.
-  FuncSec[DefinedIdx] = NewTypeIdx;
+  // Re-point local refs that the dump-block below reads back so it
+  // inspects the new OSR segment rather than the untouched original.
+  auto &OsrSegRef = CodeSec.back();
 
   // Optional dump for debugging. WASMEDGE_OSR_DUMP=<dir> writes one file
   // per OSR body, named `osr_<funcIdx>_<loopIdx>.txt`, so subsequent
@@ -750,10 +774,12 @@ bool synthesizeOsrModule(AST::Module &Mini, uint32_t FuncIdx,
                        std::to_string(FuncIdx) + "_" +
                        std::to_string(LoopIdx) + ".txt";
     if (FILE *F = std::fopen(Path.c_str(), "w")) {
-      const auto &Body = Seg.getExpr().getInstrs();
-      std::fprintf(F, "func=%u loop=%u body_size=%zu rets=%zu params=%zu\n",
-                   FuncIdx, LoopIdx, Body.size(), OrigRets.size(),
-                   OsrParams.size());
+      const auto &Body = OsrSegRef.getExpr().getInstrs();
+      std::fprintf(F,
+                   "func=%u osr_idx=%u loop=%u body_size=%zu rets=%zu "
+                   "params=%zu\n",
+                   FuncIdx, OsrFuncIdxOut, LoopIdx, Body.size(),
+                   OrigRets.size(), OsrParams.size());
       int Depth = 0;
       for (size_t I = 0; I < Body.size(); ++I) {
         OpCode Op = Body[I].getOpCode();
@@ -1054,7 +1080,7 @@ Tier2Compiler::compileBatch(Span<const uint32_t> BatchIdx,
 
   for (uint32_t FuncIdx : BatchIdx) {
     const auto &FT = getFuncType(Mod, FuncIdx, ImportFuncNum);
-    emitFwdThunk(LLMod, LLCtx, FuncIdx, FT);
+    emitFwdThunk(LLMod, LLCtx, FuncIdx, FT, FuncIdx);
   }
 
   // Replace the stub body of every non-batch defined function that is
@@ -1267,16 +1293,19 @@ Tier2Compiler::compileOsrEntry(uint32_t FuncIdx, uint32_t LoopIdx,
   // function without mutating the shared parsed module.
   AST::Module Mini(Mod);
 
-  // Rewrite the target function into its OSR form (locals-as-params,
-  // body = [loop..end]). Must be done before stubbing non-OSR bodies so
-  // synthesizeMiniModule doesn't zero the Instrs vector we care about.
-  if (!synthesizeOsrModule(Mini, FuncIdx, LoopIdx, ImportFuncNum)) {
+  // Append the synthesized OSR body as a new function slot. Leaves the
+  // original function at FuncIdx untouched so in-body `call FuncIdx`
+  // (self-recursion) validates against the original signature and is
+  // routed back to tier-1 through a t1_thunk.
+  uint32_t OsrFuncIdx = UINT32_MAX;
+  if (!synthesizeOsrModule(Mini, FuncIdx, LoopIdx, ImportFuncNum,
+                            OsrFuncIdx)) {
     spdlog::warn("tier2-osr: synth failed for func {} loop {}", FuncIdx,
                  LoopIdx);
     return nullptr;
   }
 
-  // Expand the batch BFS-style from the OSR function: pull in its direct
+  // Expand the batch BFS-style from the OSR body: pull in its direct
   // (and, up to MaxDepth, transitive) promotable callees so their real
   // bodies stay in the mini-module. Without this the OSR function is a
   // singleton and every helper call becomes an indirect FuncTable
@@ -1287,11 +1316,16 @@ Tier2Compiler::compileOsrEntry(uint32_t FuncIdx, uint32_t LoopIdx,
   constexpr uint32_t OsrBatchMaxDepth = 2;
   constexpr uint32_t OsrBatchMaxSize = 12;
   std::unordered_set<uint32_t> BatchSet =
-      bfsOsrBatch(Mini, FuncIdx, ImportFuncNum, OsrBatchMaxDepth,
+      bfsOsrBatch(Mini, OsrFuncIdx, ImportFuncNum, OsrBatchMaxDepth,
                    OsrBatchMaxSize);
+  // If the OSR body self-recurses the BFS would pull the original func
+  // into the batch, re-triggering the same type-mismatch trap we just
+  // avoided (its body still contains `call FuncIdx`). Keep it stubbed so
+  // emitT1ThunkInPlace routes self-recursion back to tier-1.
+  BatchSet.erase(FuncIdx);
   if (BatchSet.size() > 1) {
-    spdlog::info("tier2-osr: batch expanded to {} funcs (root {})",
-                 BatchSet.size(), FuncIdx);
+    spdlog::info("tier2-osr: batch expanded to {} funcs (root f{} osr f{})",
+                 BatchSet.size(), FuncIdx, OsrFuncIdx);
   }
   {
     auto &CodeSec = Mini.getCodeSection().getContent();
@@ -1392,10 +1426,10 @@ Tier2Compiler::compileOsrEntry(uint32_t FuncIdx, uint32_t LoopIdx,
 
   // Build the OSR function type (must reflect the rewritten signature:
   // (all locals as params) -> original return). Read from Mini since
-  // that's the source of truth for the new type index.
-  const uint32_t DefinedIdx = FuncIdx - ImportFuncNum;
+  // that's the source of truth for the new OSR slot's type index.
+  const uint32_t OsrDefinedIdx = OsrFuncIdx - ImportFuncNum;
   const uint32_t NewTypeIdx =
-      Mini.getFunctionSection().getContent()[DefinedIdx];
+      Mini.getFunctionSection().getContent()[OsrDefinedIdx];
   const auto &OsrFT =
       Mini.getTypeSection().getContent()[NewTypeIdx].getCompositeType()
           .getFuncType();
@@ -1405,8 +1439,10 @@ Tier2Compiler::compileOsrEntry(uint32_t FuncIdx, uint32_t LoopIdx,
   // args[] into the LLVM function's native param types. Because the OSR
   // function's params are all wasm locals and the OsrLocalsFrame is laid
   // out exactly the same way, the locals buffer passed by tier-1 can be
-  // treated as an args[] buffer for ABI purposes.
-  emitFwdThunk(LLMod, LLCtx, FuncIdx, OsrFT);
+  // treated as an args[] buffer for ABI purposes. The thunk name keys off
+  // the original FuncIdx (so the tier-1 runtime finds it) but invokes
+  // the new OSR slot.
+  emitFwdThunk(LLMod, LLCtx, FuncIdx, OsrFT, OsrFuncIdx);
 
   // Rewrite every non-OSR defined function referenced by the OSR body
   // as a tier-2 → tier-1 dispatch bridge. This is the OSR equivalent of
