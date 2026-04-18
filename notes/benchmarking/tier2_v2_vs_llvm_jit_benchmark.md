@@ -685,87 +685,120 @@ hook in `lib/executor/instantiate/module.cpp`; proxy update in
 ### Full-sweep results (sightglass-strong, 33 kernels, 2026-04-18 P1g)
 
 Config: `WASMEDGE_TIER2_ENABLE=1 WASMEDGE_TIER2_THRESHOLD=10
-WASMEDGE_OSR_THRESHOLD=5000 WASMEDGE_IR_JIT_OPT_LEVEL=2`, one sample
-per cell. Speedup column = `LLVM_JIT_WT / tier-2_WT` (>1 means
-tier-2 wins).
+WASMEDGE_OSR_THRESHOLD=5000 WASMEDGE_IR_JIT_OPT_LEVEL=2` for tier-2;
+tier-1 arm runs the same binary with tier-2 disabled; LLVM JIT arm
+runs `WASMEDGE_SIGHTGLASS_MODE=JIT`. One sample per cell,
+`WASMEDGE_QUIET=1` to keep stdout clean for parsing.
 
 **Failures.** Tier-2: only blind-sig (pre-existing tier-2 SEGV,
-tracked in `notes/bugs/osr_bugs.md`). LLVM JIT: 33/33 pass, no
-new crashes. The base64 / minicsv / ratelimit / quicksort / regex /
+tracked in `notes/bugs/osr_bugs.md`). Tier-1: 33/33 pass. LLVM JIT:
+33/33 pass. The base64 / minicsv / ratelimit / quicksort / regex /
 fib2 crashes that gated the P1f table are all green.
 
-**Aggregates (31 kernels where both tier-2 and LLVM JIT complete,
-`noop` excluded as below measurement noise):**
+**Aggregates (31 kernels where all three arms complete; `noop`
+excluded as below measurement noise, `blind-sig` excluded as tier-2
+crash).**
 
 | Aggregate                        | value     |
 |---                               |---        |
-| Geomean tier-2 / LLVM JIT WT     | **0.910×** |
-| Wins (≥1.02×)                    | 4 / 31    |
-| Flat (±2%)                       | 12 / 31   |
-| Losses (≤0.98×)                  | 15 / 31   |
-| Best tier-2 vs LLVM JIT          | shootout-nestedloop **1.64×** |
-| Worst tier-2 vs LLVM JIT         | gcc-loops 0.32×               |
+| Geomean tier-2 / tier-1 WT       | **1.073×** |
+| Geomean tier-2 / LLVM JIT WT     | **0.959×** |
+| tier-2 wins vs tier-1 (≥1.02×)   | 16 / 31    |
+| tier-2 flat vs tier-1 (±2%)      | 6 / 31    |
+| tier-2 losses vs tier-1 (≤0.98×) | 9 / 31    |
+| tier-2 wins vs LLVM JIT (≥1.02×) | 6 / 31    |
+| tier-2 flat vs LLVM JIT (±2%)    | 12 / 31   |
+| tier-2 losses vs LLVM JIT (≤0.98×) | 13 / 31 |
+| Best tier-2 vs tier-1            | shootout-ackermann **1.61×** |
+| Best tier-2 vs LLVM JIT          | shootout-nestedloop **1.62×** |
+| Worst tier-2 vs tier-1           | gcc-loops 0.80×              |
+| Worst tier-2 vs LLVM JIT         | gcc-loops 0.72×              |
 
-**Per-kernel WT (µs), sorted by tier-2-vs-LLVM-JIT speedup.**
+**Per-kernel WT (µs), sorted by tier-2-vs-LLVM-JIT speedup
+(descending).** `t2/t1` > 1 means tier-2 wins over tier-1;
+`t2/LLVM` > 1 means tier-2 wins over whole-module LLVM JIT.
 
-| Kernel | Tier-2 WT | LLVM JIT WT | vs LLVM JIT |
-|---|---:|---:|---:|
-| shootout-nestedloop | 5,441,303 | 8,897,982 | **1.64×** |
-| shootout-seqhash | 5,444,556 | 5,647,657 | **1.04×** |
-| shootout-heapsort | 8,108,564 | 8,354,794 | **1.03×** |
-| shootout-quicksort *(quicksort)* | 6,687,734 | 6,824,257 | **1.02×** |
-| blake3-scalar | 5,530,839 | 5,599,068 | 1.01× |
-| shootout-switch | 9,053,964 | 9,115,937 | 1.01× |
-| richards | 8,180,296 | 8,242,565 | 1.01× |
-| shootout-gimli | 7,947,330 | 7,912,516 | 1.00× |
-| shootout-matrix | 6,812,719 | 6,804,627 | 1.00× |
-| shootout-memmove | 8,746,128 | 8,710,693 | 1.00× |
-| shootout-keccak | 6,840,191 | 6,838,795 | 1.00× |
-| shootout-xchacha20 | 7,736,824 | 7,756,911 | 1.00× |
-| shootout-xblabla20 | 8,205,539 | 8,134,204 | 0.99× |
-| shootout-random | 4,459,944 | 4,398,912 | 0.99× |
-| shootout-ratelimit | 8,661,416 | 8,523,274 | 0.98× |
-| shootout-minicsv | 9,456,108 | 9,313,371 | 0.98× |
-| shootout-base64 | 7,136,852 | 6,974,577 | 0.98× |
-| pulldown-cmark | 7,939,661 | 7,541,923 | 0.95× |
-| shootout-ctype | 5,348,745 | 5,026,698 | 0.94× |
-| regex | 9,371,857 | 8,653,544 | 0.92× |
-| hashset | 8,358,919 | 7,521,331 | 0.90× |
-| shootout-sieve | 8,971,983 | 8,024,504 | 0.89× |
-| rust-html-rewriter | 8,489,686 | 7,478,645 | 0.88× |
-| rust-protobuf | 7,504,266 | 6,615,743 | 0.88× |
-| rust-json | 8,571,346 | 7,399,584 | 0.86× |
-| shootout-ackermann | 5,115,902 | 4,209,159 | 0.82× |
-| rust-compression | 9,133,452 | 7,008,842 | 0.77× |
-| shootout-fib2 | 7,418,440 | 5,633,494 | 0.76× |
-| shootout-ed25519 | 7,181,394 | 5,189,207 | 0.72× |
-| bz2 | 10,775,825 | 6,978,049 | 0.65× |
-| gcc-loops | 22,105,857 | 7,055,431 | 0.32× |
+| Kernel | Tier-1 WT | Tier-2 WT | LLVM JIT WT | t2/t1 | t2/LLVM |
+|---|---:|---:|---:|---:|---:|
+| shootout-nestedloop | 5,459,640 | 5,486,239 | 8,880,856 | 1.00× | **1.62×** |
+| shootout-ackermann | 7,318,758 | 4,556,064 | 5,512,741 | **1.61×** | **1.21×** |
+| quicksort | 8,249,911 | 6,678,280 | 7,005,021 | **1.24×** | **1.05×** |
+| shootout-heapsort | 8,478,449 | 8,099,379 | 8,324,611 | **1.05×** | **1.03×** |
+| shootout-seqhash | 5,470,844 | 5,510,354 | 5,650,288 | 0.99× | **1.03×** |
+| richards | 8,164,443 | 8,119,315 | 8,348,322 | 1.01× | **1.03×** |
+| shootout-matrix | 8,144,649 | 6,802,282 | 6,837,154 | **1.20×** | **1.01×** |
+| shootout-random | 6,984,138 | 4,385,474 | 4,412,376 | **1.59×** | **1.01×** |
+| shootout-keccak | 8,307,491 | 6,900,632 | 6,931,473 | **1.20×** | 1.00× |
+| shootout-switch | 8,870,958 | 9,089,230 | 9,098,453 | 0.98× | 1.00× |
+| shootout-xchacha20 | 8,329,127 | 7,724,662 | 7,761,497 | **1.08×** | 1.00× |
+| shootout-base64 | 8,368,540 | 6,998,407 | 6,934,629 | **1.20×** | 0.99× |
+| shootout-gimli | 8,267,568 | 8,020,938 | 7,973,215 | **1.03×** | 0.99× |
+| blake3-scalar | 5,633,306 | 5,539,728 | 5,506,077 | **1.02×** | 0.99× |
+| shootout-ratelimit | 8,388,852 | 8,661,465 | 8,540,553 | 0.97× | 0.99× |
+| shootout-xblabla20 | 8,086,667 | 8,257,294 | 8,125,708 | 0.98× | 0.98× |
+| pulldown-cmark | 8,027,446 | 7,872,257 | 7,720,755 | **1.02×** | 0.98× |
+| shootout-memmove | 8,203,025 | 8,831,410 | 8,696,650 | 0.93× | 0.98× |
+| shootout-minicsv | 9,757,081 | 9,551,184 | 9,248,277 | **1.02×** | 0.97× |
+| bz2 | 7,894,430 | 7,443,015 | 7,058,844 | **1.06×** | 0.95× |
+| hashset | 8,304,124 | 8,026,279 | 7,631,276 | **1.03×** | 0.95× |
+| shootout-ctype | 8,286,034 | 5,312,058 | 4,968,446 | **1.56×** | 0.94× |
+| regex | 9,354,710 | 9,320,839 | 8,724,838 | 1.00× | 0.94× |
+| rust-html-rewriter | 7,917,998 | 8,472,735 | 7,489,518 | 0.93× | 0.88× |
+| rust-protobuf | 7,161,548 | 7,463,972 | 6,602,448 | 0.96× | 0.88× |
+| rust-json | 8,231,823 | 8,531,795 | 7,424,444 | 0.96× | 0.87× |
+| shootout-sieve | 8,196,874 | 8,896,643 | 7,238,875 | 0.92× | 0.81× |
+| rust-compression | 9,967,552 | 9,021,199 | 6,990,075 | **1.10×** | 0.77× |
+| shootout-fib2 | 7,874,919 | 7,330,088 | 5,675,304 | **1.07×** | 0.77× |
+| shootout-ed25519 | 8,581,572 | 7,139,896 | 5,170,585 | **1.20×** | 0.72× |
+| gcc-loops | 7,978,199 | 9,933,359 | 7,111,934 | 0.80× | 0.72× |
+
+(`noop` omitted — WT in the single-µs range is below measurement
+noise. `blind-sig` omitted — tier-2 core dump; tier-1 8,581k,
+LLVM JIT 3,671k for reference.)
 
 ### Observations
 
-- **Tier-2 legitimately matches or beats LLVM JIT on 16/31 kernels**
-  (within-2% or better). The 4 clean wins are nestedloop, seqhash,
-  heapsort, and quicksort. nestedloop's 1.64× remains an LLVM
-  codegen pathology on empty nested loops (already flagged earlier);
-  the others are within a few percent and could be noise.
-- **Tier-2 legitimately loses on 15 kernels**, most notably gcc-loops
-  (0.32×), bz2 (0.65×), ed25519 (0.72×), rust-compression (0.77×),
-  fib2 (0.76×). These are the real compiler-quality deltas: LLVM's
-  whole-module inliner/vectorizer sees optimizations the mini-module
-  doesn't have scope for. That's the honest story about tiered vs.
-  whole-module compilation.
-- **The previously-headlining ratelimit 1.71× / ackermann 5.32× /
-  ctype 1.66× numbers from P1f were partially real and partially
-  artifact.** Ratelimit's gain was almost entirely the inline fast
-  path (reverted); under the thunk fix it drops to 0.98× LLVM JIT.
-  Ackermann's gain came from P1f's OSR-first priority + ratio-gated
-  batching (kept) but the previous 1.71× reflects a favorable
-  snapshot; the current number is 0.82× LLVM JIT — still a real
-  OSR-migration signal, but small.
-- **gcc-loops 0.32×** is a ~3× regression that warrants investigation
-  — the outlier of the set, likely a mini-module scope cliff on its
-  large kernel / many-function layout.
+- **Tier-2 beats tier-1 on 16/31 kernels, matches on 6, loses on 9.**
+  Geomean 1.073×. Biggest wins are the call_indirect-heavy /
+  deep-recursion shapes OSR was built for: ackermann 1.61×, random
+  1.59×, ctype 1.56×, quicksort 1.24×. The loss cluster — gcc-loops,
+  rust-html-rewriter, shootout-memmove, sieve — is the usual
+  mini-module narrowing cost (no whole-module inlining) plus some
+  worker-backlog contention on wide call graphs (rhr, rust-json).
+
+- **Tier-2 matches or beats LLVM JIT on 18/31 kernels** (6 wins
+  ≥1.02× plus 12 within-2%). Clean wins against LLVM JIT are
+  nestedloop (1.62× — LLVM codegen pathology on empty nested loops),
+  ackermann (1.21× — OSR migrating the deep recursion into LLVM
+  mid-unwind), quicksort, heapsort, seqhash, richards (1.03–1.05×).
+  matrix / random / keccak land within ±1%.
+
+- **Tier-2 legitimately loses to LLVM JIT on 13 kernels.** The real
+  compiler-quality deltas are ed25519 (0.72×), gcc-loops (0.72×),
+  fib2/rust-compression (0.77×), sieve (0.81×) — all kernels where
+  LLVM's whole-module inliner / vectorizer / cross-function SCCP
+  reaches optimizations the mini-module doesn't have scope for.
+  rust-json / rhr / rust-protobuf sit at 0.87–0.88× for a related
+  reason plus wide-call-graph worker-backlog cost.
+
+- **ratelimit and minicsv are back to parity** with both tier-1 and
+  LLVM JIT (0.97–0.99× vs LLVM JIT) after the P1g entry-thunk fix.
+  The explanation for why these needed fixing at all is structural:
+  the original 2026-04-15 table showed them at 1.00× / 0.95× vs
+  LLVM JIT, but that was tier-1 running the whole benchmark because
+  function-entry swap never fires on one-shot callers. OSR changed
+  the equation by migrating the hot loop *into* tier-2 LLVM code,
+  which then paid `proxyCallIndirect` per `call_indirect` — a detour
+  whole-module LLVM JIT never takes because its indirect targets are
+  `isCompiledFunction()`. Thunks close that path by giving IR-JIT
+  targets an LLVM-ABI callable entry, so both arms now reach
+  `NotNullBB` (direct typed call).
+
+- **gcc-loops 0.72× vs LLVM JIT** is the worst honest delta. The
+  kernel is a giant synthetic loop corpus; mini-module batches
+  capture one hot nest at a time while LLVM JIT sees the whole
+  function corpus at once. Not specific to the thunk work and not in
+  scope to close here.
 
 ### Not in scope
 
