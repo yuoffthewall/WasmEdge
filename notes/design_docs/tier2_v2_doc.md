@@ -296,6 +296,80 @@ and patch call sites) require walking every use of `@f<i>` and
 inliner if we ever want to inline thunks later (which we do — the O2 run
 after rewriting happily inlines short t1_thunks into their callers).
 
+### `f<i>_entry_thunk` — LLVM-ABI entry point for `call_indirect` targets
+
+Landed 2026-04-18. Closes the `proxyCallIndirect` detour that used to
+dominate `call_indirect` cost from tier-2 and OSR bodies.
+
+**Problem.** The LLVM frontend's `compileIndirectCallOp` emits the usual
+`proxyTableGetFuncSymbol` → `NotNullBB` (direct typed call) vs.
+`IsNullBB` (`proxyCallIndirect` slow path) split. For whole-module LLVM
+JIT targets the proxy returns the LLVM-compiled native pointer and
+`NotNullBB` wins. For IR-JIT-backed targets it returned `nullptr` — the
+tier-1 native pointer has a different ABI (`fastcall(JitExecEnv*,
+uint64_t*)`) and can't be called LLVM-native directly — so every
+indirect call through a tier-2 / OSR body trapped into
+`proxyCallIndirect`'s full executor re-entry. Measured on sightglass-
+strong: ratelimit 0.33× tier-1, minicsv 0.66×, rhr 0.88×, etc.
+
+**Fix.** Emit a small LLVM-ABI wrapper per IR-JIT function at
+instantiation time, store its address on the `IRJitFunction` variant,
+and have `proxyTableGetFuncSymbol` return it. `NotNullBB` then fires
+for IR-JIT targets too — same dispatch shape whole-module LLVM JIT
+uses, no frontend-side shadow-dispatch trickery applied asymmetrically.
+
+```
+; signature: ret (ExecCtx*, typed params...)          // LLVM-native
+define ret @f<i>_entry_thunk(ptr %execCtx, T0 %p0, T1 %p1, ...) {
+entry:
+  %env = call ptr asm "movq %fs:OFFSET, $0", "=r"()   // JitExecEnv* via
+                                                     // wasmedge_tier2_jit_env_tls
+  %args = alloca [N x i64]
+  store (zext/bitcast %p0), %args[0]
+  store (zext/bitcast %p1), %args[1]
+  ...
+  %raw = call widened_ret (ptr, ptr) <IR_JIT_NATIVE_PTR>(ptr %env,
+                                                        ptr %args)
+  %ret = trunc/bitcast %raw to ret_ty
+  ret ret_ty %ret
+}
+```
+
+Thunks are batched into one LLVM module and JIT-compiled by a dedicated
+ORC LLJIT held alive by `IRJitEnvCache::EntryThunksKeepalive`. Per-call
+cost budget after the switch:
+
+| path                               | per-call overhead (x86-64) |
+|---                                 |---:|
+| Whole-module LLVM JIT (unchanged)  | proxy (~50c) + direct call (~5–10c) |
+| Tier-2 / OSR with entry thunks     | proxy (~50c) + direct call (~5–10c) + thunk marshal (~15–25c) |
+| Tier-2 / OSR pre-fix (proxy path)  | proxy (~50c) + `proxyCallIndirect` full re-entry (~2000–5000c) |
+
+Tier-2 is now ~1.5× LLVM JIT's per-call dispatch cost (the thunk bridge
+is the honest tax); previously it was 50× slower on IR-JIT-heavy
+call_indirect dispatch.
+
+**Eligibility filter.** Thunks are only emitted for scalar-only
+signatures (i32/i64/f32/f64, at most one return). Anything with
+ref/v128 params or multi-return falls through `getIRJitLlvmEntryThunk()
+== nullptr` → `proxyTableGetFuncSymbol` returns null → `IsNullBB`
+handles it via `proxyCallIndirect` as before. This matches the
+existing tier-2 promotion filter, so the excluded set is the same
+tier-2 already cannot accelerate.
+
+**Files.** `lib/vm/tier2_compiler.cpp::buildIRJitEntryThunks` (new
+helper; declared in `include/vm/tier2_compiler.h`). Call site:
+`lib/executor/instantiate/module.cpp` — right after the IR-JIT compile
+loop, guarded on `Tier2Threshold > 0`. Storage:
+`include/runtime/instance/function.h::IRJitFunction::LlvmEntryThunk`
+plus `get/setIRJitLlvmEntryThunk`. Consumer: `lib/executor/engine/
+proxy.cpp::proxyTableGetFuncSymbol` / `proxyRefGetFuncSymbol`.
+
+**Required init.** The thunk body uses a `movq %fs:OFFSET, $0` inline
+asm. Whole-module LLVM JIT's ORC refused modules with inline asm
+because `LLVMInitializeNativeAsmParser()` was never called on its init
+path. Fixed in `lib/llvm/llvm.h::initOnce`.
+
 ---
 
 ## Runtime helpers

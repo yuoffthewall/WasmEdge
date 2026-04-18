@@ -1611,6 +1611,298 @@ Tier2Compiler::compileOsrEntry(uint32_t FuncIdx, uint32_t LoopIdx,
   return Entry;
 }
 
+namespace {
+
+/// Emit one LLVM-ABI entry thunk that forwards to a tier-1 IR-JIT native
+/// pointer. Signature: `ret (ExecCtx*, typed_params...)`. Body:
+///   1. Inline `movq %fs:OFFSET, $0` to load `wasmedge_tier2_jit_env_tls`
+///      (the JitExecEnv* installed by IRJitEngine::invoke).
+///   2. Allocate `uint64_t args[NParams]` on the stack, store each
+///      typed param at offset `I*8`.
+///   3. Indirect `fastcall` to the embedded tier-1 native pointer with
+///      `(JitExecEnv*, uint64_t*)` signature.
+///   4. Narrow the widened tier-1 return into the LLVM-native return
+///      type and emit `ret`.
+/// Returns `false` if the function signature contains non-scalar types
+/// (ref/v128/multi-return); caller must skip those FuncIdxs.
+bool emitIRJitEntryThunk(LLVMModuleRef LLMod, LLVMContextRef Ctx,
+                          uint32_t FuncIdx, const AST::FunctionType &FT,
+                          void *IRJitNative) {
+  const auto &Params = FT.getParamTypes();
+  const auto &Rets = FT.getReturnTypes();
+
+  auto IsScalar = [](TypeCode C) {
+    return C == TypeCode::I32 || C == TypeCode::I64 ||
+           C == TypeCode::F32 || C == TypeCode::F64;
+  };
+  if (Rets.size() > 1) return false;
+  for (const auto &P : Params)
+    if (!IsScalar(P.getCode())) return false;
+  if (!Rets.empty() && !IsScalar(Rets.front().getCode())) return false;
+
+  LLVMTypeRef PtrTy = LLVMPointerTypeInContext(Ctx, 0);
+  LLVMTypeRef Int64Ty = LLVMInt64TypeInContext(Ctx);
+  LLVMTypeRef Int32Ty = LLVMInt32TypeInContext(Ctx);
+  LLVMTypeRef FloatTy = LLVMFloatTypeInContext(Ctx);
+  LLVMTypeRef DoubleTy = LLVMDoubleTypeInContext(Ctx);
+  LLVMTypeRef VoidTy = LLVMVoidTypeInContext(Ctx);
+
+  // Build the LLVM-native signature expected by compileIndirectCallOp's
+  // NotNullBB: (ExecCtx*, param0, param1, …) → ret.
+  std::vector<LLVMTypeRef> ParamTys;
+  ParamTys.reserve(Params.size() + 1);
+  ParamTys.push_back(PtrTy); // ExecCtx*
+  for (const auto &P : Params) {
+    switch (P.getCode()) {
+    case TypeCode::I32: ParamTys.push_back(Int32Ty); break;
+    case TypeCode::I64: ParamTys.push_back(Int64Ty); break;
+    case TypeCode::F32: ParamTys.push_back(FloatTy); break;
+    case TypeCode::F64: ParamTys.push_back(DoubleTy); break;
+    default: return false;
+    }
+  }
+  LLVMTypeRef LlvmRetTy = VoidTy;
+  if (!Rets.empty()) {
+    switch (Rets.front().getCode()) {
+    case TypeCode::I32: LlvmRetTy = Int32Ty; break;
+    case TypeCode::I64: LlvmRetTy = Int64Ty; break;
+    case TypeCode::F32: LlvmRetTy = FloatTy; break;
+    case TypeCode::F64: LlvmRetTy = DoubleTy; break;
+    default: return false;
+    }
+  }
+
+  LLVMTypeRef FTy = LLVMFunctionType(
+      LlvmRetTy, ParamTys.data(),
+      static_cast<unsigned>(ParamTys.size()), /*IsVarArg=*/0);
+
+  const std::string Name = "f" + std::to_string(FuncIdx) + "_entry_thunk";
+  LLVMValueRef Thunk = LLVMAddFunction(LLMod, Name.c_str(), FTy);
+  LLVMSetLinkage(Thunk, LLVMExternalLinkage);
+  {
+    unsigned UWTableKind = LLVMGetEnumAttributeKindForName(
+        "uwtable", static_cast<unsigned>(std::strlen("uwtable")));
+    LLVMAddAttributeAtIndex(
+        Thunk, LLVMAttributeFunctionIndex,
+        LLVMCreateEnumAttribute(Ctx, UWTableKind, 0));
+  }
+
+  LLVMBasicBlockRef BB = LLVMAppendBasicBlockInContext(Ctx, Thunk, "entry");
+  LLVMBuilderRef B = LLVMCreateBuilderInContext(Ctx);
+  LLVMPositionBuilderAtEnd(B, BB);
+
+  // Inline asm: `movq %fs:OFFSET, $0` → JitExecEnv* (tier-1 TLS).
+  static const ptrdiff_t TlsOff =
+      wasmedge_tier2_get_jit_env_tls_offset();
+  LLVMTypeRef AsmFTy = LLVMFunctionType(PtrTy, nullptr, 0, /*IsVarArg=*/0);
+  std::string AsmStr = "movq %fs:" + std::to_string(TlsOff) + ", $0";
+  std::string AsmCon = "=r";
+  LLVMValueRef AsmVal = LLVMGetInlineAsm(
+      AsmFTy, AsmStr.c_str(), AsmStr.size(),
+      AsmCon.c_str(), AsmCon.size(),
+      /*HasSideEffects=*/0, /*IsAlignStack=*/0,
+      LLVMInlineAsmDialectATT, /*CanThrow=*/0);
+  LLVMValueRef Env =
+      LLVMBuildCall2(B, AsmFTy, AsmVal, nullptr, 0, "jit_env");
+
+  // Allocate 8-byte-slot args[] scratch.
+  LLVMValueRef ArgsArr = nullptr;
+  if (!Params.empty()) {
+    ArgsArr = LLVMBuildArrayAlloca(
+        B, Int64Ty,
+        LLVMConstInt(Int32Ty, static_cast<uint32_t>(Params.size()), 0),
+        "args");
+  } else {
+    ArgsArr = LLVMConstNull(PtrTy);
+  }
+
+  // Marshal each typed param into args[i] as u64 (low-bits convention;
+  // tier-1 `ir_LOAD_I32`/`ir_LOAD_F` reads low 4 bytes, high bits are
+  // don't-care — same contract emitFwdThunk establishes in reverse).
+  for (size_t I = 0; I < Params.size(); ++I) {
+    LLVMValueRef Raw = nullptr;
+    LLVMValueRef P = LLVMGetParam(Thunk, static_cast<unsigned>(I + 1));
+    switch (Params[I].getCode()) {
+    case TypeCode::I32:
+      Raw = LLVMBuildZExt(B, P, Int64Ty, "p64");
+      break;
+    case TypeCode::I64:
+      Raw = P;
+      break;
+    case TypeCode::F32: {
+      LLVMValueRef Bits = LLVMBuildBitCast(B, P, Int32Ty, "fbits");
+      Raw = LLVMBuildZExt(B, Bits, Int64Ty, "p64");
+      break;
+    }
+    case TypeCode::F64:
+      Raw = LLVMBuildBitCast(B, P, Int64Ty, "p64");
+      break;
+    default:
+      LLVMDisposeBuilder(B);
+      return false;
+    }
+    LLVMValueRef Idx = LLVMConstInt(Int64Ty, I, 0);
+    LLVMValueRef Slot =
+        LLVMBuildInBoundsGEP2(B, Int64Ty, ArgsArr, &Idx, 1, "slot");
+    LLVMBuildStore(B, Raw, Slot);
+  }
+
+  // Tier-1 signature: ret_widened fastcall(JitExecEnv*, uint64_t*).
+  LLVMTypeRef Tier1RetTy = VoidTy;
+  if (!Rets.empty()) {
+    switch (Rets.front().getCode()) {
+    case TypeCode::I32:
+    case TypeCode::I64:
+      Tier1RetTy = Int64Ty;
+      break;
+    case TypeCode::F32:
+      Tier1RetTy = FloatTy;
+      break;
+    case TypeCode::F64:
+      Tier1RetTy = DoubleTy;
+      break;
+    default: break;
+    }
+  }
+  LLVMTypeRef Tier1ParamTys[2] = {PtrTy, PtrTy};
+  LLVMTypeRef Tier1FTy =
+      LLVMFunctionType(Tier1RetTy, Tier1ParamTys, 2, /*IsVarArg=*/0);
+
+  // Embed the tier-1 native pointer as a constant.
+  LLVMValueRef Target = LLVMConstIntToPtr(
+      LLVMConstInt(Int64Ty,
+                    static_cast<uint64_t>(
+                        reinterpret_cast<uintptr_t>(IRJitNative)),
+                    0),
+      PtrTy);
+
+  LLVMValueRef CallArgs[2] = {Env, ArgsArr};
+  LLVMValueRef CallRes = LLVMBuildCall2(
+      B, Tier1FTy, Target, CallArgs, 2, Rets.empty() ? "" : "tr");
+
+  // Narrow tier-1's widened return into the LLVM-native return type.
+  if (Rets.empty()) {
+    LLVMBuildRetVoid(B);
+  } else {
+    LLVMValueRef Out = nullptr;
+    switch (Rets.front().getCode()) {
+    case TypeCode::I32:
+      Out = LLVMBuildTrunc(B, CallRes, Int32Ty, "i32r");
+      break;
+    case TypeCode::I64:
+    case TypeCode::F32:
+    case TypeCode::F64:
+      Out = CallRes;
+      break;
+    default:
+      LLVMDisposeBuilder(B);
+      return false;
+    }
+    LLVMBuildRet(B, Out);
+  }
+
+  LLVMDisposeBuilder(B);
+  return true;
+}
+
+} // namespace
+
+Expect<IRJitEntryThunksResult>
+buildIRJitEntryThunks(Span<const IRJitEntryThunkReq> Reqs) {
+  IRJitEntryThunksResult Out;
+  if (Reqs.empty()) {
+    return Out;
+  }
+
+  // Target init. idempotent; safe to call repeatedly.
+  LLVMInitializeNativeTarget();
+  LLVMInitializeNativeAsmPrinter();
+  LLVMInitializeNativeAsmParser();
+
+  LLVMOrcThreadSafeContextRef TSCtx = LLVMOrcCreateNewThreadSafeContext();
+  LLVMContextRef Ctx = LLVMOrcThreadSafeContextGetContext(TSCtx);
+  LLVMModuleRef LLMod =
+      LLVMModuleCreateWithNameInContext("ir_jit_entry_thunks", Ctx);
+
+  std::vector<uint32_t> EmittedIdxs;
+  EmittedIdxs.reserve(Reqs.size());
+  for (const auto &R : Reqs) {
+    if (!R.NativeFunc || !R.FuncType) continue;
+    if (emitIRJitEntryThunk(LLMod, Ctx, R.FuncIdx, *R.FuncType, R.NativeFunc)) {
+      EmittedIdxs.push_back(R.FuncIdx);
+    }
+  }
+
+  if (EmittedIdxs.empty()) {
+    LLVMDisposeModule(LLMod);
+    LLVMOrcDisposeThreadSafeContext(TSCtx);
+    return Out;
+  }
+
+  // Wrap module into a ThreadSafeModule — addLLVMIRModule takes ownership.
+  LLVMOrcThreadSafeModuleRef TSM =
+      LLVMOrcCreateNewThreadSafeModule(LLMod, TSCtx);
+
+  LLVMOrcLLJITBuilderRef Builder = LLVMOrcCreateLLJITBuilder();
+  LLVMOrcLLJITRef JIT = nullptr;
+  if (LLVMErrorRef Err = LLVMOrcCreateLLJIT(&JIT, Builder)) {
+    char *Msg = LLVMGetErrorMessage(Err);
+    spdlog::error("ir-jit entry thunks: LLJIT create failed: {}",
+                  Msg ? Msg : "(null)");
+    LLVMDisposeErrorMessage(Msg);
+    LLVMOrcDisposeThreadSafeModule(TSM);
+    LLVMOrcDisposeThreadSafeContext(TSCtx);
+    return Unexpect(ErrCode::Value::RuntimeError);
+  }
+
+  LLVMOrcJITDylibRef MainJD = LLVMOrcLLJITGetMainJITDylib(JIT);
+  if (LLVMErrorRef Err = LLVMOrcLLJITAddLLVMIRModule(JIT, MainJD, TSM)) {
+    char *Msg = LLVMGetErrorMessage(Err);
+    spdlog::error("ir-jit entry thunks: addLLVMIRModule failed: {}",
+                  Msg ? Msg : "(null)");
+    LLVMDisposeErrorMessage(Msg);
+    LLVMOrcDisposeLLJIT(JIT);
+    LLVMOrcDisposeThreadSafeContext(TSCtx);
+    return Unexpect(ErrCode::Value::RuntimeError);
+  }
+
+  for (uint32_t FuncIdx : EmittedIdxs) {
+    const std::string Name =
+        "f" + std::to_string(FuncIdx) + "_entry_thunk";
+    LLVMOrcJITTargetAddress Addr = 0;
+    if (LLVMErrorRef Err = LLVMOrcLLJITLookup(JIT, &Addr, Name.c_str())) {
+      char *Msg = LLVMGetErrorMessage(Err);
+      spdlog::warn("ir-jit entry thunks: lookup {} failed: {}", Name,
+                   Msg ? Msg : "(null)");
+      LLVMDisposeErrorMessage(Msg);
+      continue;
+    }
+    Out.Thunks.emplace_back(FuncIdx,
+                            reinterpret_cast<void *>(
+                                static_cast<uintptr_t>(Addr)));
+  }
+
+  // Hand ownership of the LLJIT to a shared_ptr with a custom deleter.
+  // The TSCtx lifetime is tied to the JIT (we dispose it when the JIT is
+  // destroyed).
+  struct KeepAlive {
+    LLVMOrcLLJITRef JIT;
+    LLVMOrcThreadSafeContextRef TSCtx;
+  };
+  auto *K = new KeepAlive{JIT, TSCtx};
+  Out.Keepalive = std::shared_ptr<void>(
+      static_cast<void *>(K), [](void *P) noexcept {
+        auto *KA = static_cast<KeepAlive *>(P);
+        if (KA->JIT) LLVMOrcDisposeLLJIT(KA->JIT);
+        if (KA->TSCtx) LLVMOrcDisposeThreadSafeContext(KA->TSCtx);
+        delete KA;
+      });
+
+  spdlog::info("ir-jit entry thunks: emitted {}/{} thunks",
+               Out.Thunks.size(), Reqs.size());
+  return Out;
+}
+
 } // namespace WasmEdge::VM
 
 #endif // WASMEDGE_BUILD_IR_JIT && WASMEDGE_USE_LLVM
