@@ -265,10 +265,13 @@ counts are identical across the three dumps.
 
 ## Bug 2: OSR locals-store IR triggers O2 miscompile
 
-**Status: majority fixed (31/33 kernels green). Two residual kernels
-(blind-sig, rust-compression) still miscompile with a narrower, unresolved
-signature. Main fix landed in `lib/vm/ir_builder.cpp` `emitLoopBackEdge()`;
-`WASMEDGE_OSR_SKIP_STORES` bisection gate retained for the residual cases.**
+**Status: fully fixed (33/33 kernels green under tier2+OSR at O2).**
+Main fix in `lib/vm/ir_builder.cpp` `emitLoopBackEdge()` (type-native
+stores, no widening CSE substrate). **Residual blind-sig fix**
+(landed 2026-04-18) in `thirdparty/ir/ir_emit.c` — canonicalize
+spill-slot-aliased labels in `ir_emit_dessa_moves` before handing
+them to the parallel-copy algorithm. `WASMEDGE_OSR_SKIP_STORES`
+bisection gate retired.
 
 ### Syndrome (original, before fix)
 
@@ -338,87 +341,118 @@ owns the snapshot.
 
 ### Verified
 
-- 31/33 sightglass-strong kernels pass at O2 with
-  `WASMEDGE_OSR_THRESHOLD=5000`. Exit-0 with no error/failed grep hits
-  (modulo the "unreachable trap stubs" info line, which is harmless).
-- Golden output unchanged across every passing kernel.
-- No WT regression on non-looping functions (the widening ops were only
-  on the OSR diamond; removing them cannot help or hurt non-OSR code).
+- 33/33 sightglass-strong kernels pass at O2 with
+  `WASMEDGE_TIER2_ENABLE=1 WASMEDGE_TIER2_THRESHOLD=10
+  WASMEDGE_OSR_THRESHOLD=5000`. Exit-0, no error/failed grep hits
+  (modulo the harmless "unreachable trap stubs" info line).
+- Golden output unchanged across every kernel.
+- No WT regression on non-looping functions.
 
-### Residual failures under tier2+OSR (3/33)
+### Residual: blind-sig (SEGV) — FIXED 2026-04-18
 
-Sweep config: `WASMEDGE_TIER2_ENABLE=1 WASMEDGE_TIER2_THRESHOLD=10
-WASMEDGE_OSR_THRESHOLD=5000 WASMEDGE_IR_JIT_OPT_LEVEL=2`,
-sightglass-strong, 60 s per-kernel timeout. 30/33 pass; 3 fail:
+Symptom: SIGSEGV (or `unreachable` 0x40a with BOUND_CHECK=1) during
+blind-sig at O2 under tier2+OSR. The SEGV is in `wasm_jit_520`
+(tier-1 compile of wasm f535, not f106 as earlier bisection
+suggested — earlier numbering was stale).
 
-| Kernel             | Symptom                                  |
-|--------------------|------------------------------------------|
-| blind-sig          | timeout (hang under OSR; core dumped)    |
-| shootout-base64    | timeout (hang under OSR; core dumped)    |
-| shootout-ratelimit | timeout (hang under OSR; core dumped)    |
+Bisected (re-run on 2026-04-18):
+- `WASMEDGE_OSR_MIN_FUNC=535 WASMEDGE_OSR_MAX_FUNC=535
+   WASMEDGE_OSR_MIN_LOOP=2 WASMEDGE_OSR_MAX_LOOP=2` — SEGVs.
+- Any other single function's OSR emission — passes.
 
-(The earlier OSR-only sweep also showed rust-compression trap at
-FuncIdx 97/346; with tier2 enabled those functions get promoted before
-OSR can fire into them, so the trap disappears — confirming the failure
-class is OSR-specific and tier2 racing ahead masks it.)
+#### Root cause
 
-Each of the three residual kernels fails at O2 in the supported
-tier2+OSR config. All three pass with `WASMEDGE_OSR_SKIP_STORES=1`,
-pointing the finger at the store chain emitted in the OSR diamond on
-the hot tier-1 back-edge path (before tier-2 has landed the OSR entry,
-and before tier-2 has function-entry-promoted the caller).
+The earlier 2026-04-18 investigation blamed `ir_sccp_analyze` after
+an iter_opt / xform bisection — but that conclusion was wrong.
+A follow-up investigation (same day, new build) with clean gates
+ruled it out:
 
-`rust-compression` bisected with `WASMEDGE_OSR_MIN_FUNC` /
-`WASMEDGE_OSR_MAX_FUNC` down to **exactly two functions** out of 649:
-`FuncIdx 97` and `FuncIdx 346`. Both have large store-chain IF_TRUE
-branches (44+ stores) with loop-carried PHI values (`d_791`, `d_792`,
-`d_793`) also used outside the diamond — the value lives across both
-branches of the diamond *and* the enclosing loop.
+- `BYPASS_TRANSFORM=1` (run analyze + iter_opt, skip transform): PASS.
+- `BYPASS_ITEROPT=1` (run analyze + transform, skip iter_opt): PASS.
+- `BYPASS_BOTH=1` (analyze only): PASS.
+- `RESET_ITERWL=1` (clear iter_worklist between transform and
+  iter_opt): PASS.
 
-The `WASMEDGE_OSR_SKIP_CALL` diagnostic (since removed) confirmed the
-residual failures are driven by the **store chain in the IF_TRUE
-branch**, not by the CALL+RETURN side-exit on the transition path.
-Suppressing just the stores (`WASMEDGE_OSR_SKIP_STORES=1`) makes both
-kernels pass; suppressing just the CALL does not.
+Both consumers of analyze's output individually succeed; only the
+combination failed. And dumping `_values[]` after analyze for
+SKIP_STORES=0 vs SKIP_STORES=1 showed **structurally identical
+classifications** (same TOP / BOTTOM set modulo renumbering). The
+iter_worklist diff was also just a +21 offset from the extra IR
+instructions. So analyze is not miscompiling.
 
-Hypothesis: a secondary CSE/GCM interaction still exists for store
-chains that use loop-carried PHI addresses or values, even without the
-widening ops. Not yet isolated to a specific pass.
+The real culprit is **downstream of SCCP, in dessa+regalloc+emit**.
+Adding GDB tracing to the crashing f535 confirmed:
 
-### Current state of the bisection gate
+- SEGV on `xorl (%r14,%r15), %r9d` in the loop-2 body.
+- `r14` (loop-induction offset) had a nonsensical large value.
+- Bound-check mode (`WASMEDGE_IR_JIT_BOUND_CHECK=1`) reclassified
+  the SEGV as `Code: 0x408 out-of-bounds memory access`, confirming
+  a bad address, not a wild pointer.
+- Tracing the stack spills showed the BB14 → BB18 DESSA transition
+  copying the WRONG value into d_99's slot (`0x50(%rsp)`): instead
+  of `d_73 → d_99` (inital iv), it wrote `d_75 → d_99`. The initial
+  iv of the inner loop was thus `d_30 - 1` instead of `d_73 =
+  PHI(d_32, d_53)`. The inner loop walks an OOB address each iter.
 
-`lib/vm/ir_builder.cpp`:
+With the WASMEDGE_IR_DESSA_TRACE gate (later removed), the parallel
+copy list at BB14 was:
 
-```cpp
-const char *SkipStoresEnv = std::getenv("WASMEDGE_OSR_SKIP_STORES");
-const bool SkipStores = SkipStoresEnv && SkipStoresEnv[0] != '0';
-if (!SkipStores) {
-  /* emit type-native locals stores */
+```
+[dessa f=520 b=14] ADD copy0: from=vreg23 to=vreg33
+[dessa f=520 b=14] ADD copy1: from=vreg20 to=vreg52
+...
+[dessa-emit-m2m] copy0: from slot 2792 → to slot 2788
+[dessa-emit-m2m] copy1: from slot 2788 → to slot 2800
+```
+
+**vreg 20 and vreg 33 share spill slot 2788.** copy1 reads slot
+2788 AFTER copy0 has already overwritten it. The parallel-copy
+algorithm in `ir_dessa_parallel_copy` treated each (from, to) as an
+abstract label — it didn't know that two distinct labels could
+resolve to the same memory cell — and sequenced the copies in a
+way that violates read-before-overwrite. Classic SSA-to-CSSA
+stack-coloring correctness bug.
+
+With SKIP_STORES=1 (or any non-OSR config), f535 has a different
+vreg coloring and the aliased pair doesn't form, so the bug only
+shows up when the extra OSR-store live ranges put pressure on
+register allocation.
+
+Why only f535 and not every function: the coloring bug requires
+two PHI inputs at a single dessa edge to be coalesced to the same
+spill slot with overlapping use-at-edge. That pattern is rare
+enough to surface only in one of 534 functions under one specific
+IR shape.
+
+#### The fix
+
+`thirdparty/ir/ir_emit.c` `ir_emit_dessa_moves` (one-liner in
+concept, a dozen lines in code): **canonicalize spill-slot-aliased
+labels in the copies[] array** before handing it to
+`ir_dessa_parallel_copy`. For any two spilled labels in the list
+that resolve to the same `IR_MEM_VAL` slot, rewrite the
+larger-numbered label to the smaller. The parallel-copy algorithm
+then sees the correct dependency chain (copy reading a slot that
+a later copy writes → reader must run first, or a scratch must be
+inserted) and produces the right move order.
+
+```c
+if (n > 1) {
+    for each pair (copies[i], copies[j]):
+        for each label side (from/to) in each:
+            if both labels are spills and different vregs
+               but same spill slot:
+                rewrite the larger label to the smaller, in-place
+                across all of copies[]
+    // drop self-copies and duplicate (from,to) pairs
 }
 ```
 
-Retained as a bisection knob for debugging the residual 2 kernels. When
-set, the transition path still runs but reads **stale** locals from
-`OsrLocalsFrame`, so the OSR continuation produces wrong output —
-debug-only, not a correctness gate.
-
-No per-kernel skip, no pass disable, no kernel-shape early return in
-the codebase. The residual failures are observable as natural outputs
-from the 33-kernel sweep.
-
-### Plan for the residual fix
-
-1. Shrink `rust-compression` `FuncIdx=97` / `FuncIdx=346` to a
-   standalone IR reproducer. The loop carries PHIs `d_791`, `d_792`,
-   `d_793` through a 44-store IF_TRUE diamond branch — a <200-line
-   hand-written IR harness should suffice.
-2. Dump IR at each O2 pass boundary (`WASMEDGE_IR_JIT_DUMP=1` +
-   per-pass snapshot patch). Identify the first pass whose output
-   diverges between `SKIP_STORES=1` (correct) and `SKIP_STORES=0`
-   (wrong).
-3. Fix at the point the invariant breaks, in `thirdparty/ir/`.
-4. Retire the `WASMEDGE_OSR_SKIP_STORES` gate and this residual
-   subsection once green.
+This preserves the emit correctness (since both rewritten labels
+resolve to the same slot) while fixing the dependency-graph
+analysis. No changes to the register allocator or coalescing — the
+stack-slot sharing is legitimate in principle, we just need the
+parallel-copy stage to be aware of it.
 
 ### Debug artifacts
 
@@ -426,16 +460,26 @@ Regenerated on demand via per-function OSR filters:
 
 ```shell
 WASMEDGE_OSR_THRESHOLD=5000 \
-WASMEDGE_OSR_MIN_FUNC=97 WASMEDGE_OSR_MAX_FUNC=97 \
+WASMEDGE_OSR_MIN_FUNC=535 WASMEDGE_OSR_MAX_FUNC=535 \
+WASMEDGE_OSR_MIN_LOOP=2 WASMEDGE_OSR_MAX_LOOP=2 \
 WASMEDGE_IR_JIT_DUMP=1 \
-WASMEDGE_SIGHTGLASS_KERNEL=rust-compression ...
+WASMEDGE_SIGHTGLASS_KERNEL=blind-sig ...
 ```
 
-produces `/tmp/wasmedge_ir_097_{before,after}.ir`.
+produces `/tmp/wasmedge_ir_520_{before,after}.ir` (f535's tier-1
+compile, the SEGV site).
 
 ### Related
 
-- Bug 1 (dead-PHI DCE miscompile under OSR diamond) — same family:
-  post-SCCP O2 pass misreasons about IR shape introduced by OSR. Bug 1
-  is dormant in the supported tier2+OSR configuration; its workaround
-  has been reverted.
+- Bug 1 (dead-PHI DCE miscompile under OSR diamond) — related but
+  different family: Bug 1's workaround is at the iter_opt level
+  (no longer needed); Bug 2's residual fix is at the parallel-copy
+  level. Both arise from OSR IR shape putting atypical pressure on
+  the tier-1 backend.
+- `rust-compression`'s OSR-only trap at FuncIdx 97/346 was a
+  separate issue that disappears under tier2+OSR because tier-2
+  promotes those funcs before OSR can fire into them. Not tracked
+  further.
+- `base64` / `shootout-ratelimit` were fixed separately in commit
+  `5f34a78e fix(llvm-frontend): Hoist call_indirect null-path
+  allocas to entry block` — unrelated to tier-1 IR.

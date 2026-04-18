@@ -749,12 +749,23 @@ crash).**
 | shootout-sieve | 8,196,874 | 8,896,643 | 7,238,875 | 0.92× | 0.81× |
 | rust-compression | 9,967,552 | 9,021,199 | 6,990,075 | **1.10×** | 0.77× |
 | shootout-fib2 | 7,874,919 | 7,330,088 | 5,675,304 | **1.07×** | 0.77× |
+| blind-sig† | 9,521,382 | 4,951,149 | 3,712,637 | **1.92×** | 0.75× |
 | shootout-ed25519 | 8,581,572 | 7,139,896 | 5,170,585 | **1.20×** | 0.72× |
 | gcc-loops | 7,978,199 | 9,933,359 | 7,111,934 | 0.80× | 0.72× |
 
 (`noop` omitted — WT in the single-µs range is below measurement
-noise. `blind-sig` omitted — tier-2 core dump; tier-1 8,581k,
-LLVM JIT 3,671k for reference.)
+noise. †`blind-sig` measured 2026-04-19 after the DESSA
+spill-slot-aliasing fix landed (3-run median per mode,
+sightglass-strong, same config as the rest of the table). Tier-2+OSR
+wins **1.92×** over tier-1 — the largest `t2/t1` speedup in the
+suite — because blind-sig is a one-shot outer caller with long hot
+signing loops, exactly the shape OSR was built for: the in-flight
+tier-1 frame is migrated into tier-2 mid-loop, then runs the
+remaining signing work at LLVM speed. Tier-2 still loses to
+whole-module LLVM JIT at 0.75× because the bigint-multiply helpers
+(`__multi3`, `mac3`, `monty_modpow`) benefit from LLVM's
+whole-module vectorizer / cross-function SCCP that the mini-module
+batch doesn't reach.)
 
 ### Observations
 

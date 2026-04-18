@@ -2,6 +2,8 @@
 
 Apply to any test run in this repo.
 
+0. **Invoke the `sightglass` skill before running any sightglass/IR-JIT build or test command.** Do this even if you think you know the invocation — the skill holds the canonical commands and current env-var defaults. If the skill is already loaded this session, you can skip re-invoking.
+
 1. **No Interpreter mode for benchmarks.** Minutes per kernel, useless signal. Use `WASMEDGE_SIGHTGLASS_MODE=IR_JIT` (or `JIT`/`AOT` to compare backends). For a non-JIT oracle, use standalone `wasmtime`.
 
 2. **Never pipe test output for pass/fail.** `cmd | grep; echo $?` reports `grep`'s exit, not the test's. Redirect: `cmd > /tmp/test.log 2>&1; echo $?`. Use `set -o pipefail` only if you need streaming.

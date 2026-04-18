@@ -205,7 +205,7 @@ for wasm in ../test/ir/testdata/sightglass-strong/*.wasm; do
   WASMEDGE_IR_JIT_OPT_LEVEL=2 \
   WASMEDGE_TIER2_ENABLE=1 \
   WASMEDGE_TIER2_THRESHOLD=10 \
-  WASMEDGE_OSR_THRESHOLD=5000 \
+  WASMEDGE_OSR_THRESHOLD=1000 \
   stdbuf -oL timeout 60 ./test/ir/wasmedgeIRBenchmarkTests --gtest_filter='*SightglassSuite*' 2>&1
 done | tee /tmp/wasm-tier2-osr.log
 echo $?

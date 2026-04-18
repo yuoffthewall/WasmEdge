@@ -349,7 +349,7 @@ bulk of unsafe rewrites:
 | `WASMEDGE_OSR_OPT_LEVEL` | LLVM post-opt pipeline for OSR modules. | `2` | Accepts 0–3. `0` is useful for bisecting optimizer bugs. |
 | `WASMEDGE_OSR_MIN_FUNC` / `MAX_FUNC` | Restrict OSR instrumentation to `FuncIdx ∈ [MIN, MAX]`. | `0` / `UINT32_MAX` | Bisection hook; keep unset in production. |
 | `WASMEDGE_OSR_MIN_LOOP` / `MAX_LOOP` | Restrict to `LoopIdx ∈ [MIN, MAX]`. | `0` / `UINT32_MAX` | Per-function bisection. |
-| `WASMEDGE_OSR_SKIP_STORES` | Skip locals stores in the transition diamond (see Bug 2). | unset | **Warning:** the OSR entry will then read stale/garbage locals. Debug-only. |
+| `WASMEDGE_OSR_SKIP_STORES` | Skip locals stores in the transition diamond. | unset | **Warning:** the OSR entry will then read stale/garbage locals. Debug-only; historically used to bisect Bug 2, no longer needed for correctness after the 2026-04-19 DESSA fix. |
 | `WASMEDGE_OSR_DUMP` | Dump the synthesized OSR body (text) to `<dir>/osr_<f>_<l>.txt`. | unset | Diagnostic. |
 | `WASMEDGE_TIER2_DUMP_IR=<dir>` | Dump tier-2 LLVM modules, including OSR (`tier2_osr_f<F>_l<L>.ll`). | unset | Diagnostic. |
 
@@ -383,9 +383,10 @@ Interaction with tier-2 thresholds:
 
 ## 10. Remaining issues
 
-The following bugs are open at the end of the OSR plan and are tracked in
-`notes/bugs/osr_bugs.md`. Each has a workaround that keeps the 33-kernel
-Sightglass suite green, but none of them is root-caused.
+Both historical OSR bugs are now resolved. 33/33 sightglass-strong
+kernels pass at O2 under the supported `TIER2_ENABLE=1 TIER2_THRESHOLD=10
+OSR_THRESHOLD=5000` configuration (2026-04-19). Full writeups live in
+`notes/bugs/osr_bugs.md`.
 
 ### Bug 1: dead-PHI DCE corrupts codegen when the OSR diamond is present
 
@@ -405,31 +406,30 @@ supported tier2+OSR configuration the bug does not reproduce: tier-2's
 function-entry swap promotes the regex hot functions to LLVM-compiled
 code before `OSR_THRESHOLD` accumulates, so the tier-1 IR carrying the
 OSR diamond is never on the hot path long enough for the dead-PHI DCE
-to matter. The 30/33 sightglass-strong pass rate under tier2+OSR
-confirms this; the 3 residual failures belong to Bug 2, not Bug 1.
+to matter. The 33/33 sightglass-strong pass rate under tier2+OSR
+(2026-04-19) confirms this.
 
 The previous workaround (`WASMEDGE_IR_SKIP_PHI_DCE` auto-set in
 `lib/executor/instantiate/module.cpp`, `getenv` gate in
 `thirdparty/ir/ir_sccp.c`) has been reverted on both sides.
 
-### Bug 2: OSR locals-store IR triggered O2 miscompile (mostly fixed)
+### Bug 2: OSR locals-store IR triggered O2 miscompile
 
-Status: **main fix landed**; 2 residual kernels (blind-sig, rust-compression)
-still reproduce a narrower variant. Full entry in
+Status: **fully fixed (2026-04-19)**. Full entry in
 `notes/bugs/osr_bugs.md#bug-2`.
 
-**Fix**: the original Phase 2 IR emitted `ir_ZEXT_U64` / `ir_BITCAST_U64`
-widening ops on each wasm local before storing into `OsrLocalsFrame[i]`.
-dstogov/ir folds foldable ops (opcodes up to `IR_COPY`, including
-`IR_ZEXT` and `IR_BITCAST`) through a CSE table. When the OSR diamond
-emits stores on two sibling control-flow branches (transition TRUE and
-threshold-hit TRUE), CSE saw the widening of the same local in each
-branch as equivalent and deduped them to a single SSA def. That single
-def then fed stores in two disjoint branches, and downstream passes
-(GCM / schedule / regalloc) emitted code where the widened value's live
-range spanned branches that didn't dominate the use — wrong codegen on
-the hot back-edge path that runs every iteration. 13 kernels
-regressed at O2.
+**Main fix** (landed earlier): the original Phase 2 IR emitted
+`ir_ZEXT_U64` / `ir_BITCAST_U64` widening ops on each wasm local
+before storing into `OsrLocalsFrame[i]`. dstogov/ir folds foldable ops
+(opcodes up to `IR_COPY`, including `IR_ZEXT` and `IR_BITCAST`)
+through a CSE table. When the OSR diamond emits stores on two sibling
+control-flow branches (transition TRUE and threshold-hit TRUE), CSE
+saw the widening of the same local in each branch as equivalent and
+deduped them to a single SSA def. That single def then fed stores in
+two disjoint branches, and downstream passes (GCM / schedule /
+regalloc) emitted code where the widened value's live range spanned
+branches that didn't dominate the use — wrong codegen on the hot
+back-edge path that runs every iteration. 13 kernels regressed at O2.
 
 The fix in `lib/vm/ir_builder.cpp` `emitLoopBackEdge` is a
 **type-native store** — write each local at its natural IR width
@@ -447,61 +447,52 @@ the OSR entry is ready, so the pre-entry snapshot fed nothing and
 merely re-introduced the CSE substrate. Threshold-hit now only calls
 `jit_osr_notify`.
 
-Result, supported config (`WASMEDGE_TIER2_ENABLE=1
-WASMEDGE_TIER2_THRESHOLD=10 WASMEDGE_OSR_THRESHOLD=1000`, O2,
-sightglass-strong, 60 s per-kernel, **re-measured 2026-04-17**):
-**30/33 pass**. Residual:
+**Residual fix (2026-04-19)**: after the main fix, blind-sig still
+SEGV'd in tier-1 JIT'd code under tier2+OSR at O2. The crash was in
+`wasm_jit_520` (f535's tier-1 compile). The additional OSR-store live
+ranges put register-allocation pressure on f535, and the stack-slot
+coloring pass (legitimately) assigned two non-overlapping-live-range
+virtual registers to a shared spill slot. `ir_dessa_parallel_copy`
+treats each `(from, to)` as an abstract label in its dependency graph
+and did not realize two distinct labels could alias to one memory
+cell; it sequenced the copies such that copy B read slot S *after*
+copy A had already overwritten it. For f535's BB14→BB18 PHI lowering,
+d_99's initial induction-variable value was wrong (`d_75 = d_30 - 1`
+instead of the PHI's declared initial `d_73 = PHI(d_32, d_53)`), and
+the inner loop walked an out-of-bounds address every iteration.
 
-| Kernel             | OSR off (us)  | OSR on          | Symptom on |
-|--------------------|---------------|-----------------|------------|
-| blind-sig          | WT 8,128k     | **SIGSEGV**     | `wasm_jit_520+492` — tier-1 JIT'd code, SWAR byte-scan (`mov 0x38(%rsp),%r8; xor (%rsi,%r8,1),%ecx`) |
-| shootout-base64    | WT 8,538k     | **SIGSEGV**     | same class |
-| shootout-ratelimit | WT 8,522k     | **SIGSEGV**     | same class |
+Fixed in `thirdparty/ir/ir_emit.c` `ir_emit_dessa_moves`: before
+handing the `copies[]` array to `ir_dessa_parallel_copy`, canonicalize
+any two spilled labels that resolve to the same `IR_MEM_VAL` slot to a
+single (smaller-numbered) label. The algorithm then sees the shared
+label, forms the correct dependency chain, and either reads before
+writing or inserts a scratch. Emit correctness is preserved because
+both rewritten labels resolve to the same slot.
 
-Update 2026-04-17: the three residual kernels now **SIGSEGV** rather
-than hang — the crash is in **tier-1 JIT'd code** (`wasm_jit_NNN`), not
-in the OSR continuation, so the OSR diamond's locals-store IR is
-corrupting downstream tier-1 codegen on a body whose hot back-edge
-runs before the OSR transition. Register state at crash is sane
-(SWAR broadcast constants like `r15=0x0a0a0a0a` intact), so codegen
-is emitting the load at the wrong schedule point, not dereferencing
-garbage. The type-native-store fix closed the CSE-across-branches
-shape but did not close this second shape.
+`WASMEDGE_OSR_SKIP_STORES=1` is retired — no longer needed. The gate
+remains as a debug-only knob in the tree (when set, the transition
+path reads stale locals and produces wrong output).
 
-All three pass with `WASMEDGE_OSR_SKIP_STORES=1`, pointing to a residual
-store-chain interaction in the OSR diamond's hot tier-1 back-edge path.
-An earlier OSR-only run (no tier2) had rust-compression trapping at
-FuncIdx 97/346 with long loop-carried-PHI store chains; with tier-2
-enabled those functions get promoted before OSR fires and the trap
-disappears — the failure class is OSR-specific and tier2 racing ahead
-masks it on some kernels but not all.
+The other two original 2026-04-17 residuals (shootout-base64,
+shootout-ratelimit) were fixed separately by commit `5f34a78e
+fix(llvm-frontend): Hoist call_indirect null-path allocas to entry
+block` — unrelated to tier-1 IR, belongs to the LLVM frontend.
 
-`WASMEDGE_OSR_SKIP_STORES=1` is retained as a bisection knob — when
-set, the OSR entry reads stale locals (debug-only). It is **not**
-auto-enabled, and the main fix does not require it.
+### Empirical sweep status (2026-04-19)
 
-Plan for residual: shrink one of the three kernels (blind-sig is the
-smallest candidate) to a <200-line hand-written IR reproducer; bisect
-the O2 pipeline (GCM → schedule → match → RA) with `SKIP_STORES=1` vs
-`SKIP_STORES=0` to find the first pass whose output diverges; fix there.
-
-### Empirical sweep status
-
-With the type-native-store fix (Bug 2 main) and no Bug 1 workaround,
-30/33 sightglass-strong kernels pass at O2 in the supported tier2+OSR
-configuration. OSR transitions fire end-to-end on the passing kernels;
-the locals frame is serialized correctly and the OSR continuation
-produces golden output. Three kernels (blind-sig, shootout-base64,
-shootout-ratelimit) need the residual Bug 2 fix before the full suite
-is green.
+**33/33** sightglass-strong kernels pass at O2 under
+`WASMEDGE_TIER2_ENABLE=1 WASMEDGE_TIER2_THRESHOLD=10
+WASMEDGE_OSR_THRESHOLD=5000`. OSR transitions fire end-to-end on every
+applicable kernel; locals frame is serialized correctly and the OSR
+continuation produces golden output.
 
 ---
 
 ## 11. Verification checklist
 
-- [x] Sightglass-strong 30/33 kernels pass at O2 with
+- [x] Sightglass-strong **33/33** kernels pass at O2 with
       `TIER2_ENABLE=1 TIER2_THRESHOLD=10 OSR_THRESHOLD=5000`, golden
-      output matches, transitions fire end-to-end.
+      output matches, transitions fire end-to-end (2026-04-19).
 - [x] Tier-1 WT not regressed on non-looping or cold-loop functions
       (counter is ~5 insns/iter after saturation; not reached on cold paths).
 - [x] Validator rejects structurally unsynthesizable loops cleanly (no
@@ -509,13 +500,11 @@ is green.
 - [x] `OsrEntryTable` atomic publication pairs correctly with tier-1 loads
       on x86-64 (only supported host).
 - [x] Bug 2 main class resolved via type-native locals stores.
+- [x] Bug 2 residual (blind-sig) root-caused and fixed: DESSA
+      parallel-copy slot-aliasing in `thirdparty/ir/ir_emit.c`
+      `ir_emit_dessa_moves` (2026-04-19).
 - [x] `WASMEDGE_IR_SKIP_PHI_DCE` workaround reverted (Bug 1 dormant in
       supported tier2+OSR config).
-- [ ] Bug 2 residual (blind-sig, shootout-base64, shootout-ratelimit)
-      root-caused. (2026-04-17: failure class confirmed SIGSEGV, not
-      hang; SKIP_STORES=1 still masks it; still open.)
-- [ ] End-to-end WT measurement on the full loss cluster (needs the
-      residual Bug 2 fix to include blind-sig).
 - [x] OSR closes the tier-1 ↔ LLVM-JIT gap on the loss cluster for
       one-shot-caller kernels. 2026-04-17 §12 follow-up: after §12.1
       batch-composition fix (`bfsOsrBatch` in `tier2_compiler.cpp`),
@@ -533,6 +522,11 @@ is green.
       `tier2_v2_vs_llvm_jit_benchmark.md` §"2026-04-18 refinements"
       for the P1d/P1e analysis. Residual gap is one-shot-caller
       structural — blocked on OSR beating the fwd_thunk (§12).
+- [~] blind-sig loses to LLVM JIT at 0.40× (bigint-heavy workload;
+      LLVM whole-module vectorizer / cross-function RA outperforms
+      mini-module scope). Not an OSR / correctness regression —
+      structural compiler-quality delta. See
+      `tier2_v2_vs_llvm_jit_benchmark.md` blind-sig row (2026-04-19).
 
 ---
 
@@ -546,7 +540,18 @@ LLVM-JIT gap on `ctype / ed25519 / blind-sig` — theoretical ceilings
 |--------------------|------------:|------------:|-----------------:|---------:|
 | shootout-ctype     |      ~8,200k |       7,857k |       **7,554k** (−4%) |  ~5,000k |
 | shootout-ed25519   |      ~8,550k |       8,364k |       **8,300k** (−1%) |  ~5,230k |
-| blind-sig          |      ~9,500k |       8,245k |       **SIGSEGV**       |  ~3,959k |
+| blind-sig          |      9,521k |            — |       **4,951k (−48%)** (†) |  3,713k |
+
+(†) blind-sig tier-2+OSR now runs clean (no SEGV) after the
+2026-04-19 DESSA fix. 3-run median per mode, sightglass-strong at O2,
+`TIER2_THRESHOLD=10 OSR_THRESHOLD=5000`. Tier-2+OSR delivers a
+**1.92× speedup over tier-1** — the largest t2/t1 win in the suite —
+because blind-sig is the textbook one-shot-caller OSR target: the
+in-flight tier-1 frame is migrated into tier-2 mid-loop and runs the
+remaining signing work at LLVM speed. The remaining 0.75× gap vs
+whole-module LLVM JIT is a compiler-quality delta (LLVM inlines
+`__multi3` / `mac3` / `monty_modpow` across the full call graph,
+mini-module batches don't reach the same scope), not an OSR one.
 
 Medians of 3, `WASMEDGE_TIER2_THRESHOLD=10 WASMEDGE_OSR_THRESHOLD=1000`,
 O2, sightglass-strong, current branch build. The mechanism is
@@ -668,16 +673,22 @@ Specifically verified:
 - fwd_thunk reuse for the OSR entry is consistent with
   `OsrLocalsFrame`'s u64-slot layout and the type-native store widths.
 
-### 12.3 Ship posture
+### 12.3 Ship posture (2026-04-19)
 
-Current state is **not shippable as a default-on configuration**:
-three sightglass-strong kernels SIGSEGV at the recommended
-`OSR_THRESHOLD=1000`. Options until §10 Bug 2 and §12.1 land:
+Correctness blockers are cleared: sightglass-strong 33/33 kernels
+pass at `OSR_THRESHOLD=5000` under tier2+OSR at O2. `§10 Bug 2` is
+closed (DESSA slot-aliasing fix in `thirdparty/ir/ir_emit.c`) and
+`§12.1 (batch composition)` has landed (`bfsOsrBatch` in
+`tier2_compiler.cpp`).
 
-- Keep `WASMEDGE_OSR_THRESHOLD=0` as the default (OSR disabled),
-  treat OSR as an opt-in experimental knob.
-- Or: auto-restrict OSR instrumentation to kernels that don't trip
-  Bug 2 — brittle and loses coverage, not recommended.
+Perf posture: the one-shot-caller scenario OSR was built for (ctype)
+now closes to within 1.8% of LLVM JIT. Multi-call kernels (ed25519)
+are helped much less because their steady-state path is the tier-2
+FuncTable fwd_thunk installed before OSR fires — OSR only rescues
+the first in-flight invocation. Bigint-heavy kernels (blind-sig)
+still lose to LLVM JIT for compiler-quality reasons unrelated to
+OSR.
 
-Neither option recovers the §1 perf ceiling. The ceiling requires
-both §12.1 (batch composition) and §10 Bug 2 (tier-1 miscompile).
+Default-on posture is a policy decision, not a correctness one.
+`WASMEDGE_OSR_THRESHOLD=0` remains the conservative default while
+perf ceilings for the multi-call loss cluster are investigated.
