@@ -422,32 +422,49 @@ requests total, one per `(func, loop)` pair.
 
 ## Known failure modes (2026-04-18)
 
-Full-sweep runs of `sightglass-strong` at `TIER2_THRESHOLD=10` surface
-eight kernels that do not complete cleanly:
+Full-sweep runs of `sightglass-strong` at
+`TIER2_THRESHOLD=10 OSR_THRESHOLD=5000` — 32 / 33 kernels pass. One
+residual:
 
-| Kernel             | Arm             | Failure                                                |
-|---                 |---              |---                                                     |
-| shootout-base64    | tier-2          | core dump inside tier-2 compile/install                |
-| shootout-minicsv   | tier-2          | core dump inside tier-2 compile/install                |
-| shootout-ratelimit | tier-2          | core dump inside tier-2 compile/install                |
-| quicksort          | tier-2          | mini-module validation: value-stack underflow at `call`|
-| regex              | tier-2          | mini-module validation: type mismatch (i64 vs i32)     |
-| shootout-fib2      | tier-2          | mini-module validation: value-stack underflow at `call`|
-| blind-sig          | tier-1 + tier-2 | kernel traps during execution (pre-existing)           |
-| rust-compression   | tier-1          | unreachable trap at runtime (pre-existing)             |
+| Kernel    | Arm    | Failure                                      |
+|---        |---     |---                                           |
+| blind-sig | tier-2 | SEGV inside the OSR'd body (pre-existing, tracked in `notes/bugs/osr_bugs.md`) |
 
-The three validation errors share a shape — a synthesized `call` site
-whose operand stack or types do not match the callee signature.
-Suspected location: `synthesizeMiniModule` / `emitT1ThunkInPlace`
-handling of functions whose original body led with `Unreachable` (these
-are filtered by `isPromotable` but may still appear as non-batch stubs
-referenced by batch bodies). Enlarged batches from P1e exposed the
-latent cases.
+tier-1 alone is clean across all 33 kernels (`rust-compression` no
+longer traps after the tier-1 codegen work that landed alongside the
+OSR inlining changes).
 
-At production thresholds (e.g. 1000), most of these do not reproduce
-because the hot functions never trip. They are documented here as
-follow-up items, not as active blockers for the tier-2 pipeline's
-design.
+### Fixed on this pass
+
+- **Mini-module validation (quicksort / shootout-fib2 / regex).**
+  `synthesizeOsrModule` used to overwrite `FuncSec[DefinedIdx]` with the
+  OSR signature (`all-locals flattened → original-rets`), which broke
+  validation of any `call FuncIdx` inside the OSR body that referenced
+  the function's own, un-rewritten signature. Fixed by appending the OSR
+  body as a **new** function slot and leaving the original
+  `FuncIdx`/type untouched — self-recursion now routes back through
+  tier-1 via `emitT1ThunkInPlace`. Implementation:
+  `synthesizeOsrModule` + `compileOsrEntry` in `lib/vm/tier2_compiler.cpp`,
+  and `emitFwdThunk` which now takes separate `ThunkIdx` / `CalleeIdx`
+  so the thunk can be named off the original index while invoking the
+  appended OSR slot.
+- **Core dumps (shootout-base64 / shootout-minicsv / shootout-ratelimit).**
+  `compileIndirectCallOp` and `compileCallRefOp` in
+  `lib/llvm/compiler.cpp` emitted the null-path `Args`/`Rets` scratch
+  allocas in the null basic block itself rather than the function entry
+  block. LLVM only folds repeated allocas back to a single slot when
+  they live in the entry block — allocas emitted in any other block
+  accumulate one frame per execution until the enclosing function
+  returns. On these three kernels `proxyTableGetFuncSymbol` returns
+  null on *every* call_indirect iteration (IR-JIT targets are not
+  `CompiledFunction`), so an OSR'd hot loop leaked 16 B per iteration
+  until the 8 MB thread stack filled and SEGV'd on the next
+  `setjmp` in `IRJitEngine::invoke`. Fixed with a `createEntryAlloca`
+  helper that hoists the two scratch allocas to the function entry
+  block via `LLVMGetFirstBasicBlock` /
+  `LLVMPositionBuilderBefore`. `compileReturn{Indirect,}CallRefOp` do
+  not need the same fix — their null path ends in `ret`, so the alloca
+  is released on function return.
 
 ---
 
@@ -564,6 +581,12 @@ Bug histories closed by the rewrite:
 6. **Scope-filter hit rate is not measured.** We should emit a counter
    for "tier-up requests skipped due to non-scalar signature" to drive
    the v128 scope-expansion decision.
+7. **blind-sig tier-2 residual.** SEGV inside the OSR'd body; last
+   active bug in the tier-2+OSR matrix. Tracked in
+   `notes/bugs/osr_bugs.md` — same OSR-specific store-chain / codegen
+   family that the base64/minicsv/ratelimit triage already picked
+   apart; blind-sig is suspected to hit a different trigger and is not
+   yet root-caused.
 
 ---
 
