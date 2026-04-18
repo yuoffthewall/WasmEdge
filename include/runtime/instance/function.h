@@ -156,7 +156,25 @@ public:
     }
     return nullptr;
   }
-  
+
+  /// Getter of the LLVM-ABI entry thunk address (or nullptr if not built).
+  void *getIRJitLlvmEntryThunk() const noexcept {
+    if (auto *Func = std::get_if<IRJitFunction>(&Data)) {
+      return Func->LlvmEntryThunk;
+    }
+    return nullptr;
+  }
+
+  /// Install the LLVM-ABI entry thunk address. Called post-IR-JIT by the
+  /// instantiation path once `buildIRJitEntryThunks` JIT-compiles them.
+  bool setIRJitLlvmEntryThunk(void *Thunk) noexcept {
+    if (auto *Func = std::get_if<IRJitFunction>(&Data)) {
+      Func->LlvmEntryThunk = Thunk;
+      return true;
+    }
+    return false;
+  }
+
   /// Upgrade from WasmFunction to IR JIT compiled function.
   /// Returns true if successful, false if not a WasmFunction.
   bool upgradeToIRJit(void *NativeFunc, size_t CodeSize) noexcept {
@@ -189,8 +207,17 @@ private:
 
 #ifdef WASMEDGE_BUILD_IR_JIT
   struct IRJitFunction {
-    void *NativeFunc; // Pointer to JIT compiled code
+    void *NativeFunc; // Pointer to JIT compiled code (tier-1 fastcall ABI:
+                      // `ret fastcall(JitExecEnv*, uint64_t*)`)
     size_t CodeSize;  // Size of compiled code
+    /// LLVM-native ABI entry thunk: `ret (ExecCtx*, typed_params...)`.
+    /// Emitted post-IR-JIT when tier-2 is enabled so `call_indirect` from
+    /// tier-2 / OSR LLVM code can reach IR-JIT targets through the same
+    /// fast NotNullBB path that whole-module LLVM JIT uses, instead of
+    /// trapping into the `proxyCallIndirect` slow path.
+    /// nullptr means the thunk was not built (tier-2 disabled, or the
+    /// function type has non-scalar params / multi-return).
+    void *LlvmEntryThunk = nullptr;
 
     IRJitFunction(void *Func, size_t Size) noexcept
         : NativeFunc(Func), CodeSize(Size) {}

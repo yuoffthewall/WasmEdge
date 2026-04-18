@@ -1262,6 +1262,11 @@ private:
     /// WasmEdge LLVM frontend. Populated at instantiation time; kept alive
     /// for the module's lifetime so late tier-ups can still see it.
     std::shared_ptr<const AST::Module> FullModule;
+    /// Keeps the ORC LLJIT that owns the IR-JIT entry thunks alive for
+    /// the module's lifetime. Thunk native pointers stored on
+    /// `FunctionInstance::IRJitFunction::LlvmEntryThunk` are only valid
+    /// while this is held.
+    std::shared_ptr<void> EntryThunksKeepalive;
   };
   mutable std::unordered_map<const Runtime::Instance::ModuleInstance *,
                              IRJitEnvCache>

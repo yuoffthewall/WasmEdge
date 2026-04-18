@@ -31,6 +31,7 @@
 namespace WasmEdge {
 namespace AST {
 class Module;
+class FunctionType;
 } // namespace AST
 namespace VM {
 
@@ -94,6 +95,43 @@ private:
   std::unique_ptr<Impl> P;
   std::atomic<bool> *ShutdownFlag_ = nullptr;
 };
+
+/// Entry thunk request: one LLVM-ABI wrapper to emit for an IR-JIT
+/// function. Populated by the instantiation path once all IR-JIT native
+/// pointers are available.
+struct IRJitEntryThunkReq {
+  /// Module-wide function index (for naming / diagnostics only — not
+  /// baked into the generated code).
+  uint32_t FuncIdx;
+  /// Tier-1 native code pointer (`ret fastcall(JitExecEnv*, uint64_t*)`)
+  /// to forward calls to. Embedded in the thunk as a constant.
+  void *NativeFunc;
+  /// Wasm function type; determines the LLVM-native thunk signature.
+  const AST::FunctionType *FuncType;
+};
+
+/// Batch-build LLVM-ABI entry thunks for a list of IR-JIT functions.
+///
+/// Each thunk has the signature `ret (ExecCtx*, typed_params...)` — the
+/// same shape `compileIndirectCallOp`'s NotNullBB expects — and forwards
+/// to the underlying tier-1 native pointer through an inline `movq
+/// %fs:OFFSET, $0` load of `wasmedge_tier2_jit_env_tls`. Produces one
+/// ORC LLJIT that keeps the thunks alive for the Executor's lifetime.
+///
+/// Returns a vector of (FuncIdx, thunk_native_ptr). Requests whose
+/// FuncType has non-scalar params or multi-return are skipped (caller
+/// gets no entry for that FuncIdx). The returned LLJIT handle is
+/// opaque; callers must retain it for the process lifetime.
+struct IRJitEntryThunksResult {
+  std::vector<std::pair<uint32_t, void *>> Thunks;
+  /// Opaque handle that owns the ORC LLJIT; destroying it releases the
+  /// thunk code. Callers must keep it alive for as long as any thunk
+  /// address is reachable.
+  std::shared_ptr<void> Keepalive;
+};
+
+Expect<IRJitEntryThunksResult>
+buildIRJitEntryThunks(Span<const IRJitEntryThunkReq> Reqs);
 
 } // namespace VM
 } // namespace WasmEdge

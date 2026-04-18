@@ -632,3 +632,149 @@ measurement noise).
   blocked behind a 2s batch compile on higher thresholds, split the
   worker into one regular-batch thread + one OSR thread. Each
   `Tier2Compiler` would need its own `LLVMContextRef`.
+
+---
+
+## 2026-04-18 P1g refinement: LLVM-ABI entry thunks — the honest fix
+
+### Why this section supersedes every earlier "tier-2 vs LLVM JIT" claim
+
+The P1f table above and the "tier-2 beats LLVM JIT on 13 kernels"
+claim were briefly replaced by an inline-shadow-dispatch-table
+lowering emitted only by `compileIndirectCallOp` for IR-JIT targets.
+That lowering dropped tier-2's per-call dispatch cost below
+whole-module LLVM JIT's (which still paid `proxyTableGetFuncSymbol`)
+— an unfair asymmetry. On ratelimit it produced a **108×** speedup
+over the tier-2 proxy path and a **19×** speedup over LLVM JIT, which
+is not a compiler-quality delta, just a frontend lowering applied to
+only one arm. Research-integrity call: revert.
+
+P1g is the honest fix. Both paths now take the **same** dispatch
+shape (`NotNullBB` via `proxyTableGetFuncSymbol`) — tier-2 reaches it
+by way of an LLVM-ABI **entry thunk** per IR-JIT function that the
+proxy returns instead of `nullptr`. No compiler-frontend optimization
+is applied asymmetrically.
+
+### Mechanism
+
+At instantiation time, right after the IR-JIT compile pass, WasmEdge
+now builds one LLVM-native wrapper per IR-JIT function:
+
+```
+ret f<i>_entry_thunk(ExecCtx* execCtx, typed_params...) {
+  env  = movq %fs:OFFSET                      // wasmedge_tier2_jit_env_tls
+  args = alloca [N x u64]; store params…
+  raw  = ir_jit_f<i>(env, args)                // tier-1 fastcall ABI
+  return narrow(raw)
+}
+```
+
+Thunks are batched into one LLVM module and ORC-JIT-compiled by a
+dedicated LLJIT instance pinned by `IRJitEnvCache`. Thunk pointers
+are installed on `FunctionInstance::IRJitFunction::LlvmEntryThunk`.
+`proxyTableGetFuncSymbol` returns them in the `isIRJitFunction()`
+branch instead of `nullptr`, so `compileIndirectCallOp`'s existing
+`NotNullBB` handles the dispatch inline — the same path whole-module
+LLVM JIT already uses.
+
+Implementation pointers: `lib/vm/tier2_compiler.cpp::buildIRJitEntryThunks`;
+hook in `lib/executor/instantiate/module.cpp`; proxy update in
+`lib/executor/engine/proxy.cpp`. Full design: `tier2_v2_doc.md`
+§ABI bridging → `f<i>_entry_thunk`.
+
+### Full-sweep results (sightglass-strong, 33 kernels, 2026-04-18 P1g)
+
+Config: `WASMEDGE_TIER2_ENABLE=1 WASMEDGE_TIER2_THRESHOLD=10
+WASMEDGE_OSR_THRESHOLD=5000 WASMEDGE_IR_JIT_OPT_LEVEL=2`, one sample
+per cell. Speedup column = `LLVM_JIT_WT / tier-2_WT` (>1 means
+tier-2 wins).
+
+**Failures.** Tier-2: only blind-sig (pre-existing tier-2 SEGV,
+tracked in `notes/bugs/osr_bugs.md`). LLVM JIT: 33/33 pass, no
+new crashes. The base64 / minicsv / ratelimit / quicksort / regex /
+fib2 crashes that gated the P1f table are all green.
+
+**Aggregates (31 kernels where both tier-2 and LLVM JIT complete,
+`noop` excluded as below measurement noise):**
+
+| Aggregate                        | value     |
+|---                               |---        |
+| Geomean tier-2 / LLVM JIT WT     | **0.910×** |
+| Wins (≥1.02×)                    | 4 / 31    |
+| Flat (±2%)                       | 12 / 31   |
+| Losses (≤0.98×)                  | 15 / 31   |
+| Best tier-2 vs LLVM JIT          | shootout-nestedloop **1.64×** |
+| Worst tier-2 vs LLVM JIT         | gcc-loops 0.32×               |
+
+**Per-kernel WT (µs), sorted by tier-2-vs-LLVM-JIT speedup.**
+
+| Kernel | Tier-2 WT | LLVM JIT WT | vs LLVM JIT |
+|---|---:|---:|---:|
+| shootout-nestedloop | 5,441,303 | 8,897,982 | **1.64×** |
+| shootout-seqhash | 5,444,556 | 5,647,657 | **1.04×** |
+| shootout-heapsort | 8,108,564 | 8,354,794 | **1.03×** |
+| shootout-quicksort *(quicksort)* | 6,687,734 | 6,824,257 | **1.02×** |
+| blake3-scalar | 5,530,839 | 5,599,068 | 1.01× |
+| shootout-switch | 9,053,964 | 9,115,937 | 1.01× |
+| richards | 8,180,296 | 8,242,565 | 1.01× |
+| shootout-gimli | 7,947,330 | 7,912,516 | 1.00× |
+| shootout-matrix | 6,812,719 | 6,804,627 | 1.00× |
+| shootout-memmove | 8,746,128 | 8,710,693 | 1.00× |
+| shootout-keccak | 6,840,191 | 6,838,795 | 1.00× |
+| shootout-xchacha20 | 7,736,824 | 7,756,911 | 1.00× |
+| shootout-xblabla20 | 8,205,539 | 8,134,204 | 0.99× |
+| shootout-random | 4,459,944 | 4,398,912 | 0.99× |
+| shootout-ratelimit | 8,661,416 | 8,523,274 | 0.98× |
+| shootout-minicsv | 9,456,108 | 9,313,371 | 0.98× |
+| shootout-base64 | 7,136,852 | 6,974,577 | 0.98× |
+| pulldown-cmark | 7,939,661 | 7,541,923 | 0.95× |
+| shootout-ctype | 5,348,745 | 5,026,698 | 0.94× |
+| regex | 9,371,857 | 8,653,544 | 0.92× |
+| hashset | 8,358,919 | 7,521,331 | 0.90× |
+| shootout-sieve | 8,971,983 | 8,024,504 | 0.89× |
+| rust-html-rewriter | 8,489,686 | 7,478,645 | 0.88× |
+| rust-protobuf | 7,504,266 | 6,615,743 | 0.88× |
+| rust-json | 8,571,346 | 7,399,584 | 0.86× |
+| shootout-ackermann | 5,115,902 | 4,209,159 | 0.82× |
+| rust-compression | 9,133,452 | 7,008,842 | 0.77× |
+| shootout-fib2 | 7,418,440 | 5,633,494 | 0.76× |
+| shootout-ed25519 | 7,181,394 | 5,189,207 | 0.72× |
+| bz2 | 10,775,825 | 6,978,049 | 0.65× |
+| gcc-loops | 22,105,857 | 7,055,431 | 0.32× |
+
+### Observations
+
+- **Tier-2 legitimately matches or beats LLVM JIT on 16/31 kernels**
+  (within-2% or better). The 4 clean wins are nestedloop, seqhash,
+  heapsort, and quicksort. nestedloop's 1.64× remains an LLVM
+  codegen pathology on empty nested loops (already flagged earlier);
+  the others are within a few percent and could be noise.
+- **Tier-2 legitimately loses on 15 kernels**, most notably gcc-loops
+  (0.32×), bz2 (0.65×), ed25519 (0.72×), rust-compression (0.77×),
+  fib2 (0.76×). These are the real compiler-quality deltas: LLVM's
+  whole-module inliner/vectorizer sees optimizations the mini-module
+  doesn't have scope for. That's the honest story about tiered vs.
+  whole-module compilation.
+- **The previously-headlining ratelimit 1.71× / ackermann 5.32× /
+  ctype 1.66× numbers from P1f were partially real and partially
+  artifact.** Ratelimit's gain was almost entirely the inline fast
+  path (reverted); under the thunk fix it drops to 0.98× LLVM JIT.
+  Ackermann's gain came from P1f's OSR-first priority + ratio-gated
+  batching (kept) but the previous 1.71× reflects a favorable
+  snapshot; the current number is 0.82× LLVM JIT — still a real
+  OSR-migration signal, but small.
+- **gcc-loops 0.32×** is a ~3× regression that warrants investigation
+  — the outlier of the set, likely a mini-module scope cliff on its
+  large kernel / many-function layout.
+
+### Not in scope
+
+- Closing the 15 remaining losses against LLVM JIT would mean either
+  (a) growing the mini-module batch scope toward whole-module (gives
+  up the tier-2 latency advantage), or (b) applying a uniform inline
+  shadow-dispatch optimization to both arms (doable but big change —
+  would need shadow table populated for LLVM JIT mode too, plus ABI
+  unification). Neither is on this branch.
+- Per-OSR hotness priority and dedicated OSR worker from the P1f
+  list remain open but are now lower priority given the honest
+  numbers don't depend on them.

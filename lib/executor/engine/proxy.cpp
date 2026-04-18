@@ -637,20 +637,40 @@ Expect<void *> Executor::proxyTableGetFuncSymbol(
     return Unexpect(ErrCode::Value::IndirectCallTypeMismatch);
   }
 
-  if (unlikely(!FuncInst->isCompiledFunction())) {
-    return nullptr;
+  if (FuncInst->isCompiledFunction()) {
+    return FuncInst->getSymbol().get();
   }
-  return FuncInst->getSymbol().get();
+#ifdef WASMEDGE_BUILD_IR_JIT
+  // IR-JIT targets have an LLVM-ABI entry thunk emitted at instantiation
+  // when tier-2 is enabled. Returning it lets `compileIndirectCallOp`'s
+  // NotNullBB fast path handle the dispatch inline — the same path
+  // whole-module LLVM JIT uses — instead of falling to the
+  // `proxyCallIndirect` slow path. nullptr if tier-2 is off or the
+  // function type isn't thunk-eligible (non-scalar / multi-return).
+  if (FuncInst->isIRJitFunction()) {
+    if (void *Thunk = FuncInst->getIRJitLlvmEntryThunk()) {
+      return Thunk;
+    }
+  }
+#endif
+  return nullptr;
 }
 
 Expect<void *> Executor::proxyRefGetFuncSymbol(Runtime::StackManager &,
                                                const RefVariant Ref) noexcept {
   const auto *FuncInst = retrieveFuncRef(Ref);
   assuming(FuncInst);
-  if (unlikely(!FuncInst->isCompiledFunction())) {
-    return nullptr;
+  if (FuncInst->isCompiledFunction()) {
+    return FuncInst->getSymbol().get();
   }
-  return FuncInst->getSymbol().get();
+#ifdef WASMEDGE_BUILD_IR_JIT
+  if (FuncInst->isIRJitFunction()) {
+    if (void *Thunk = FuncInst->getIRJitLlvmEntryThunk()) {
+      return Thunk;
+    }
+  }
+#endif
+  return nullptr;
 }
 
 } // namespace Executor

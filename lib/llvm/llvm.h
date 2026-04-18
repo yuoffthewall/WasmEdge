@@ -155,6 +155,12 @@ private:
 #endif
     LLVMInitializeNativeTarget();
     LLVMInitializeNativeAsmPrinter();
+    // compileIndirectCallOp's shadow-dispatch fast path emits a
+    // `movq %fs:N, $0` inline asm to read wasmedge_tier2_jit_env_tls.
+    // ORC JIT refuses modules with inline asm unless the asm parser is
+    // initialized — without this, whole-module LLVM JIT fails at codegen
+    // with "Inline asm not supported by this streamer".
+    LLVMInitializeNativeAsmParser();
 
     Ceil = getIntrinsicID("llvm.ceil"sv);
     CopySign = getIntrinsicID("llvm.copysign"sv);

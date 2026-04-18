@@ -10,6 +10,9 @@
 #include "vm/ir_builder.h"
 #include "vm/ir_jit_engine.h"
 #include "vm/canonical_type_registry.h"
+#if defined(WASMEDGE_USE_LLVM)
+#include "vm/tier2_compiler.h"
+#endif
 #endif
 
 #include <chrono>
@@ -416,6 +419,44 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
     if (Tier2Threshold > 0) {
       IRJitEnvCache_[ModInst.get()].FullModule =
           std::make_shared<const AST::Module>(Mod);
+
+#if defined(WASMEDGE_USE_LLVM)
+      // Build LLVM-ABI entry thunks for every successfully IR-JIT'd
+      // function so `call_indirect` dispatches from tier-2 / OSR
+      // LLVM-compiled code go through the same `NotNullBB` direct-call
+      // path whole-module LLVM JIT already uses, bypassing the expensive
+      // `proxyCallIndirect` slow path for IR-JIT-backed targets.
+      auto FuncInsts = ModInst->getFunctionInstances();
+      std::vector<VM::IRJitEntryThunkReq> Reqs;
+      Reqs.reserve(FuncInsts.size());
+      for (uint32_t I = 0; I < FuncInsts.size(); ++I) {
+        auto *FI = FuncInsts[I];
+        if (!FI || !FI->isIRJitFunction())
+          continue;
+        void *Native = FI->getIRJitNativeFunc();
+        if (!Native)
+          continue;
+        Reqs.push_back({I, Native, &FI->getFuncType()});
+      }
+      if (!Reqs.empty()) {
+        auto ThunksRes = VM::buildIRJitEntryThunks(Reqs);
+        if (ThunksRes) {
+          for (auto &[FIdx, Thunk] : ThunksRes->Thunks) {
+            // Mutable path: unsafeGetFunction returns a non-const pointer
+            // so we can install the thunk address on the instance.
+            if (auto *FI = ModInst->unsafeGetFunction(FIdx)) {
+              FI->setIRJitLlvmEntryThunk(Thunk);
+            }
+          }
+          IRJitEnvCache_[ModInst.get()].EntryThunksKeepalive =
+              std::move(ThunksRes->Keepalive);
+        } else {
+          spdlog::warn(
+              "IR JIT entry thunks: build failed; call_indirect from "
+              "tier-2/OSR code will take the proxyCallIndirect slow path.");
+        }
+      }
+#endif
     }
     auto IRJitCompEnd = std::chrono::high_resolution_clock::now();
     IREngine.LastCompileTimeUs_ =
