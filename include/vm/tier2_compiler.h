@@ -35,8 +35,19 @@ class FunctionType;
 } // namespace AST
 namespace VM {
 
+/// Result of a unified tier-2 compile.
+///   - FwdThunks: (funcIdx, native ptr) pairs for FuncTable swap. Populated
+///     when LoopEntries was empty (pure function-entry batch).
+///   - OsrEntries: (loopIdx, native ptr) pairs for the OsrEntryTable slot
+///     at `RootFuncIdx * OSR_MAX_LOOPS_PER_FUNC + loopIdx`. Populated when
+///     LoopEntries was non-empty.
+struct Tier2CompileResult {
+  std::vector<std::pair<uint32_t, void *>> FwdThunks;
+  std::vector<std::pair<uint32_t, void *>> OsrEntries;
+};
+
 /// Tier-2 compiler. One instance is owned by the background Tier2Manager
-/// worker. Each compileBatch() call produces a fresh ORC LLJIT containing
+/// worker. Each compile call produces a fresh ORC LLJIT containing
 /// the compiled batch.
 class Tier2Compiler {
 public:
@@ -46,45 +57,30 @@ public:
   Tier2Compiler(const Tier2Compiler &) = delete;
   Tier2Compiler &operator=(const Tier2Compiler &) = delete;
 
-  /// Set a shutdown flag. If non-null, compileBatch() checks it at key
-  /// points and bails out early if set, avoiding long-running LLVM codegen.
+  /// Set a shutdown flag. If non-null, compile paths check it at key
+  /// points and bail out early if set, avoiding long-running LLVM codegen.
   void setShutdownFlag(std::atomic<bool> *Flag) noexcept {
     ShutdownFlag_ = Flag;
   }
 
-  /// Compile a batch of hot functions by synthesizing a mini AST::Module
-  /// from \p Mod that contains only the batch bodies (non-batch defined
-  /// functions get `unreachable` stubs to preserve funcIdx space), feeding
-  /// it through WasmEdge::LLVM::Compiler, and ORC-JITing the result.
+  /// Unified tier-2 compile entry. Synthesizes a mini AST::Module that
+  /// keeps real bodies for \p Batch members, optionally appends one OSR
+  /// function slot per `LoopEntries` index (whose body starts at the loop
+  /// header inside `RootFuncIdx`), stubs everything else, and ORC-JITs
+  /// the result.
   ///
-  /// \param BatchIdx  Module-wide function indices to promote (imports are
-  ///                  not valid inputs here). First entry is the hot head.
-  /// \param Mod       Full parsed AST::Module. Kept alive by the manager.
-  /// \param OptLevel  LLVM optimization level (0-3).
-  /// \returns A vector of (funcIdx, tier1-ABI entry pointer) pairs suitable
-  ///          for atomic FuncTable swap.
-  Expect<std::vector<std::pair<uint32_t, void *>>>
-  compileBatch(Span<const uint32_t> BatchIdx, const AST::Module &Mod,
-               unsigned OptLevel = 2);
-
-  /// Compile an OSR (on-stack replacement) entry for the given
-  /// (FuncIdx, LoopIdx) pair. The target function is rewritten so its
-  /// entry point is the start of the \p LoopIdx-th outermost loop; all
-  /// wasm locals (params + declared) become function parameters and are
-  /// passed via the tier-1 `(JitExecEnv*, uint64_t*)` ABI just like a
-  /// regular fwd_thunk. Other defined functions in the module are stubbed
-  /// as tier-2 → tier-1 bridges so cross-function calls resolve
-  /// correctly.
-  ///
-  /// \param FuncIdx   Module-wide function index containing the target loop.
-  /// \param LoopIdx   Index of the outermost loop (matches the
-  ///                  `CurrLoopIdx++` assignment in the IR builder).
-  /// \param Mod       Full parsed AST::Module. Kept alive by the manager.
-  /// \param OptLevel  LLVM optimization level (0-3).
-  /// \returns The native OSR entry pointer (tier-1 ABI) on success.
-  Expect<void *> compileOsrEntry(uint32_t FuncIdx, uint32_t LoopIdx,
-                                  const AST::Module &Mod,
-                                  unsigned OptLevel = 2);
+  /// \param RootFuncIdx Anchor function (used for OSR slot synthesis and
+  ///                    dump/log file naming).
+  /// \param Batch       Manager-resolved batch members (real bodies kept
+  ///                    so LLVM can inline). First entry is the hot head.
+  /// \param LoopEntries OSR loop indices to synthesize entry slots for.
+  ///                    Empty for a pure function-entry tier-2 batch.
+  /// \param Mod         Full parsed AST::Module. Kept alive by the manager.
+  /// \param OptLevel    LLVM optimization level (0-3).
+  Expect<Tier2CompileResult>
+  compileRequest(uint32_t RootFuncIdx, Span<const uint32_t> Batch,
+                 Span<const uint32_t> LoopEntries, const AST::Module &Mod,
+                 unsigned OptLevel = 2);
 
 private:
   bool isShutdown() const noexcept {

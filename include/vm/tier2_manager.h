@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <set>
 #include <thread>
@@ -46,30 +47,26 @@ public:
   /// before _exit(0) to give the worker a chance to check Shutdown_.
   void shutdown() noexcept;
 
-  /// Enqueue a function for tier-2 recompilation.
-  /// Called from jit_tier_up_notify (JIT code context).
-  /// \param FuncIdx      The function that tripped the tier-up threshold.
-  /// \param Mod          Shared pointer to the full parsed AST::Module.
-  /// \param FuncTable    Shared pointer to the FuncTable array (for live
-  ///                     code swap).
-  /// \param CallCounters Read-only pointer to the tier-1 per-function call
-  ///                     counter array (from JitExecEnv). Used by the
-  ///                     walk-up phase to score ancestor warmth. May be
-  ///                     null; walk-up is skipped in that case.
+  /// Unified tier-2 enqueue. Called from both jit_tier_up_notify (call-
+  /// count trigger) and jit_osr_notify (back-edge trigger).
+  ///
+  /// \param FuncIdx       Triggering function. Anchor of the batch.
+  /// \param LoopIdx       Set when the trigger is a back-edge counter →
+  ///                      synthesize an OSR entry slot for this loop.
+  ///                      `std::nullopt` for a pure call-count trigger.
+  /// \param Mod           Shared pointer to the full parsed AST::Module.
+  /// \param FuncTable     Shared pointer to the FuncTable array (for live
+  ///                      code swap on call-count requests).
+  /// \param OsrEntryTable Required when LoopIdx is set; otherwise ignored.
+  /// \param CallCounters  Read-only pointer to the tier-1 per-function
+  ///                      call counter array. Walk-up uses it on call-
+  ///                      count triggers; OSR triggers ignore it.
   void enqueue(uint32_t FuncIdx,
+               std::optional<uint32_t> LoopIdx,
                std::shared_ptr<const AST::Module> Mod,
                std::shared_ptr<void *[]> FuncTable,
+               std::shared_ptr<void *[]> OsrEntryTable,
                const uint32_t *CallCounters) noexcept;
-
-  /// Enqueue an OSR (on-stack replacement) compilation request for a
-  /// (FuncIdx, LoopIdx) pair. Called from jit_osr_notify when a tier-1
-  /// loop's back-edge counter saturates. The worker compiles an OSR
-  /// entry point and writes its native address into
-  /// `OsrEntryTable[FuncIdx * OSR_MAX_LOOPS_PER_FUNC + LoopIdx]`.
-  void enqueueOsr(uint32_t FuncIdx, uint32_t LoopIdx,
-                  std::shared_ptr<const AST::Module> Mod,
-                  std::shared_ptr<void *[]> FuncTable,
-                  std::shared_ptr<void *[]> OsrEntryTable) noexcept;
 
   /// Number of functions successfully recompiled to tier-2.
   uint32_t tier2Count() const noexcept {
@@ -95,24 +92,21 @@ private:
 
   /// A batch request carries the fully-resolved set of funcIdxs to compile
   /// together. The worker does no further expansion.
+  ///
+  /// LoopEntries is the OSR overlay: when non-empty, the compiler also
+  /// appends one OSR function slot per loop index (whose body starts at
+  /// that loop's header) and writes the resulting native entries into
+  /// OsrEntryTable. When empty, it's a pure tier-2 function-entry batch
+  /// and OsrEntryTable is null.
   struct Request {
     uint32_t HotFuncIdx;        // function that tripped the threshold
     uint32_t RootFuncIdx;       // chosen batch anchor (may equal HotFuncIdx)
     uint32_t WalkupHops;        // telemetry
     std::vector<uint32_t> Batch;
+    std::vector<uint32_t> LoopEntries;
     std::shared_ptr<const AST::Module> Mod;
     std::shared_ptr<void *[]> FuncTable;
-  };
-
-  /// OSR-specific request. Compiled independently of the regular batch
-  /// path; lands the native entry pointer in OsrEntryTable instead of
-  /// FuncTable.
-  struct OsrRequest {
-    uint32_t FuncIdx;
-    uint32_t LoopIdx;
-    std::shared_ptr<const AST::Module> Mod;
-    std::shared_ptr<void *[]> FuncTable;
-    std::shared_ptr<void *[]> OsrEntryTable;
+    std::shared_ptr<void *[]> OsrEntryTable; // null when LoopEntries empty
   };
 
   void workerLoop();
@@ -133,19 +127,33 @@ private:
   /// frequency from the enclosing body is >= StaticFreqHot_ (catches
   /// siblings of the first-tripping function that haven't yet run).
   /// Ensures HotFuncIdx appears in the result. Caller must hold Mu_.
+  ///
+  /// \p SkipSeen bypasses the Seen_ membership filter so OSR callers can
+  /// collect an inlining neighborhood around an already-tier2'd function
+  /// (the running tier-1 frame still needs a loop-entry, regardless of
+  /// whether function-entry swap has happened).
   std::vector<uint32_t>
   bfsDownBatchLocked(const AST::Module &Mod, const ModuleCG &CG,
                      uint32_t Root, uint32_t HotFuncIdx,
                      uintptr_t FTKey,
-                     const uint32_t *CallCounters) noexcept;
+                     const uint32_t *CallCounters,
+                     bool SkipSeen = false) noexcept;
 
   std::thread Worker_;
   std::mutex Mu_;
   std::condition_variable CV_;
+  /// Tier-2 function-entry requests (call-count triggered).
   std::queue<Request> Queue_;
-  std::queue<OsrRequest> OsrQueue_;
+  /// OSR requests (back-edge triggered). Drained before Queue_ — OSR is
+  /// the only mechanism that can transfer a mid-execution frame into
+  /// tier-2, so delaying it behind a ~2s O2 batch can make the compile
+  /// arrive after the frame has returned (one-shot mains like
+  /// blind-sig, shootout-ctype, shootout-ed25519). Empirically required:
+  /// removing the priority regresses blind-sig 0.60× and ctype 0.70×.
+  std::queue<Request> OsrQueue_;
+  /// Dedup key for tier-2 function-entry batches: (FuncTablePtr, FuncIdx).
   std::set<std::pair<uintptr_t, uint32_t>> Seen_;
-  /// Dedup key for OSR compiles: (FuncTablePtr, FuncIdx<<16 | LoopIdx).
+  /// Dedup key for OSR compiles: (FuncTablePtr, FuncIdx<<32 | LoopIdx).
   /// Separate from Seen_ so regular tier-2 promotion and OSR compilation
   /// don't block each other.
   std::set<std::pair<uintptr_t, uint64_t>> SeenOsr_;

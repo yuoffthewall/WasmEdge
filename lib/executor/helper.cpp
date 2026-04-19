@@ -550,7 +550,8 @@ extern "C" void jit_tier_up_notify(WasmEdge::VM::JitExecEnv *env,
     auto FT = g_jitExecutor->getJitFuncTable(g_jitModInst);
     auto Mod = g_jitExecutor->getJitFullModule(g_jitModInst);
     if (FT && Mod) {
-      getTier2Manager()->enqueue(funcIdx, std::move(Mod), std::move(FT),
+      getTier2Manager()->enqueue(funcIdx, std::nullopt, std::move(Mod),
+                                 std::move(FT), nullptr,
                                  env->CallCounters);
     }
   }
@@ -575,8 +576,9 @@ extern "C" void jit_osr_notify(WasmEdge::VM::JitExecEnv *env,
     auto Mod = g_jitExecutor->getJitFullModule(g_jitModInst);
     auto OET = g_jitExecutor->getJitOsrEntryTable(g_jitModInst);
     if (FT && Mod && OET) {
-      getTier2Manager()->enqueueOsr(funcIdx, loopIdx, std::move(Mod),
-                                    std::move(FT), std::move(OET));
+      getTier2Manager()->enqueue(funcIdx, std::optional<uint32_t>(loopIdx),
+                                 std::move(Mod), std::move(FT),
+                                 std::move(OET), env->CallCounters);
     }
   }
 #endif

@@ -254,7 +254,8 @@ std::vector<uint32_t>
 Tier2Manager::bfsDownBatchLocked(const AST::Module &Mod, const ModuleCG &CG,
                                  uint32_t Root, uint32_t HotFuncIdx,
                                  uintptr_t FTKey,
-                                 const uint32_t *CallCounters) noexcept {
+                                 const uint32_t *CallCounters,
+                                 bool SkipSeen) noexcept {
   std::vector<uint32_t> Batch;
   Batch.reserve(MaxBatchSize_);
   std::unordered_set<uint32_t> InBatch;
@@ -266,7 +267,7 @@ Tier2Manager::bfsDownBatchLocked(const AST::Module &Mod, const ModuleCG &CG,
       return false;
     if (!isPromotable(Mod, F, CG.ImportFuncNum))
       return false;
-    if (Seen_.count(std::make_pair(FTKey, F)))
+    if (!SkipSeen && Seen_.count(std::make_pair(FTKey, F)))
       return false;
     Batch.push_back(F);
     InBatch.insert(F);
@@ -334,46 +335,86 @@ Tier2Manager::bfsDownBatchLocked(const AST::Module &Mod, const ModuleCG &CG,
 }
 
 void Tier2Manager::enqueue(uint32_t FuncIdx,
+                           std::optional<uint32_t> LoopIdx,
                            std::shared_ptr<const AST::Module> Mod,
                            std::shared_ptr<void *[]> FuncTable,
+                           std::shared_ptr<void *[]> OsrEntryTable,
                            const uint32_t *CallCounters) noexcept {
   if (!Mod || !FuncTable) {
     return;
   }
+  const bool IsOsr = LoopIdx.has_value();
+  if (IsOsr) {
+    if (!OsrEntryTable || *LoopIdx >= OSR_MAX_LOOPS_PER_FUNC) {
+      return;
+    }
+  }
+
   Request Req;
   {
     std::lock_guard<std::mutex> Lock(Mu_);
     const auto FTKey = reinterpret_cast<uintptr_t>(FuncTable.get());
-    if (Seen_.count(std::make_pair(FTKey, FuncIdx)))
-      return;
+
+    if (IsOsr) {
+      const uint64_t OsrKey =
+          (static_cast<uint64_t>(FuncIdx) << 32) | *LoopIdx;
+      if (SeenOsr_.count(std::make_pair(FTKey, OsrKey)))
+        return;
+      SeenOsr_.insert(std::make_pair(FTKey, OsrKey));
+      // Do NOT short-circuit when FuncIdx is already in Seen_: function-
+      // entry swap only redirects *future* calls. The currently-running
+      // tier-1 frame stays in the tier-1 body until the loop exits —
+      // exactly the case OSR exists to rescue.
+    } else {
+      if (Seen_.count(std::make_pair(FTKey, FuncIdx)))
+        return;
+    }
 
     const ModuleCG &CG = getOrBuildCGLocked(*Mod);
 
-    // The hot function itself must be scalar-promotable, otherwise we have
-    // nothing to compile. Mark it Seen_ so we never retry it.
     if (!isPromotable(*Mod, FuncIdx, CG.ImportFuncNum)) {
-      Seen_.insert(std::make_pair(FTKey, FuncIdx));
+      // Mark the call-count path as Seen_ so we never retry. OSR is gated
+      // by SeenOsr_ already, and emitFwdThunk would still bail at compile
+      // time on non-scalar signatures.
+      if (!IsOsr) {
+        Seen_.insert(std::make_pair(FTKey, FuncIdx));
+      }
       spdlog::debug("tier2: skip func {} (unsupported signature)", FuncIdx);
       return;
     }
 
-    auto [Root, Hops] =
-        walkUpRootLocked(*Mod, CG, FuncIdx, FTKey, CallCounters);
-    auto Batch =
-        bfsDownBatchLocked(*Mod, CG, Root, FuncIdx, FTKey, CallCounters);
+    uint32_t Root = FuncIdx;
+    uint32_t Hops = 0;
+    if (!IsOsr) {
+      std::tie(Root, Hops) =
+          walkUpRootLocked(*Mod, CG, FuncIdx, FTKey, CallCounters);
+    }
+
+    // OSR uses SkipSeen=true so already-tier2'd callees still appear in
+    // the inlining neighborhood (the running tier-1 frame needs the loop
+    // entry regardless of FuncTable swaps). CallCounters is passed for
+    // both triggers — by the time OSR fires (back-edge threshold reached)
+    // most loop-body callees already have non-zero counters, and the
+    // dynamic gate is what catches direct-call helpers whose static_freq
+    // is only 1 (e.g. shootout-ctype char-class predicates: dropping
+    // them from the OSR batch regressed ctype 0.71× vs the P1g baseline).
+    auto Batch = bfsDownBatchLocked(*Mod, CG, Root, FuncIdx, FTKey,
+                                    CallCounters,
+                                    /*SkipSeen=*/IsOsr);
     if (Batch.empty()) {
-      Seen_.insert(std::make_pair(FTKey, FuncIdx));
+      if (!IsOsr) {
+        Seen_.insert(std::make_pair(FTKey, FuncIdx));
+      }
       return;
     }
 
-    // Reserve every batch member against future tier-up triggers.
-    // This is the core anti-fragmentation mechanism: once a function
-    // neighborhood is captured in a batch, sibling leaf trips that
-    // would otherwise become singletons (with no callers to batch
-    // them with) are suppressed because the parent already pulled
-    // them in here.
-    for (uint32_t B : Batch) {
-      Seen_.insert(std::make_pair(FTKey, B));
+    if (!IsOsr) {
+      // Reserve every batch member against future tier-up triggers.
+      // Anti-fragmentation: once a neighborhood is captured, sibling
+      // leaf trips that would become singletons are suppressed.
+      for (uint32_t B : Batch) {
+        Seen_.insert(std::make_pair(FTKey, B));
+      }
     }
 
     Req.HotFuncIdx = FuncIdx;
@@ -382,48 +423,13 @@ void Tier2Manager::enqueue(uint32_t FuncIdx,
     Req.Batch = std::move(Batch);
     Req.Mod = std::move(Mod);
     Req.FuncTable = std::move(FuncTable);
-    Queue_.push(std::move(Req));
-  }
-  CV_.notify_one();
-}
-
-void Tier2Manager::enqueueOsr(
-    uint32_t FuncIdx, uint32_t LoopIdx,
-    std::shared_ptr<const AST::Module> Mod,
-    std::shared_ptr<void *[]> FuncTable,
-    std::shared_ptr<void *[]> OsrEntryTable) noexcept {
-  if (!Mod || !FuncTable || !OsrEntryTable) {
-    return;
-  }
-  if (LoopIdx >= OSR_MAX_LOOPS_PER_FUNC) {
-    return;
-  }
-  OsrRequest Req;
-  {
-    std::lock_guard<std::mutex> Lock(Mu_);
-    const auto FTKey = reinterpret_cast<uintptr_t>(FuncTable.get());
-    const uint64_t OsrKey =
-        (static_cast<uint64_t>(FuncIdx) << 32) | LoopIdx;
-    if (SeenOsr_.count(std::make_pair(FTKey, OsrKey)))
-      return;
-    SeenOsr_.insert(std::make_pair(FTKey, OsrKey));
-
-    // Do NOT short-circuit when the function is already in Seen_: function-
-    // entry swap only redirects *future* calls. The currently-running tier-1
-    // invocation stays in the tier-1 body until its loop exits — that is
-    // precisely the case OSR exists to rescue. The loss cluster (ctype,
-    // shootout-ed25519, blind-sig) is a one-shot caller with a long inner
-    // loop: by the time tier-2 has compiled the caller, the tier-1 frame
-    // is mid-loop and will never be re-called. Skipping OSR here would
-    // leave the in-flight invocation running tier-1 IR with OSR diamond
-    // overhead and no transition.
-
-    Req.FuncIdx = FuncIdx;
-    Req.LoopIdx = LoopIdx;
-    Req.Mod = std::move(Mod);
-    Req.FuncTable = std::move(FuncTable);
-    Req.OsrEntryTable = std::move(OsrEntryTable);
-    OsrQueue_.push(std::move(Req));
+    if (IsOsr) {
+      Req.LoopEntries = {*LoopIdx};
+      Req.OsrEntryTable = std::move(OsrEntryTable);
+      OsrQueue_.push(std::move(Req));
+    } else {
+      Queue_.push(std::move(Req));
+    }
   }
   CV_.notify_one();
 }
@@ -440,9 +446,6 @@ void Tier2Manager::workerLoop() {
 
   while (true) {
     Request Req;
-    OsrRequest OsrReq;
-    bool HaveBatch = false;
-    bool HaveOsr = false;
     {
       std::unique_lock<std::mutex> Lock(Mu_);
       CV_.wait(Lock, [this] {
@@ -453,18 +456,15 @@ void Tier2Manager::workerLoop() {
         WorkerDone_.store(true, std::memory_order_release);
         return;
       }
-      // OSR drains first: it's the only mechanism that can transfer a
-      // mid-execution frame into tier-2, so delaying it behind a ~2s O2
-      // batch can make the compile arrive after the frame has returned
-      // (one-shot mains like ed25519 `_start → f8`).
+      // OSR drains first; see header for rationale.
       if (!OsrQueue_.empty()) {
-        OsrReq = std::move(OsrQueue_.front());
+        Req = std::move(OsrQueue_.front());
         OsrQueue_.pop();
-        HaveOsr = true;
       } else if (!Queue_.empty()) {
         Req = std::move(Queue_.front());
         Queue_.pop();
-        HaveBatch = true;
+      } else {
+        continue;
       }
     }
 
@@ -475,42 +475,73 @@ void Tier2Manager::workerLoop() {
       return;
     }
 
-    if (HaveBatch) {
-      if (!Req.Mod || !Req.FuncTable || Req.Batch.empty())
-        continue;
+    if (!Req.Mod || !Req.FuncTable || Req.Batch.empty())
+      continue;
+    const bool IsOsr = !Req.LoopEntries.empty();
+    if (IsOsr && !Req.OsrEntryTable)
+      continue;
 
-      const AST::Module &Mod = *Req.Mod;
-      const auto FTKey = reinterpret_cast<uintptr_t>(Req.FuncTable.get());
+    const AST::Module &Mod = *Req.Mod;
+    const auto FTKey = reinterpret_cast<uintptr_t>(Req.FuncTable.get());
 
-      std::ostringstream Idxs;
-      for (size_t I = 0; I < Req.Batch.size(); ++I) {
-        if (I)
-          Idxs << ",";
-        Idxs << Req.Batch[I];
-      }
+    std::ostringstream Idxs;
+    for (size_t I = 0; I < Req.Batch.size(); ++I) {
+      if (I)
+        Idxs << ",";
+      Idxs << Req.Batch[I];
+    }
+    if (IsOsr) {
+      spdlog::info(
+          "tier2-osr: compile: root={} loop={} size={} [{}]",
+          Req.RootFuncIdx, Req.LoopEntries.front(),
+          Req.Batch.size(), Idxs.str());
+    } else {
       spdlog::info(
           "tier2: batch compile: root={} hot={} size={} walkup={} [{}]",
-          Req.RootFuncIdx, Req.HotFuncIdx, Req.Batch.size(), Req.WalkupHops,
-          Idxs.str());
+          Req.RootFuncIdx, Req.HotFuncIdx, Req.Batch.size(),
+          Req.WalkupHops, Idxs.str());
+      std::lock_guard<std::mutex> Lock(Mu_);
+      ++StatBatches_;
+      StatBatchMemberSum_ += Req.Batch.size();
+      if (Req.Batch.size() == 1)
+        ++StatSingletons_;
+      if (Req.WalkupHops > 0)
+        ++StatWalkupHits_;
+    }
 
-      {
-        std::lock_guard<std::mutex> Lock(Mu_);
-        ++StatBatches_;
-        StatBatchMemberSum_ += Req.Batch.size();
-        if (Req.Batch.size() == 1)
-          ++StatSingletons_;
-        if (Req.WalkupHops > 0)
-          ++StatWalkupHits_;
+    unsigned OptLevel = 2;
+    if (IsOsr) {
+      if (const char *E = ::getenv("WASMEDGE_OSR_OPT_LEVEL")) {
+        OptLevel = static_cast<unsigned>(std::atoi(E));
       }
+    }
 
-      auto BatchResult = Compiler.compileBatch(Req.Batch, Mod, 2);
-      if (!BatchResult) {
-        spdlog::warn("tier2: batch compile failed for func {}",
-                     Req.HotFuncIdx);
-        continue;
+    auto Result = Compiler.compileRequest(Req.RootFuncIdx, Req.Batch,
+                                          Req.LoopEntries, Mod, OptLevel);
+    if (!Result) {
+      spdlog::warn("tier2: compile failed for root func {}",
+                   Req.RootFuncIdx);
+      continue;
+    }
+
+    if (IsOsr) {
+      const uint32_t OsrFuncIdx = Req.RootFuncIdx;
+      for (auto &[L, Entry] : Result->OsrEntries) {
+        // Atomic store: tier-1 polls this slot every back-edge; the
+        // memory-order-release here pairs with the acquire load in
+        // emitLoopBackEdge().
+        auto *Slot = reinterpret_cast<std::atomic<void *> *>(
+            &Req.OsrEntryTable.get()[OsrFuncIdx *
+                                         OSR_MAX_LOOPS_PER_FUNC +
+                                     L]);
+        Slot->store(Entry, std::memory_order_release);
+        ++CompileCount;
+        spdlog::info("tier2-osr: entry installed: func={} loop={} ({:#x})",
+                     OsrFuncIdx, L,
+                     reinterpret_cast<uintptr_t>(Entry));
       }
-
-      for (auto &[FIdx, NativePtr] : *BatchResult) {
+    } else {
+      for (auto &[FIdx, NativePtr] : Result->FwdThunks) {
         {
           std::lock_guard<std::mutex> Lock(Mu_);
           Seen_.insert(std::make_pair(FTKey, FIdx));
@@ -521,39 +552,6 @@ void Tier2Manager::workerLoop() {
         spdlog::info("tier2: upgraded func {} → tier-2 ({:#x})", FIdx,
                      reinterpret_cast<uintptr_t>(NativePtr));
       }
-      continue;
-    }
-
-    if (HaveOsr) {
-      if (!OsrReq.Mod || !OsrReq.FuncTable || !OsrReq.OsrEntryTable)
-        continue;
-      spdlog::info("tier2: OSR compile: func={} loop={}", OsrReq.FuncIdx,
-                   OsrReq.LoopIdx);
-      unsigned OsrOpt = 2;
-      if (const char *E = ::getenv("WASMEDGE_OSR_OPT_LEVEL")) {
-        OsrOpt = static_cast<unsigned>(std::atoi(E));
-      }
-      auto OsrResult = Compiler.compileOsrEntry(OsrReq.FuncIdx,
-                                                OsrReq.LoopIdx,
-                                                *OsrReq.Mod, OsrOpt);
-      if (!OsrResult) {
-        spdlog::warn("tier2: OSR compile failed for func {} loop {}",
-                     OsrReq.FuncIdx, OsrReq.LoopIdx);
-        continue;
-      }
-      void *Entry = *OsrResult;
-      // Atomic store: the tier-1 IR polls this slot on each iteration
-      // and the memory-order-release here pairs with the memory-order-
-      // acquire load in emitLoopBackEdge().
-      auto *Slot = reinterpret_cast<std::atomic<void *> *>(
-          &OsrReq.OsrEntryTable.get()[OsrReq.FuncIdx *
-                                          OSR_MAX_LOOPS_PER_FUNC +
-                                      OsrReq.LoopIdx]);
-      Slot->store(Entry, std::memory_order_release);
-      ++CompileCount;
-      spdlog::info("tier2: OSR entry installed: func={} loop={} ({:#x})",
-                   OsrReq.FuncIdx, OsrReq.LoopIdx,
-                   reinterpret_cast<uintptr_t>(Entry));
     }
   }
 }

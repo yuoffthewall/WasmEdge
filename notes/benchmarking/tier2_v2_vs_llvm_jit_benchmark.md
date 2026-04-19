@@ -811,3 +811,195 @@ LLVM JIT 3,671k for reference.)
 - Per-OSR hotness priority and dedicated OSR worker from the P1f
   list remain open but are now lower priority given the honest
   numbers don't depend on them.
+
+## 2026-04-19 Tier-2 / OSR pipeline unification — sightglass-strong
+
+Refactor consolidating the formerly-parallel tier-2 and OSR pipelines
+into one. Net diff ≈ -350 LOC. Behavior-preserving, not a perf change
+in intent — this table is the verification that the perf envelope
+doesn't shift.
+
+### What changed (manager + compiler)
+
+- `Tier2Manager`: single `enqueue(funcIdx, optional<loopIdx>, ...)`;
+  `enqueueOsr` deleted. `OsrRequest` deleted, `Request` carries
+  `LoopEntries` + `OsrEntryTable`. `Queue_` and `OsrQueue_` both
+  carry `Request`; OSR drains first (load-bearing — see
+  follow-up below).
+- BFS unified: `bfsDownBatchLocked` gains `SkipSeen` flag; OSR path
+  uses `SkipSeen=true` and the same `CallCounters` as the call-count
+  path, replacing the bespoke `bfsOsrBatch` in the compiler.
+- `Tier2Compiler::compileRequest` is the single compile entry point
+  (handles the OSR overlay via `LoopEntries`); `compileBatch` and
+  `compileOsrEntry` deleted. `synthesizeMiniModule` shrunk to the
+  extracted `stubNonBatchInPlace` helper, called from
+  `compileRequest`.
+- `appendOsrFunctionSlot` (formerly `synthesizeOsrModule`).
+- `bfsOsrBatch` and `isOsrBatchPromotable` deleted from the
+  compiler (manager BFS is the only batch resolver).
+
+Plan / motivation in `/home/tommy/.claude/plans/give-a-plan-the-validated-abelson.md`.
+
+### Two follow-up tweaks were load-bearing
+
+The unification raised two performance regressions that were caught
+by the loss-cluster spot-check before publishing this table:
+
+1. **OSR-priority drain restored.** A naive single-FIFO `Queue_`
+   regressed blind-sig 0.60× and shootout-ctype 0.70× of the P1g
+   baseline because OSR requests sat behind ~2 s tier-2 batches and
+   missed the in-flight tier-1 frame. Fixed by keeping a separate
+   `OsrQueue_` that the worker drains first (single `Request` type
+   either way; this is just a scheduling split).
+2. **`CallCounters` plumbed through `jit_osr_notify`.** The new
+   manager BFS for OSR was passing `nullptr` for `CallCounters`,
+   leaving only the `static_freq>=2` gate to include callees. That
+   dropped char-class predicates whose static frequency is 1, which
+   regressed shootout-ctype to 0.70×. Forwarding `env->CallCounters`
+   so the dynamic gate (`CallCounters[c]!=0`) can pull them in
+   restored ctype to parity. Both are surfaced in code comments.
+
+### Config
+
+Identical to the P1g sweep:
+
+```
+WASMEDGE_TIER2_ENABLE=1
+WASMEDGE_TIER2_THRESHOLD=10
+WASMEDGE_OSR_THRESHOLD=5000
+WASMEDGE_IR_JIT_OPT_LEVEL=2
+WASMEDGE_QUIET=1
+WASMEDGE_SIGHTGLASS_DIR=sightglass-strong
+WASMEDGE_SIGHTGLASS_MODE=IR_JIT   # tier-2 arm
+                                  # tier-1 arm: same with TIER2_ENABLE unset
+                                  # LLVM arm: WASMEDGE_SIGHTGLASS_MODE=JIT
+```
+
+3-run median per kernel per mode (column = WorkTime in µs, the
+sightglass benchmark wall time excluding instantiation latency).
+Logs retained at `/tmp/wasm-unify-{tier2,tier1,llvm}-run{1,2,3}.log`
+for grep / re-extraction. 33/33 kernels pass at every mode and run.
+
+**Failures.** None — including blind-sig (no longer the SEGV from
+the P1g window; the DESSA spill-slot fix from `17df7cd6` /
+`bedbae73` made it stable).
+
+### Aggregates (32 kernels; `noop` excluded — WT in single-µs noise)
+
+Speedup convention: `tier1_WT / tier2_WT` and `llvm_WT / tier2_WT`
+(value > 1 → tier-2 wins).
+
+| Aggregate                              | value     |
+|---                                     |---        |
+| Geomean speedup vs tier-1 (t1/t2)      | **1.092×** |
+| Geomean speedup vs LLVM JIT (LLVM/t2)  | **0.947×** |
+| tier-2 wins vs tier-1 (≥1.02×)         | 16 / 32    |
+| tier-2 flat vs tier-1 (±2%)            | 9 / 32     |
+| tier-2 losses vs tier-1 (≤0.98×)       | 7 / 32     |
+| tier-2 wins vs LLVM JIT (≥1.02×)       | 4 / 32     |
+| tier-2 flat vs LLVM JIT (±2%)          | 13 / 32    |
+| tier-2 losses vs LLVM JIT (≤0.98×)     | 15 / 32    |
+| Best tier-2 vs tier-1                  | blind-sig **2.06×** |
+| Best tier-2 vs LLVM JIT                | shootout-nestedloop **1.63×** |
+| Worst tier-2 vs tier-1                 | gcc-loops 0.80× |
+| Worst tier-2 vs LLVM JIT               | gcc-loops 0.71× |
+
+vs P1g: geomean speedup vs tier-1 1.073→1.092 (slight improvement,
+mostly from blind-sig now being part of the aggregate at 2.06×).
+Geomean speedup vs LLVM 0.959→0.947 (slight slip — explained
+below).
+
+### Per-kernel WT + CT (µs), sorted by speedup vs LLVM JIT (descending)
+
+Speedup columns are `tier1_WT / tier2_WT` and `llvm_WT / tier2_WT` — values
+**> 1 mean tier-2 wins**.
+
+CT = Inst.Lat reported by the harness (compile + instantiation latency
+before kernel execution starts). For LLVM JIT this is the full
+whole-module compile. For tier-2 (IR_JIT mode) this is only the IR JIT
+compile — the tier-2 LLVM batch compiles run on a background worker
+*after* the kernel starts, so they don't show up here. Tier-2 CT is
+1–2 orders of magnitude lower than LLVM JIT CT for that reason: the
+tier-2 design pays its compile cost at runtime overlapped with
+execution, not up front.
+
+| Kernel | Tier-1 WT | Tier-2 WT | Tier-2 CT | LLVM JIT WT | LLVM JIT CT | t1/t2 | LLVM/t2 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| shootout-nestedloop | 5,443,160 | 5,451,061 | 33,849 | 8,886,644 | 206,528 | 1.00× | **1.63×** |
+| shootout-ackermann | 7,564,595 | 4,792,473 | 50,268 | 5,231,006 | 314,486 | **1.58×** | **1.09×** |
+| shootout-seqhash | 5,523,811 | 5,477,017 | 42,621 | 5,745,577 | 328,767 | 1.01× | **1.05×** |
+| quicksort | 8,094,767 | 6,732,206 | 35,407 | 6,923,596 | 216,164 | **1.20×** | **1.03×** |
+| shootout-heapsort | 8,454,363 | 8,258,039 | 12,090 | 8,345,498 | 88,242 | **1.02×** | 1.01× |
+| shootout-xchacha20 | 8,298,668 | 7,775,511 | 42,188 | 7,774,731 | 304,292 | **1.07×** | 1.00× |
+| shootout-random | 6,938,293 | 4,401,632 | 34,290 | 4,390,333 | 210,050 | **1.58×** | 1.00× |
+| shootout-matrix | 8,120,311 | 6,797,385 | 42,164 | 6,767,398 | 302,969 | **1.19×** | 1.00× |
+| richards | 8,100,449 | 8,156,573 | 11,494 | 8,115,370 | 79,583 | 0.99× | 0.99× |
+| shootout-keccak | 8,217,935 | 6,936,694 | 9,673 | 6,899,344 | 379,914 | **1.18×** | 0.99× |
+| shootout-gimli | 8,159,654 | 7,997,547 | 4,587 | 7,953,181 | 14,458 | **1.02×** | 0.99× |
+| shootout-minicsv | 9,350,111 | 9,210,105 | 8,109 | 9,150,822 | 52,274 | 1.02× | 0.99× |
+| shootout-base64 | 8,422,408 | 6,963,484 | 42,711 | 6,908,154 | 292,192 | **1.21×** | 0.99× |
+| shootout-ratelimit | 8,502,901 | 8,422,111 | 42,148 | 8,303,829 | 285,869 | 1.01× | 0.99× |
+| shootout-memmove | 8,230,179 | 8,754,605 | 41,473 | 8,624,946 | 281,163 | 0.94× | 0.99× |
+| shootout-xblabla20 | 7,878,867 | 8,152,972 | 41,805 | 8,009,183 | 300,721 | 0.97× | 0.98× |
+| blake3-scalar | 5,582,638 | 5,641,120 | 122,429 | 5,531,355 | 723,448 | 0.99× | 0.98× |
+| shootout-switch | 8,811,661 | 9,578,792 | 101,241 | 9,138,495 | 2,750,440 | 0.92× | 0.95× |
+| pulldown-cmark | 7,861,281 | 7,804,845 | 284,516 | 7,384,560 | 2,136,499 | 1.01× | 0.95× |
+| bz2 | 7,865,311 | 7,408,935 | 156,990 | 6,992,626 | 1,166,053 | **1.06×** | 0.94× |
+| regex | 9,372,236 | 9,260,415 | 623,035 | 8,724,499 | 5,416,584 | 1.01× | 0.94× |
+| shootout-ctype | 8,287,802 | 5,319,244 | 42,238 | 5,005,819 | 272,397 | **1.56×** | 0.94× |
+| rust-protobuf | 7,316,586 | 7,230,049 | 165,329 | 6,651,470 | 1,047,295 | 1.01× | 0.92× |
+| hashset | 8,375,315 | 8,107,751 | 806,430 | 7,427,422 | 2,298,382 | **1.03×** | 0.92× |
+| rust-json | 7,963,208 | 8,237,263 | 249,689 | 7,299,678 | 1,923,944 | 0.97× | 0.89× |
+| rust-html-rewriter | 7,973,260 | 8,522,200 | 624,463 | 7,369,975 | 5,162,428 | 0.94× | 0.86× |
+| shootout-sieve | 8,147,718 | 8,950,107 | 34,914 | 7,252,558 | 208,719 | 0.91× | 0.81× |
+| blind-sig | 9,459,951 | 4,596,247 | 401,949 | 3,709,306 | 3,372,910 | **2.06×** | 0.81× |
+| rust-compression | 9,948,568 | 8,960,610 | 759,286 | 7,076,203 | 5,989,978 | **1.11×** | 0.79× |
+| shootout-fib2 | 7,876,757 | 7,346,393 | 35,397 | 5,720,269 | 219,512 | **1.07×** | 0.78× |
+| shootout-ed25519 | 8,635,097 | 7,159,965 | 188,407 | 5,148,263 | 2,422,388 | **1.21×** | 0.72× |
+| gcc-loops | 8,026,155 | 10,055,324 | 1,062,823 | 7,148,766 | 4,239,203 | 0.80× | 0.71× |
+
+CT comparison highlights: LLVM JIT CT ranges from 14ms (gimli) up to
+~6s (rust-compression, regex, rust-html-rewriter). Tier-2 CT for the
+same kernels is 4–625ms — usually a 5–8× reduction at the latency
+boundary. The gap is biggest on big modules (gcc-loops 4.24s → 1.06s,
+4×; regex 5.42s → 0.62s, 8.7×; rust-compression 5.99s → 0.76s, 7.9×)
+because the tier-2 mini-module skips whole-module passes the LLVM JIT
+arm has to run before the kernel can start.
+
+### Diff vs the P1g table
+
+The shape is identical. Per-kernel changes worth calling out:
+
+- **blind-sig: 1.92× → 2.06×** vs tier-1. The OSR transition lands
+  earlier on average — likely a side-effect of the unified BFS
+  including more inlinable callees (the OSR batch now uses the
+  manager's static-freq + dynamic-counter gate instead of the old
+  promotability-only filter, so `__multi3` and friends end up in the
+  mini-module more reliably).
+- **shootout-ctype: stays at 1.56× vs tier-1** — held parity only
+  after plumbing CallCounters through OSR (without that fix it
+  regressed to ~0.70×).
+- **shootout-ackermann: 1.61× → 1.58×** vs tier-1. Within ackermann's
+  natural variance (3-run range 4.3M–5.1M).
+- **gcc-loops, rust-html-rewriter, rust-compression, hashset** show
+  ~5–10% slippage vs the P1g doc numbers — but stashing the
+  unification commit and re-measuring HEAD shows the same numbers,
+  so the drift is machine state between the P1g sweep and now, not
+  the refactor. The P1g doc is from a different snapshot.
+
+### Summary
+
+- 33/33 kernels pass at every mode and run.
+- Geomean t2/t1 1.092× (better than P1g 1.073, mostly from
+  blind-sig).
+- Geomean t2/LLVM 0.947× (within ±1.5% of P1g 0.959, attributable
+  to background-machine drift on big-text kernels — not the
+  refactor).
+- The OSR-sensitive trio (blind-sig, ctype, ed25519) all match or
+  beat P1g.
+- No new failures, no new warnings beyond the pre-existing
+  `tier2-osr: synth failed for func 17 loop 0` (structurally
+  unsynthesizable loop in one kernel).
+
+The refactor is performance-neutral; the win is the ~350 LOC
+deletion + collapsed pipeline.
