@@ -25,7 +25,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <deque>
 #include <string>
 #include <unordered_set>
 #include <utility>
@@ -121,20 +120,16 @@ const AST::FunctionType &getFuncType(const AST::Module &Mod, uint32_t FuncIdx,
   return TypeSec[TypeIdx].getCompositeType().getFuncType();
 }
 
-/// Build a synthetic mini AST::Module from \p Src that only keeps real
-/// bodies for functions in \p BatchSet. Every other defined function
-/// body is replaced with a minimal "push default returns; end" body,
-/// which type-checks against the function's own signature. We avoid the
-/// obvious `unreachable; end` stub because the LLVM frontend marks the
-/// resulting function `noreturn`, and any batch body calling it would
-/// be compiled under the assumption the call never returns — collapsing
-/// subsequent code paths into unreachable. We post-process the stub
-/// bodies of *referenced* non-batch functions in the LLVM module to
-/// become tier-2 → tier-1 thunks (see emitT1ThunkInPlace).
-AST::Module synthesizeMiniModule(const AST::Module &Src,
-                                 const std::unordered_set<uint32_t> &BatchSet,
-                                 uint32_t ImportFuncNum) {
-  AST::Module Mini(Src);
+/// Stub the body of every defined function in \p Mini whose module-wide
+/// index is NOT in \p BatchSet. The replacement body pushes the function's
+/// declared return values (default-constructed) and ends — type-checks
+/// against the original signature without forcing `noreturn` semantics
+/// (an `unreachable` stub would let LLVM infer noreturn and DCE batch
+/// callsites that follow). Referenced non-batch entries are rewritten to
+/// tier-2 → tier-1 t1_thunks after LLVM codegen.
+void stubNonBatchInPlace(AST::Module &Mini,
+                         const std::unordered_set<uint32_t> &BatchSet,
+                         uint32_t ImportFuncNum) {
   auto &CodeSec = Mini.getCodeSection().getContent();
   const auto &FuncSec = Mini.getFunctionSection().getContent();
   const auto &TypeSec = Mini.getTypeSection().getContent();
@@ -187,12 +182,6 @@ AST::Module synthesizeMiniModule(const AST::Module &Src,
     }
     Instrs.emplace_back(OpCode::End);
   }
-  // The batch bodies came from an already-validated parent module, and
-  // the stubbed non-batch bodies validate trivially via stack-polymorphic
-  // unreachable. Skip the expensive re-validation — Compiler::compile()
-  // only checks the flag.
-  Mini.setIsValidated(true);
-  return Mini;
 }
 
 /// Tier-1's `IR_FASTCALL_FUNC` direct-call convention (x86_64/aarch64 Linux
@@ -638,17 +627,17 @@ uint32_t findOsrLoopStart(const AST::CodeSegment &Seg,
 /// param count). Leaving FuncIdx alone lets the non-batch stubbing loop
 /// + emitT1ThunkInPlace route self-recursion back to tier-1.
 ///
-/// Every other defined function in the module gets the usual
-/// stack-polymorphic stub body; non-batch callees will be rewritten as
-/// tier-2 → tier-1 bridges by emitT1ThunkInPlace() after LLVM codegen.
+/// Caller is responsible for stubbing non-batch bodies (via
+/// synthesizeMiniModule) and rewriting them as tier-2 → tier-1 bridges
+/// (via emitT1ThunkInPlace) after LLVM codegen.
 ///
 /// Returns true on success, false if the target loop was not found, the
 /// enclosing scope chain contains an If (unsupported — would require
 /// mid-entering a then/else arm), or validation prerequisites are not met.
-bool synthesizeOsrModule(AST::Module &Mini, uint32_t FuncIdx,
-                          uint32_t LoopIdx,
-                          uint32_t ImportFuncNum,
-                          uint32_t &OsrFuncIdxOut) noexcept {
+bool appendOsrFunctionSlot(AST::Module &Mini, uint32_t FuncIdx,
+                           uint32_t LoopIdx,
+                           uint32_t ImportFuncNum,
+                           uint32_t &OsrFuncIdxOut) noexcept {
   if (FuncIdx < ImportFuncNum) {
     return false;
   }
@@ -818,120 +807,6 @@ bool synthesizeOsrModule(AST::Module &Mini, uint32_t FuncIdx,
 /// `call` targets that are (a) defined (not imports) and (b) not already
 /// in the batch. These are the non-batch functions for which we must
 /// emit tier-2 → tier-1 bridges.
-/// Scalar-only MVP promotion filter, mirroring the one used by the batch
-/// planner in Tier2Manager (see lib/vm/tier2_manager.cpp). Duplicated here
-/// because the compiler must make the same decision when expanding the OSR
-/// batch, and there is no cross-TU header for the manager's private helpers.
-/// Rejects: imports, multi-return functions, non-scalar param/ret types,
-/// and trap-stub bodies that start with `unreachable` (the frontend skips
-/// emitting `f<Idx>` for those, which would break emitFwdThunk lookup).
-bool isOsrBatchPromotable(const AST::Module &Mod, uint32_t FuncIdx,
-                           uint32_t ImportFuncNum) noexcept {
-  if (FuncIdx < ImportFuncNum) {
-    return false;
-  }
-  const auto &FuncSec = Mod.getFunctionSection().getContent();
-  const uint32_t DefinedIdx = FuncIdx - ImportFuncNum;
-  if (DefinedIdx >= FuncSec.size()) {
-    return false;
-  }
-  const uint32_t TypeIdx = FuncSec[DefinedIdx];
-  const auto &TypeSec = Mod.getTypeSection().getContent();
-  if (TypeIdx >= TypeSec.size()) {
-    return false;
-  }
-  const auto &CodeSec = Mod.getCodeSection().getContent();
-  if (DefinedIdx < CodeSec.size()) {
-    const auto Instrs = CodeSec[DefinedIdx].getExpr().getInstrs();
-    auto It = Instrs.begin();
-    if (It != Instrs.end() && It->getOpCode() == OpCode::Unreachable) {
-      return false;
-    }
-  }
-  const auto &FT = TypeSec[TypeIdx].getCompositeType().getFuncType();
-  if (FT.getReturnTypes().size() > 1) {
-    return false;
-  }
-  auto Marshalable = [](const ValType &VT) {
-    switch (VT.getCode()) {
-    case TypeCode::I32:
-    case TypeCode::I64:
-    case TypeCode::F32:
-    case TypeCode::F64:
-      return true;
-    default:
-      return false;
-    }
-  };
-  for (const auto &PT : FT.getParamTypes()) {
-    if (!Marshalable(PT))
-      return false;
-  }
-  for (const auto &RT : FT.getReturnTypes()) {
-    if (!Marshalable(RT))
-      return false;
-  }
-  return true;
-}
-
-/// BFS over direct `call` edges in \p Mod starting from \p Root, collecting
-/// promotable defined-function indices up to depth \p MaxDepth and cap
-/// \p MaxSize. Root is always included regardless of promotability (caller
-/// vets the root; for OSR, emitFwdThunk rejects non-scalar params at emit
-/// time and we surface that as a warn+bail). The returned set is used as
-/// the OSR batch: its members keep real bodies in the synthesized mini
-/// module, get marked internal+alwaysinline so O2 inlines helper calls
-/// into the OSR body, and are excluded from the t1_thunk rewrite pass.
-std::unordered_set<uint32_t>
-bfsOsrBatch(const AST::Module &Mod, uint32_t Root, uint32_t ImportFuncNum,
-             uint32_t MaxDepth, uint32_t MaxSize) noexcept {
-  std::unordered_set<uint32_t> Batch;
-  Batch.insert(Root);
-  const auto &CodeSec = Mod.getCodeSection().getContent();
-  std::deque<std::pair<uint32_t, uint32_t>> Frontier;
-  Frontier.push_back({Root, 0});
-  while (!Frontier.empty() && Batch.size() < MaxSize) {
-    auto [F, D] = Frontier.front();
-    Frontier.pop_front();
-    if (D >= MaxDepth) {
-      continue;
-    }
-    if (F < ImportFuncNum) {
-      continue;
-    }
-    const uint32_t DefinedIdx = F - ImportFuncNum;
-    if (DefinedIdx >= CodeSec.size()) {
-      continue;
-    }
-    const auto Instrs = CodeSec[DefinedIdx].getExpr().getInstrs();
-    std::unordered_set<uint32_t> LocalSeen;
-    for (auto It = Instrs.begin(); It != Instrs.end(); ++It) {
-      if (It->getOpCode() != OpCode::Call) {
-        continue;
-      }
-      const uint32_t Tgt = It->getTargetIndex();
-      if (Tgt < ImportFuncNum) {
-        continue;
-      }
-      if (Batch.count(Tgt)) {
-        continue;
-      }
-      if (!LocalSeen.insert(Tgt).second) {
-        continue;
-      }
-      if (!isOsrBatchPromotable(Mod, Tgt, ImportFuncNum)) {
-        continue;
-      }
-      if (Batch.size() >= MaxSize) {
-        break;
-      }
-      Batch.insert(Tgt);
-      Frontier.push_back({Tgt, D + 1});
-    }
-  }
-  return Batch;
-}
-
 std::vector<uint32_t>
 collectNonBatchCallees(const AST::Module &Mod,
                        const std::unordered_set<uint32_t> &BatchSet,
@@ -1016,11 +891,13 @@ Tier2Compiler::Tier2Compiler() noexcept : P(std::make_unique<Impl>()) {
 
 Tier2Compiler::~Tier2Compiler() noexcept = default;
 
-Expect<std::vector<std::pair<uint32_t, void *>>>
-Tier2Compiler::compileBatch(Span<const uint32_t> BatchIdx,
-                            const AST::Module &Mod, unsigned OptLevel) {
-  std::vector<std::pair<uint32_t, void *>> Result;
-  if (isShutdown() || BatchIdx.empty()) {
+Expect<Tier2CompileResult>
+Tier2Compiler::compileRequest(uint32_t RootFuncIdx,
+                              Span<const uint32_t> Batch,
+                              Span<const uint32_t> LoopEntries,
+                              const AST::Module &Mod, unsigned OptLevel) {
+  Tier2CompileResult Result;
+  if (isShutdown() || Batch.empty()) {
     return Result;
   }
 
@@ -1032,13 +909,67 @@ Tier2Compiler::compileBatch(Span<const uint32_t> BatchIdx,
     }
   }
 
-  std::unordered_set<uint32_t> BatchSet;
-  BatchSet.reserve(BatchIdx.size());
-  for (uint32_t F : BatchIdx) {
-    BatchSet.insert(F);
+  const bool HasOsr = !LoopEntries.empty();
+  if (HasOsr && RootFuncIdx < ImportFuncNum) {
+    spdlog::warn("tier2: OSR for func {} rejected (import index)",
+                 RootFuncIdx);
+    return Result;
   }
 
-  AST::Module Mini = synthesizeMiniModule(Mod, BatchSet, ImportFuncNum);
+  // Mini starts as a full copy. Append OSR slots first so they read the
+  // un-stubbed bodies of their root functions (the appended slot's body is
+  // a prefix of the original body). Each appended slot's funcIdx is
+  // assigned in the order pushed.
+  AST::Module Mini(Mod);
+  std::vector<std::pair<uint32_t, uint32_t>> OsrSlots; // (loopIdx, slotIdx)
+  if (HasOsr) {
+    OsrSlots.reserve(LoopEntries.size());
+    for (uint32_t L : LoopEntries) {
+      uint32_t Slot = UINT32_MAX;
+      if (!appendOsrFunctionSlot(Mini, RootFuncIdx, L, ImportFuncNum, Slot)) {
+        spdlog::warn("tier2-osr: synth failed for func {} loop {}",
+                     RootFuncIdx, L);
+        // Bail entirely — tier-2 batch will be re-requested on the next
+        // call-count trip if the regular path wants this neighborhood.
+        return Result;
+      }
+      OsrSlots.push_back({L, Slot});
+    }
+  }
+
+  // Effective batch set:
+  //   - Pure tier-2: every Batch member keeps real body and gets a fwd_thunk.
+  //   - OSR: drop RootFuncIdx so self-recursion in the OSR body validates
+  //     against the original signature and routes through a t1_thunk; add
+  //     each appended OSR slot so its body stays in the mini-module.
+  std::unordered_set<uint32_t> BatchSet;
+  BatchSet.reserve(Batch.size() + OsrSlots.size());
+  for (uint32_t F : Batch) {
+    if (HasOsr && F == RootFuncIdx)
+      continue;
+    BatchSet.insert(F);
+  }
+  for (const auto &[_, Slot] : OsrSlots) {
+    BatchSet.insert(Slot);
+  }
+
+  stubNonBatchInPlace(Mini, BatchSet, ImportFuncNum);
+
+  // OSR rewrites a function body (locals → params, enclosing Block chain
+  // synthesized) in a way that could fail validation if operand-stack
+  // balance diverges from the original. Validate so we surface a clean
+  // reject instead of an LLVM-backend assertion crash.
+  if (HasOsr) {
+    Configure ValConf;
+    Validator::Validator V(ValConf);
+    if (auto VR = V.validate(Mini); !VR) {
+      spdlog::warn(
+          "tier2-osr: validator rejected synthesized module (func {}): {}",
+          RootFuncIdx, ErrCodeStr[VR.error().getEnum()]);
+      return Result;
+    }
+  }
+  Mini.setIsValidated(true);
 
   if (isShutdown()) {
     return Result;
@@ -1066,8 +997,8 @@ Tier2Compiler::compileBatch(Span<const uint32_t> BatchIdx,
   LLVM::Compiler LC(Conf);
   auto CompRes = LC.compile(Mini);
   if (!CompRes) {
-    spdlog::warn("tier2: LLVM frontend compile failed (head func {})",
-                 BatchIdx.front());
+    spdlog::warn("tier2: LLVM frontend compile failed (root func {})",
+                 RootFuncIdx);
     return Result;
   }
 
@@ -1078,9 +1009,23 @@ Tier2Compiler::compileBatch(Span<const uint32_t> BatchIdx,
     return Result;
   }
 
-  for (uint32_t FuncIdx : BatchIdx) {
-    const auto &FT = getFuncType(Mod, FuncIdx, ImportFuncNum);
-    emitFwdThunk(LLMod, LLCtx, FuncIdx, FT, FuncIdx);
+  // Emit fwd_thunks. Two flavors:
+  //   - Pure tier-2: one per Batch member, ThunkIdx == CalleeIdx.
+  //   - OSR: one per appended slot, ThunkIdx = RootFuncIdx (so the tier-1
+  //     runtime finds it via the same lookup name), CalleeIdx = OsrSlot.
+  //     Single-loop requests are the only supported shape today; multi-
+  //     loop in one Request would collide on `f<RootFuncIdx>_fwd_thunk`.
+  if (HasOsr) {
+    for (const auto &[L, Slot] : OsrSlots) {
+      const auto &OsrFT = getFuncType(Mini, Slot, ImportFuncNum);
+      emitFwdThunk(LLMod, LLCtx, RootFuncIdx, OsrFT, Slot);
+      (void)L;
+    }
+  } else {
+    for (uint32_t FuncIdx : Batch) {
+      const auto &FT = getFuncType(Mod, FuncIdx, ImportFuncNum);
+      emitFwdThunk(LLMod, LLCtx, FuncIdx, FT, FuncIdx);
+    }
   }
 
   // Replace the stub body of every non-batch defined function that is
@@ -1089,8 +1034,11 @@ Tier2Compiler::compileBatch(Span<const uint32_t> BatchIdx,
   // batch would execute a `[const, end]` stub and silently drop the
   // call, corrupting the caller's logical state.
   const auto NonBatchCallees =
-      collectNonBatchCallees(Mod, BatchSet, ImportFuncNum);
+      collectNonBatchCallees(Mini, BatchSet, ImportFuncNum);
   for (uint32_t CalleeIdx : NonBatchCallees) {
+    // Use the ORIGINAL module's FuncType — Mini's stubbed bodies keep the
+    // original signature, and t1_thunks dispatch by funcIdx at runtime
+    // against the tier-1 FuncTable which uses the original types.
     const auto &FT = getFuncType(Mod, CalleeIdx, ImportFuncNum);
     emitT1ThunkInPlace(LLMod, LLCtx, CalleeIdx, FT);
   }
@@ -1106,8 +1054,8 @@ Tier2Compiler::compileBatch(Span<const uint32_t> BatchIdx,
   // calls between batch members are then judged by the normal cost model
   // — which correctly declines to inline e.g. a 26k-line f8 at 805 call
   // sites of __multi3, the explosion we hit under `alwaysinline`.
-  for (uint32_t FuncIdx : BatchIdx) {
-    std::string Name = "f" + std::to_string(FuncIdx);
+  for (uint32_t BIdx : BatchSet) {
+    std::string Name = "f" + std::to_string(BIdx);
     LLVMValueRef Fn = LLVMGetNamedFunction(LLMod, Name.c_str());
     if (!Fn)
       continue;
@@ -1119,8 +1067,6 @@ Tier2Compiler::compileBatch(Span<const uint32_t> BatchIdx,
   // Run LLVM opt on the post-processed module now that all thunks and
   // stub rewrites are in place. The WasmEdge frontend was invoked at O0,
   // so call sites to non-batch stubs (now t1_thunks) are still intact.
-  // Opt here is free to inline t1_thunks where profitable, and batch
-  // functions (now alwaysinline) get merged into their fwd_thunks.
   if (P->TM && OptLevel > 0) {
     const char *Pipeline = OptLevel >= 3 ? "default<O3>"
                             : OptLevel == 2 ? "default<O2>"
@@ -1140,7 +1086,12 @@ Tier2Compiler::compileBatch(Span<const uint32_t> BatchIdx,
     if (!Path.empty() && Path.back() != '/') {
       Path.push_back('/');
     }
-    Path += "tier2_f" + std::to_string(BatchIdx.front()) + ".ll";
+    if (HasOsr) {
+      Path += "tier2_osr_f" + std::to_string(RootFuncIdx) + "_l" +
+              std::to_string(OsrSlots.front().first) + ".ll";
+    } else {
+      Path += "tier2_f" + std::to_string(RootFuncIdx) + ".ll";
+    }
     char *Err = nullptr;
     if (LLVMPrintModuleToFile(LLMod, Path.c_str(), &Err)) {
       spdlog::warn("tier2: dump module to {} failed: {}", Path,
@@ -1179,11 +1130,6 @@ Tier2Compiler::compileBatch(Span<const uint32_t> BatchIdx,
   LLVMOrcJITDylibRef MainJD = LLVMOrcLLJITGetMainJITDylib(JIT);
   LLVMOrcExecutionSessionRef ES = LLVMOrcLLJITGetExecutionSession(JIT);
 
-  // Define tier-2 helpers as absolute symbols:
-  //   - wasmedge_tier2_trace_thunk: debug trace for thunk entry.
-  // Note: wasmedge_tier2_get_jit_env and wasmedge_tier2_get_exec_ctx were
-  // removed — both t1_thunks and fwd_thunks now compute their TLS values
-  // directly via inline asm (%fs:OFFSET).
   {
     LLVMOrcCSymbolMapPair Pairs[1];
     Pairs[0].Name =
@@ -1207,9 +1153,6 @@ Tier2Compiler::compileBatch(Span<const uint32_t> BatchIdx,
     }
   }
 
-  // Hand the module to ORC. addLLVMIRModule takes ownership of the
-  // ThreadSafeModule (which shares ownership of TSCtx). We still own our
-  // TSCtx handle and dispose it at the end.
   LLVMOrcThreadSafeModuleRef TSM =
       LLVMOrcCreateNewThreadSafeModule(OwnedMod, TSCtx);
   OwnedMod = nullptr; // TSM owns the module now.
@@ -1222,11 +1165,7 @@ Tier2Compiler::compileBatch(Span<const uint32_t> BatchIdx,
     return Result;
   }
 
-  // Look up `intrinsics` global and install &Executor::Intrinsics. The
-  // LLVM frontend emits `intrinsics` as a mutable external global (see
-  // lib/llvm/compiler.cpp:5981 — set null initializer, globalConstant=false).
-  // At runtime the loader writes the real intrinsics table address into
-  // the global's storage. Tier-2 must do the same.
+  // Install intrinsics table.
   {
     LLVMOrcJITTargetAddress Addr = 0;
     if (LLVMErrorRef Err = LLVMOrcLLJITLookup(JIT, &Addr, "intrinsics")) {
@@ -1243,22 +1182,43 @@ Tier2Compiler::compileBatch(Span<const uint32_t> BatchIdx,
     *Slot = &Executor::Executor::Intrinsics;
   }
 
-  // Look up each batch fwd_thunk address for atomic FuncTable swap.
-  Result.reserve(BatchIdx.size());
-  for (uint32_t FuncIdx : BatchIdx) {
+  // Look up emitted thunk addresses.
+  if (HasOsr) {
     const std::string ThunkName =
-        "f" + std::to_string(FuncIdx) + "_fwd_thunk";
+        "f" + std::to_string(RootFuncIdx) + "_fwd_thunk";
     LLVMOrcJITTargetAddress Addr = 0;
     if (LLVMErrorRef Err =
             LLVMOrcLLJITLookup(JIT, &Addr, ThunkName.c_str())) {
       char *Msg = LLVMGetErrorMessage(Err);
-      spdlog::warn("tier2: lookup {} failed: {}", ThunkName,
+      spdlog::warn("tier2-osr: lookup {} failed: {}", ThunkName,
                    Msg ? Msg : "(null)");
       LLVMDisposeErrorMessage(Msg);
-      continue;
+      LLVMOrcDisposeLLJIT(JIT);
+      LLVMOrcDisposeThreadSafeContext(TSCtx);
+      return Result;
     }
-    Result.emplace_back(FuncIdx,
-                        reinterpret_cast<void *>(static_cast<uintptr_t>(Addr)));
+    void *Entry = reinterpret_cast<void *>(static_cast<uintptr_t>(Addr));
+    Result.OsrEntries.reserve(OsrSlots.size());
+    for (const auto &[L, _] : OsrSlots) {
+      Result.OsrEntries.emplace_back(L, Entry);
+    }
+  } else {
+    Result.FwdThunks.reserve(Batch.size());
+    for (uint32_t FuncIdx : Batch) {
+      const std::string ThunkName =
+          "f" + std::to_string(FuncIdx) + "_fwd_thunk";
+      LLVMOrcJITTargetAddress Addr = 0;
+      if (LLVMErrorRef Err =
+              LLVMOrcLLJITLookup(JIT, &Addr, ThunkName.c_str())) {
+        char *Msg = LLVMGetErrorMessage(Err);
+        spdlog::warn("tier2: lookup {} failed: {}", ThunkName,
+                     Msg ? Msg : "(null)");
+        LLVMDisposeErrorMessage(Msg);
+        continue;
+      }
+      Result.FwdThunks.emplace_back(
+          FuncIdx, reinterpret_cast<void *>(static_cast<uintptr_t>(Addr)));
+    }
   }
 
   // Retain the JIT for the lifetime of this Tier2Compiler — the code
@@ -1266,349 +1226,14 @@ Tier2Compiler::compileBatch(Span<const uint32_t> BatchIdx,
   P->JITs.push_back(JIT);
   LLVMOrcDisposeThreadSafeContext(TSCtx);
 
-  spdlog::info("tier2: step-5 ORC done for func {} (emitted {} thunks)",
-               BatchIdx.front(), Result.size());
+  if (HasOsr) {
+    spdlog::info("tier2-osr: ORC done for func {} (entries {})", RootFuncIdx,
+                 Result.OsrEntries.size());
+  } else {
+    spdlog::info("tier2: ORC done for func {} (emitted {} thunks)",
+                 RootFuncIdx, Result.FwdThunks.size());
+  }
   return Result;
-}
-
-Expect<void *>
-Tier2Compiler::compileOsrEntry(uint32_t FuncIdx, uint32_t LoopIdx,
-                                const AST::Module &Mod, unsigned OptLevel) {
-  if (isShutdown()) {
-    return nullptr;
-  }
-
-  uint32_t ImportFuncNum = 0;
-  for (const auto &ImpDesc : Mod.getImportSection().getContent()) {
-    if (ImpDesc.getExternalType() == ExternalType::Function) {
-      ++ImportFuncNum;
-    }
-  }
-  if (FuncIdx < ImportFuncNum) {
-    spdlog::warn("tier2-osr: func {} is an import; cannot OSR", FuncIdx);
-    return nullptr;
-  }
-
-  // Start from a copy of the module so we can surgically rewrite the OSR
-  // function without mutating the shared parsed module.
-  AST::Module Mini(Mod);
-
-  // Append the synthesized OSR body as a new function slot. Leaves the
-  // original function at FuncIdx untouched so in-body `call FuncIdx`
-  // (self-recursion) validates against the original signature and is
-  // routed back to tier-1 through a t1_thunk.
-  uint32_t OsrFuncIdx = UINT32_MAX;
-  if (!synthesizeOsrModule(Mini, FuncIdx, LoopIdx, ImportFuncNum,
-                            OsrFuncIdx)) {
-    spdlog::warn("tier2-osr: synth failed for func {} loop {}", FuncIdx,
-                 LoopIdx);
-    return nullptr;
-  }
-
-  // Expand the batch BFS-style from the OSR body: pull in its direct
-  // (and, up to MaxDepth, transitive) promotable callees so their real
-  // bodies stay in the mini-module. Without this the OSR function is a
-  // singleton and every helper call becomes an indirect FuncTable
-  // dispatch through a t1_thunk — LLVM can't see past the function
-  // pointer, so tight helpers (char-class predicates in shootout-ctype,
-  // 25519 field-arithmetic in shootout-ed25519) never get inlined into
-  // the hot loop. Mirrors the regular batch path's inlining recipe.
-  constexpr uint32_t OsrBatchMaxDepth = 2;
-  constexpr uint32_t OsrBatchMaxSize = 12;
-  std::unordered_set<uint32_t> BatchSet =
-      bfsOsrBatch(Mini, OsrFuncIdx, ImportFuncNum, OsrBatchMaxDepth,
-                   OsrBatchMaxSize);
-  // If the OSR body self-recurses the BFS would pull the original func
-  // into the batch, re-triggering the same type-mismatch trap we just
-  // avoided (its body still contains `call FuncIdx`). Keep it stubbed so
-  // emitT1ThunkInPlace routes self-recursion back to tier-1.
-  BatchSet.erase(FuncIdx);
-  if (BatchSet.size() > 1) {
-    spdlog::info("tier2-osr: batch expanded to {} funcs (root f{} osr f{})",
-                 BatchSet.size(), FuncIdx, OsrFuncIdx);
-  }
-  {
-    auto &CodeSec = Mini.getCodeSection().getContent();
-    const auto &FuncSec = Mini.getFunctionSection().getContent();
-    const auto &TypeSec = Mini.getTypeSection().getContent();
-    for (size_t I = 0; I < CodeSec.size(); ++I) {
-      const uint32_t Idx = ImportFuncNum + static_cast<uint32_t>(I);
-      if (BatchSet.count(Idx))
-        continue;
-      auto &Seg = CodeSec[I];
-      Seg.getLocals().clear();
-      auto &Instrs = Seg.getExpr().getInstrs();
-      Instrs.clear();
-      const uint32_t TypeIdx = FuncSec[I];
-      const auto &FT = TypeSec[TypeIdx].getCompositeType().getFuncType();
-      for (const auto &RT : FT.getReturnTypes()) {
-        switch (RT.getCode()) {
-        case TypeCode::I32: {
-          AST::Instruction Inst(OpCode::I32__const);
-          Inst.setNum(static_cast<uint32_t>(0));
-          Instrs.push_back(Inst);
-          break;
-        }
-        case TypeCode::I64: {
-          AST::Instruction Inst(OpCode::I64__const);
-          Inst.setNum(static_cast<uint64_t>(0));
-          Instrs.push_back(Inst);
-          break;
-        }
-        case TypeCode::F32: {
-          AST::Instruction Inst(OpCode::F32__const);
-          Inst.setNum(0.0f);
-          Instrs.push_back(Inst);
-          break;
-        }
-        case TypeCode::F64: {
-          AST::Instruction Inst(OpCode::F64__const);
-          Inst.setNum(0.0);
-          Instrs.push_back(Inst);
-          break;
-        }
-        default:
-          Instrs.emplace_back(OpCode::Unreachable);
-          break;
-        }
-      }
-      Instrs.emplace_back(OpCode::End);
-    }
-  }
-  // Unlike the regular batch path, the OSR body is a genuine rewrite of
-  // the function body (locals flattened to params, enclosing Block chain
-  // synthesized). The stubbed non-OSR bodies validate trivially, but the
-  // OSR body itself could fail validation if its operand stack balance
-  // diverges from the original (e.g. the original pushed values before
-  // the Loop that get popped after it — OSR can't reconstruct those).
-  // Run the validator so we catch such cases as a clean reject rather
-  // than an LLVM-backend assertion crash.
-  {
-    Configure ValConf;
-    Validator::Validator V(ValConf);
-    if (auto VR = V.validate(Mini); !VR) {
-      spdlog::warn(
-          "tier2-osr: validator rejected synthesized module "
-          "(func {} loop {}): {}",
-          FuncIdx, LoopIdx, ErrCodeStr[VR.error().getEnum()]);
-      return nullptr;
-    }
-  }
-  Mini.setIsValidated(true);
-
-  if (isShutdown()) {
-    return nullptr;
-  }
-
-  // Compile the synthesized module.
-  Configure Conf;
-  Conf.getCompilerConfigure().setOptimizationLevel(
-      CompilerConfigure::OptimizationLevel::O0);
-  Conf.getCompilerConfigure().setInterruptible(false);
-  Conf.getCompilerConfigure().setGenericBinary(false);
-  Conf.getStatisticsConfigure().setInstructionCounting(false);
-  Conf.getStatisticsConfigure().setCostMeasuring(false);
-  Conf.getStatisticsConfigure().setTimeMeasuring(false);
-
-  LLVM::Compiler LC(Conf);
-  auto CompRes = LC.compile(Mini);
-  if (!CompRes) {
-    spdlog::warn("tier2-osr: frontend compile failed (func {} loop {})",
-                 FuncIdx, LoopIdx);
-    return nullptr;
-  }
-  LLVMModuleRef LLMod = CompRes->getModuleRef();
-  LLVMContextRef LLCtx = CompRes->getContextRef();
-  if (!LLMod || !LLCtx) {
-    spdlog::error("tier2-osr: compiled Data has no LLVM module/context");
-    return nullptr;
-  }
-
-  // Build the OSR function type (must reflect the rewritten signature:
-  // (all locals as params) -> original return). Read from Mini since
-  // that's the source of truth for the new OSR slot's type index.
-  const uint32_t OsrDefinedIdx = OsrFuncIdx - ImportFuncNum;
-  const uint32_t NewTypeIdx =
-      Mini.getFunctionSection().getContent()[OsrDefinedIdx];
-  const auto &OsrFT =
-      Mini.getTypeSection().getContent()[NewTypeIdx].getCompositeType()
-          .getFuncType();
-
-  // Reuse emitFwdThunk: it generates a tier-1 ABI entry
-  // `f<FuncIdx>_fwd_thunk(JitExecEnv*, uint64_t* args)` that unmarshals
-  // args[] into the LLVM function's native param types. Because the OSR
-  // function's params are all wasm locals and the OsrLocalsFrame is laid
-  // out exactly the same way, the locals buffer passed by tier-1 can be
-  // treated as an args[] buffer for ABI purposes. The thunk name keys off
-  // the original FuncIdx (so the tier-1 runtime finds it) but invokes
-  // the new OSR slot.
-  emitFwdThunk(LLMod, LLCtx, FuncIdx, OsrFT, OsrFuncIdx);
-
-  // Rewrite every non-OSR defined function referenced by the OSR body
-  // as a tier-2 → tier-1 dispatch bridge. This is the OSR equivalent of
-  // t1_thunks in a regular batch.
-  const auto NonBatchCallees =
-      collectNonBatchCallees(Mini, BatchSet, ImportFuncNum);
-  for (uint32_t CalleeIdx : NonBatchCallees) {
-    // Use the ORIGINAL module's FuncType — Mini's stubbed bodies keep
-    // the original signature, and t1_thunks dispatch by funcIdx at
-    // runtime against the tier-1 FuncTable which uses the original types.
-    const auto &FT = getFuncType(Mod, CalleeIdx, ImportFuncNum);
-    emitT1ThunkInPlace(LLMod, LLCtx, CalleeIdx, FT);
-  }
-  if (!NonBatchCallees.empty()) {
-    spdlog::debug("tier2-osr: rewrote {} non-batch stubs as t1_thunks",
-                  NonBatchCallees.size());
-  }
-
-  // Demote batch members to internal linkage so O2's inliner is allowed
-  // to fold them. The OSR fwd_thunk's single call to `f<FuncIdx>` is
-  // inlined by the single-callsite bonus; cross-body inlines inside the
-  // batch are judged by the cost model. Using `alwaysinline` here is
-  // what caused the ed25519 blow-up (805× __multi3 + 60× fe25519_mul
-  // unconditionally inlined into f8's 26k-line body). Callees outside
-  // the batch remain reached via t1_thunks (FuncTable dispatch) —
-  // opaque to LLVM and left as indirect calls.
-  for (uint32_t BIdx : BatchSet) {
-    std::string Name = "f" + std::to_string(BIdx);
-    LLVMValueRef Fn = LLVMGetNamedFunction(LLMod, Name.c_str());
-    if (!Fn) {
-      continue;
-    }
-    LLVMSetLinkage(Fn, LLVMInternalLinkage);
-    LLVMSetVisibility(Fn, LLVMDefaultVisibility);
-    LLVMSetDLLStorageClass(Fn, LLVMDefaultStorageClass);
-  }
-
-  if (P->TM && OptLevel > 0) {
-    const char *Pipeline = OptLevel >= 3 ? "default<O3>"
-                            : OptLevel == 2 ? "default<O2>"
-                                             : "default<O1>";
-    LLVMPassBuilderOptionsRef PBO = LLVMCreatePassBuilderOptions();
-    if (LLVMErrorRef Err = LLVMRunPasses(LLMod, Pipeline, P->TM, PBO)) {
-      char *Msg = LLVMGetErrorMessage(Err);
-      spdlog::warn("tier2-osr: post-opt pipeline failed: {}",
-                   Msg ? Msg : "(null)");
-      LLVMDisposeErrorMessage(Msg);
-    }
-    LLVMDisposePassBuilderOptions(PBO);
-  }
-
-  if (const char *DumpDir = ::getenv("WASMEDGE_TIER2_DUMP_IR")) {
-    std::string Path = std::string(DumpDir);
-    if (!Path.empty() && Path.back() != '/') {
-      Path.push_back('/');
-    }
-    Path += "tier2_osr_f" + std::to_string(FuncIdx) + "_l" +
-            std::to_string(LoopIdx) + ".ll";
-    char *Err = nullptr;
-    if (LLVMPrintModuleToFile(LLMod, Path.c_str(), &Err)) {
-      spdlog::warn("tier2-osr: dump module to {} failed: {}", Path,
-                   Err ? Err : "(null)");
-      LLVMDisposeMessage(Err);
-    } else {
-      spdlog::info("tier2-osr: dumped module to {}", Path);
-    }
-  }
-
-  LLVMModuleRef OwnedMod = CompRes->releaseModule();
-  LLVMOrcThreadSafeContextRef TSCtx = CompRes->releaseTSContext();
-  if (!OwnedMod || !TSCtx) {
-    spdlog::error("tier2-osr: failed to release module/TSContext");
-    if (OwnedMod)
-      LLVMDisposeModule(OwnedMod);
-    if (TSCtx)
-      LLVMOrcDisposeThreadSafeContext(TSCtx);
-    return nullptr;
-  }
-
-  LLVMOrcLLJITBuilderRef Builder = LLVMOrcCreateLLJITBuilder();
-  LLVMOrcLLJITRef JIT = nullptr;
-  if (LLVMErrorRef Err = LLVMOrcCreateLLJIT(&JIT, Builder)) {
-    char *Msg = LLVMGetErrorMessage(Err);
-    spdlog::error("tier2-osr: LLVMOrcCreateLLJIT failed: {}",
-                  Msg ? Msg : "(null)");
-    LLVMDisposeErrorMessage(Msg);
-    LLVMDisposeModule(OwnedMod);
-    LLVMOrcDisposeThreadSafeContext(TSCtx);
-    return nullptr;
-  }
-
-  LLVMOrcJITDylibRef MainJD = LLVMOrcLLJITGetMainJITDylib(JIT);
-  LLVMOrcExecutionSessionRef ES = LLVMOrcLLJITGetExecutionSession(JIT);
-  {
-    LLVMOrcCSymbolMapPair Pairs[1];
-    Pairs[0].Name =
-        LLVMOrcExecutionSessionIntern(ES, "wasmedge_tier2_trace_thunk");
-    Pairs[0].Sym.Address = reinterpret_cast<LLVMOrcJITTargetAddress>(
-        reinterpret_cast<void *>(&wasmedge_tier2_trace_thunk));
-    Pairs[0].Sym.Flags.GenericFlags =
-        LLVMJITSymbolGenericFlagsExported | LLVMJITSymbolGenericFlagsCallable;
-    Pairs[0].Sym.Flags.TargetFlags = 0;
-    LLVMOrcMaterializationUnitRef MU = LLVMOrcAbsoluteSymbols(Pairs, 1);
-    if (LLVMErrorRef Err = LLVMOrcJITDylibDefine(MainJD, MU)) {
-      char *Msg = LLVMGetErrorMessage(Err);
-      spdlog::error("tier2-osr: define absolute symbols failed: {}",
-                    Msg ? Msg : "(null)");
-      LLVMDisposeErrorMessage(Msg);
-      LLVMOrcDisposeLLJIT(JIT);
-      LLVMDisposeModule(OwnedMod);
-      LLVMOrcDisposeThreadSafeContext(TSCtx);
-      return nullptr;
-    }
-  }
-
-  LLVMOrcThreadSafeModuleRef TSM =
-      LLVMOrcCreateNewThreadSafeModule(OwnedMod, TSCtx);
-  OwnedMod = nullptr;
-  if (LLVMErrorRef Err = LLVMOrcLLJITAddLLVMIRModule(JIT, MainJD, TSM)) {
-    char *Msg = LLVMGetErrorMessage(Err);
-    spdlog::error("tier2-osr: addLLVMIRModule failed: {}",
-                  Msg ? Msg : "(null)");
-    LLVMDisposeErrorMessage(Msg);
-    LLVMOrcDisposeLLJIT(JIT);
-    LLVMOrcDisposeThreadSafeContext(TSCtx);
-    return nullptr;
-  }
-
-  // Install intrinsics table.
-  {
-    LLVMOrcJITTargetAddress Addr = 0;
-    if (LLVMErrorRef Err = LLVMOrcLLJITLookup(JIT, &Addr, "intrinsics")) {
-      char *Msg = LLVMGetErrorMessage(Err);
-      spdlog::error("tier2-osr: lookup `intrinsics` failed: {}",
-                    Msg ? Msg : "(null)");
-      LLVMDisposeErrorMessage(Msg);
-      LLVMOrcDisposeLLJIT(JIT);
-      LLVMOrcDisposeThreadSafeContext(TSCtx);
-      return nullptr;
-    }
-    auto **Slot = reinterpret_cast<const Executable::IntrinsicsTable **>(
-        static_cast<uintptr_t>(Addr));
-    *Slot = &Executor::Executor::Intrinsics;
-  }
-
-  // Look up the OSR entry address (same `f<FuncIdx>_fwd_thunk` name the
-  // batch path uses — OSR reuses the tier-1 ABI).
-  const std::string ThunkName = "f" + std::to_string(FuncIdx) + "_fwd_thunk";
-  LLVMOrcJITTargetAddress Addr = 0;
-  if (LLVMErrorRef Err = LLVMOrcLLJITLookup(JIT, &Addr, ThunkName.c_str())) {
-    char *Msg = LLVMGetErrorMessage(Err);
-    spdlog::warn("tier2-osr: lookup {} failed: {}", ThunkName,
-                 Msg ? Msg : "(null)");
-    LLVMDisposeErrorMessage(Msg);
-    LLVMOrcDisposeLLJIT(JIT);
-    LLVMOrcDisposeThreadSafeContext(TSCtx);
-    return nullptr;
-  }
-
-  P->JITs.push_back(JIT);
-  LLVMOrcDisposeThreadSafeContext(TSCtx);
-
-  void *Entry = reinterpret_cast<void *>(static_cast<uintptr_t>(Addr));
-  spdlog::info("tier2-osr: compiled func {} loop {} → {:#x}", FuncIdx,
-               LoopIdx, reinterpret_cast<uintptr_t>(Entry));
-  return Entry;
 }
 
 namespace {
