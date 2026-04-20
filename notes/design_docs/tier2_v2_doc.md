@@ -422,38 +422,25 @@ reverse edges for walk-up).
 ### 1. `walkUpRootLocked` — pick the batch anchor
 
 Starting from `HotFuncIdx` (the leaf that tripped the counter), walk up
-the reverse call graph to the hottest ancestor that passes the ratio
-gate. Bounded by `WalkupMaxDepth_ = 1` (at most one hop up).
+the reverse call graph and pick the caller with the highest call count.
+Bounded by `WalkupMaxDepth_ = 1` (at most one hop up).
 
-**Ratio gate (sole floor).**
-`CallCounters[C] * RootHotRatioDen_ >= LeafCount`, i.e. the ancestor
-must be at least `1/RootHotRatioDen_ = 1/10` as hot as the leaf. Matches
-the intuition "anchor on something that actually justifies the compile".
+Eligibility checks per candidate caller: not the root itself, not
+already visited, not already in `Seen_`, scalar-promotable, and counter
+not saturated (saturated = already tier-upped). Among the eligible
+callers, the one with the largest `CallCounters[C]` becomes the new
+root. If no caller is eligible, walk-up returns `(HotFuncIdx, 0)` and
+BFS anchors on the leaf itself.
 
-A second `WarmDivisor_` floor (`CallCounters[C] >= Threshold/256`) was
-maintained alongside the ratio gate until 2026-04-20. Because the leaf
-is always saturated to `Tier2Threshold_` before walk-up runs, the ratio
-gate's effective requirement is `CCount >= Threshold/10` — strictly
-stricter than the warm floor's `CCount >= Threshold/256` at every
-production threshold, and tied at low thresholds where both clamp to 1.
-The warm floor never independently rejected a candidate, so it was
-removed.
-
-`LeafCount` needs an extra fix-up: `jit_tier_up_notify` saturates
-`CallCounters[HotFuncIdx]` to `UINT32_MAX` *before* calling `enqueue`,
-so the naive read makes the ratio arithmetic overflow and rejects every
-ancestor. We substitute `Tier2Threshold_` as a lower bound — the leaf
-just crossed it.
-
-If no ancestor passes both gates, walk-up returns `(HotFuncIdx, 0)` and
-BFS anchors on the leaf itself. This fallback is the common case for
-one-shot outer callers (`_start` / `main` variants) whose counter is
-effectively 1.
+No hotness floor is enforced. A prior `RootHotRatioDen_` gate (requiring
+the caller to be ≥ 1/10 as hot as the leaf) was removed 2026-04-21
+after measuring it neutral on sightglass-strong at the supported
+`Tier2Threshold_=10` benchmark configuration.
 
 ### 2. `bfsDownBatchLocked` — fan out from the anchor
 
-From the chosen root, BFS depth-first down the forward call graph
-bounded by `BfsMaxDepth_ = 2` and `MaxBatchSize_ = 12`. Both `Root` and
+From the chosen root, BFS down the forward call graph bounded by
+`BfsMaxDepth_ = 1` and `MaxBatchSize_ = 12`. Both `Root` and
 `HotFuncIdx` are seeded at depth 0 so the batch always covers the
 leaf's inlining neighborhood, not just the root's. A callee `C` is
 included iff:
@@ -466,7 +453,13 @@ trips the threshold long before its siblings have run (e.g. ed25519
 where `f19 = __multi3` reaches count 10 on iteration 2 but `f12/f10/f11`
 are still at 0). Without it, the batch collapses to `[root, leaf]` and
 every sibling compiles as a later singleton, fragmenting the inlining
-neighborhood.
+neighborhood. Removing this gate regressed ed25519 +4% and blind-sig
++4% in the 2026-04-21 filter sweep; kept.
+
+`BfsMaxDepth_` was dropped from 2 to 1 in the same 2026-04-21 sweep.
+Depth 2 was measured indistinguishable from depth 1 on sightglass-strong
+(±0.2pp geomean), and the hot clusters that matter fit within direct
+callees of the anchor.
 
 `HotFuncIdx` is force-added at the end (dropping the last BFS leaf if
 necessary) so the request always includes its triggering function.

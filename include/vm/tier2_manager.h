@@ -164,21 +164,11 @@ private:
 
   // Threshold loaded from env var; batching geometry is fixed.
   uint32_t Tier2Threshold_ = 1000;      // WASMEDGE_TIER2_THRESHOLD
-  // Walk-up rejects an ancestor whose runtime counter is less than
-  // 1/RootHotRatioDen_ of the leaf's counter. The leaf is always saturated
-  // to Tier2Threshold_ by the trigger before walk-up runs, so this is
-  // effectively "caller has run >= Threshold/RootHotRatioDen_ times."
-  // Prevents one-shot callers (e.g. ed25519 `_start → f8`, f8 called
-  // exactly once) from anchoring an expensive batch compile when only the
-  // leaf is genuinely hot. This is the only floor on caller hotness — a
-  // separate WarmDivisor_ floor previously existed but was strictly looser
-  // than this gate at any production threshold (Threshold/256 vs
-  // Threshold/10) and never independently rejected anything; dropped
-  // 2026-04-20. If you weaken this ratio (e.g. lower the denominator), add
-  // an absolute minimum back to keep one-shot wrappers out of batches.
-  static constexpr uint32_t RootHotRatioDen_ = 10;
   static constexpr uint32_t WalkupMaxDepth_ = 1;
-  static constexpr uint32_t BfsMaxDepth_ = 2;
+  // Depth 1 matches the shape of sightglass-strong hot clusters: the hot
+  // function's direct callees form the inlining neighborhood. Depth 2 was
+  // empirically indistinguishable (exp6/exp7 2026-04-21, ±0.2pp geomean).
+  static constexpr uint32_t BfsMaxDepth_ = 1;
   static constexpr uint32_t MaxBatchSize_ = 12;
   // Static-frequency inclusion floor. A callee whose body is reached by
   // >= this many direct Call instructions in the enclosing caller is

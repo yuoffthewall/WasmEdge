@@ -469,29 +469,6 @@ on the table for one-shot outer callers:
    tier-2; delaying it behind a multi-second batch defeats its purpose
    on one-shot mains.
 
-### P1f-1 -- ratio gate in `walkUpRootLocked`
-
-Added a second gate on top of the warm-floor: the candidate ancestor
-must also be at least `1/RootHotRatioDen_` (= 1/10) as hot as the leaf:
-
-```cpp
-if (static_cast<uint64_t>(CCount) * RootHotRatioDen_ < LeafCount)
-    continue;
-```
-
-Edge case: `jit_tier_up_notify` stamps
-`CallCounters[HotFuncIdx] = UINT32_MAX` *before* invoking `enqueue`,
-which makes the naive read overflow the arithmetic and reject every
-ancestor. `LeafCount` is clamped to `Tier2Threshold_` when the sentinel
-is observed — a lower bound, since the leaf just crossed the threshold.
-
-When no ancestor passes both gates, walk-up falls through to
-`(HotFuncIdx, 0)` and BFS anchors on the leaf. On ed25519 under
-`THRESHOLD=10`, `f8` (counter=1) still survives because `LeafCount` is
-clamped to 10: `1 * 10 >= 10` passes exactly. At higher thresholds the
-gate tightens naturally — it is the ratio, not the absolute count, that
-matters.
-
 ### P1f-2 -- OSR drains ahead of regular batches
 
 Flipped the order in `workerLoop`:
