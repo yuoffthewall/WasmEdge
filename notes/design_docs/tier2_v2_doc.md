@@ -422,21 +422,22 @@ reverse edges for walk-up).
 ### 1. `walkUpRootLocked` — pick the batch anchor
 
 Starting from `HotFuncIdx` (the leaf that tripped the counter), walk up
-the reverse call graph to the hottest ancestor that passes **two**
-gates. Bounded by `WalkupMaxDepth_ = 1` (at most one hop up).
+the reverse call graph to the hottest ancestor that passes the ratio
+gate. Bounded by `WalkupMaxDepth_ = 1` (at most one hop up).
 
-**Gate A — warm floor.**
-`CallCounters[C] >= max(1, Tier2Threshold_ / WarmDivisor_)`. With
-`WarmDivisor_ = 256` this floor is a fraction of the tier-up threshold;
-at `Tier2Threshold_ = 10` it collapses to `>= 1` and does nothing on
-its own. Its real job is to keep walk-up from anchoring on stone-cold
-ancestors at production thresholds (1000+).
-
-**Gate B — ratio gate.**
+**Ratio gate (sole floor).**
 `CallCounters[C] * RootHotRatioDen_ >= LeafCount`, i.e. the ancestor
-must be at least `1/RootHotRatioDen_ = 1/10` as hot as the leaf. This is
-the gate that matters at low thresholds and matches the intuition
-"anchor on something that actually justifies the compile".
+must be at least `1/RootHotRatioDen_ = 1/10` as hot as the leaf. Matches
+the intuition "anchor on something that actually justifies the compile".
+
+A second `WarmDivisor_` floor (`CallCounters[C] >= Threshold/256`) was
+maintained alongside the ratio gate until 2026-04-20. Because the leaf
+is always saturated to `Tier2Threshold_` before walk-up runs, the ratio
+gate's effective requirement is `CCount >= Threshold/10` — strictly
+stricter than the warm floor's `CCount >= Threshold/256` at every
+production threshold, and tied at low thresholds where both clamp to 1.
+The warm floor never independently rejected a candidate, so it was
+removed.
 
 `LeafCount` needs an extra fix-up: `jit_tier_up_notify` saturates
 `CallCounters[HotFuncIdx]` to `UINT32_MAX` *before* calling `enqueue`,
