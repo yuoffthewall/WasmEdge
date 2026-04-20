@@ -236,7 +236,7 @@ latency-sensitive embedders. There's no cheaper fallback.
 
 ### 4.4 Fixed batch geometry
 
-`BfsMaxDepth_=2`, `MaxBatchSize_=12`. Syntactic cap, not a profile-driven
+`BfsMaxDepth_=1`, `MaxBatchSize_=12`. Syntactic cap, not a profile-driven
 budget. The `bfsOsrBatch` work (osr_doc §12.1) showed that expanding scope on
 ctype 1→10 drops WT 7,554k → 5,166k µs (−32%); ed25519 expanding 1→4 but
 still 130 helpers/iter left unbatched only moves WT 8,300k → 8,422k — the

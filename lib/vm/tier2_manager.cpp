@@ -185,19 +185,11 @@ Tier2Manager::walkUpRootLocked(const AST::Module &Mod, const ModuleCG &CG,
   if (CallCounters == nullptr) {
     return {HotFuncIdx, 0};
   }
-  // Ratio gate (sole floor): candidate ancestor must be at least
-  // 1/RootHotRatioDen_ as hot as the leaf that tripped tier-up. Falls
-  // through to (HotFuncIdx, 0) when nothing qualifies, letting BFS-down
-  // anchor on the leaf itself.
-  //
-  // The leaf's counter has already been saturated to UINT32_MAX by
-  // jit_tier_up_notify before we get here. We know it just crossed
-  // Tier2Threshold_, so use that as the effective leaf count: it's a
-  // lower bound (actual may have been higher before saturation) and
-  // keeps the ratio arithmetic inside a sensible range.
-  uint32_t LeafCount = CallCounters[HotFuncIdx];
-  if (LeafCount == UINT32_MAX)
-    LeafCount = Tier2Threshold_;
+  // Walk-up promotes the batch anchor to the highest-counted eligible
+  // caller of the hot leaf. Eligibility: not yet visited, not already in
+  // Seen_, scalar-promotable, not saturated. No hotness floor — the
+  // previous ratio gate was measured neutral on sightglass-strong
+  // (2026-04-21) and removed.
   uint32_t Root = HotFuncIdx;
   uint32_t Hops = 0;
   std::unordered_set<uint32_t> Visited;
@@ -223,10 +215,6 @@ Tier2Manager::walkUpRootLocked(const AST::Module &Mod, const ModuleCG &CG,
       uint32_t CCount = CallCounters[C];
       // Saturated sentinel means already-tier-upped; skip.
       if (CCount == UINT32_MAX)
-        continue;
-      // Ratio gate: CCount * RootHotRatioDen_ >= LeafCount.
-      // Using uint64_t to avoid overflow at extreme leaf counts.
-      if (static_cast<uint64_t>(CCount) * RootHotRatioDen_ < LeafCount)
         continue;
       if (Best == UINT32_MAX || CCount > BestCount) {
         Best = C;
