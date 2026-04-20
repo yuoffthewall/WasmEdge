@@ -164,16 +164,18 @@ private:
 
   // Threshold loaded from env var; batching geometry is fixed.
   uint32_t Tier2Threshold_ = 1000;      // WASMEDGE_TIER2_THRESHOLD
-  // Warm floor = Threshold/256 ≈ 39 calls. Picked empirically from a
-  // WARM_DIVISOR sweep on the loss cluster (divisor 2 was ~30x too strict;
-  // 256 reliably batches {root,hot,siblings}). See
-  // notes/benchmarking/tier2_v2_vs_llvm_jit_benchmark.md.
-  static constexpr uint32_t WarmDivisor_ = 256;
   // Walk-up rejects an ancestor whose runtime counter is less than
-  // 1/RootHotRatioDen_ of the leaf's counter. Prevents one-shot callers
-  // (e.g. ed25519 `_start → f8`, f8 called exactly once) from anchoring
-  // an expensive batch compile when only the leaf is genuinely hot.
-  // Applied on top of the WarmDivisor_ floor.
+  // 1/RootHotRatioDen_ of the leaf's counter. The leaf is always saturated
+  // to Tier2Threshold_ by the trigger before walk-up runs, so this is
+  // effectively "caller has run >= Threshold/RootHotRatioDen_ times."
+  // Prevents one-shot callers (e.g. ed25519 `_start → f8`, f8 called
+  // exactly once) from anchoring an expensive batch compile when only the
+  // leaf is genuinely hot. This is the only floor on caller hotness — a
+  // separate WarmDivisor_ floor previously existed but was strictly looser
+  // than this gate at any production threshold (Threshold/256 vs
+  // Threshold/10) and never independently rejected anything; dropped
+  // 2026-04-20. If you weaken this ratio (e.g. lower the denominator), add
+  // an absolute minimum back to keep one-shot wrappers out of batches.
   static constexpr uint32_t RootHotRatioDen_ = 10;
   static constexpr uint32_t WalkupMaxDepth_ = 1;
   static constexpr uint32_t BfsMaxDepth_ = 2;

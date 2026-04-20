@@ -185,13 +185,7 @@ Tier2Manager::walkUpRootLocked(const AST::Module &Mod, const ModuleCG &CG,
   if (CallCounters == nullptr) {
     return {HotFuncIdx, 0};
   }
-  // A caller only counts as "warm" if it's itself within a fraction of
-  // the tier-up threshold — i.e., it would realistically tier up on its
-  // own. A looser floor (e.g. 1 invocation) would drag cold one-shot
-  // parents into the batch and ruin inlining quality.
-  const uint32_t WarmThreshold =
-      std::max<uint32_t>(1, Tier2Threshold_ / std::max<uint32_t>(1, WarmDivisor_));
-  // Additional ratio gate: candidate ancestor must be at least
+  // Ratio gate (sole floor): candidate ancestor must be at least
   // 1/RootHotRatioDen_ as hot as the leaf that tripped tier-up. Falls
   // through to (HotFuncIdx, 0) when nothing qualifies, letting BFS-down
   // anchor on the leaf itself.
@@ -229,8 +223,6 @@ Tier2Manager::walkUpRootLocked(const AST::Module &Mod, const ModuleCG &CG,
       uint32_t CCount = CallCounters[C];
       // Saturated sentinel means already-tier-upped; skip.
       if (CCount == UINT32_MAX)
-        continue;
-      if (CCount < WarmThreshold)
         continue;
       // Ratio gate: CCount * RootHotRatioDen_ >= LeafCount.
       // Using uint64_t to avoid overflow at extreme leaf counts.
