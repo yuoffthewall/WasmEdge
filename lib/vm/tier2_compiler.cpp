@@ -1064,6 +1064,52 @@ Tier2Compiler::compileRequest(uint32_t RootFuncIdx,
     LLVMSetDLLStorageClass(Fn, LLVMDefaultStorageClass);
   }
 
+  // Prune unused stub functions before running the O2 pipeline. The
+  // mini-module keeps a slot at every original funcIdx so the frontend's
+  // call lowering resolves, but on wide call graphs (e.g. rust-*, 350-
+  // 900 functions) almost every slot is a `ret iN 0` stub that nothing
+  // calls — the batch body only reaches O(10) direct callees, which
+  // emitT1ThunkInPlace above rewrites in-place (leaving those functions
+  // with live uses). Everything else is dead weight that LLVM otherwise
+  // drags through its interprocedural passes.
+  //
+  // Match exactly the stub naming pattern (`f` followed by digits, not
+  // ending in `_fwd_thunk`) and erase only if `use_empty()`. Batch
+  // members keep the fwd_thunk's single use; t1_thunks keep their batch
+  // callers' uses; fwd_thunks are excluded by name (external callers via
+  // ORC produce no in-module use). Trap stubs (`tN`) and runtime helpers
+  // (`wasmedge_*`) are left alone.
+  auto IsStubFuncName = [](const char *Name, size_t Len) {
+    if (Len < 2 || Name[0] != 'f')
+      return false;
+    for (size_t I = 1; I < Len; ++I) {
+      if (Name[I] < '0' || Name[I] > '9')
+        return false;
+    }
+    return true;
+  };
+  unsigned Pruned = 0;
+  {
+    LLVMValueRef Fn = LLVMGetFirstFunction(LLMod);
+    while (Fn) {
+      LLVMValueRef Next = LLVMGetNextFunction(Fn);
+      if (!LLVMIsDeclaration(Fn)) {
+        size_t NameLen = 0;
+        const char *Name = LLVMGetValueName2(Fn, &NameLen);
+        if (IsStubFuncName(Name, NameLen) &&
+            LLVMGetFirstUse(Fn) == nullptr) {
+          LLVMDeleteFunction(Fn);
+          ++Pruned;
+        }
+      }
+      Fn = Next;
+    }
+  }
+  if (Pruned > 0) {
+    spdlog::info("tier2: pruned {} dead stub functions before opt",
+                 Pruned);
+  }
+
   // Run LLVM opt on the post-processed module now that all thunks and
   // stub rewrites are in place. The WasmEdge frontend was invoked at O0,
   // so call sites to non-batch stubs (now t1_thunks) are still intact.

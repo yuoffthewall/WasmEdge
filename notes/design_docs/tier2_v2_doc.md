@@ -97,6 +97,8 @@ compileBatch(BatchIdx, Mod, OptLevel)
   │         emitFwdThunk(LLMod, funcIdx, funcType)       // tier-1 ABI entry
   │     for each funcIdx referenced by a batch body but NOT in BatchSet:
   │         emitT1ThunkInPlace(LLMod, funcIdx, funcType)  // tier-2 → tier-1 bridge
+  │     demote batch bodies to LLVMInternalLinkage
+  │     prune unused `fN` stubs (see "Prune dead stub functions")
   │
   ├─► LLVMRunPasses(LLMod, "default<O2>", TM, opts)
   │     ▲ own the opt pipeline — runs *after* stub rewrites so opt sees
@@ -222,6 +224,113 @@ Considered alternatives:
 Compile at O0 then run opt ourselves is the least invasive option and
 keeps all the ABI-glue knowledge on our side of the boundary instead of
 leaking into the frontend.
+
+---
+
+## Prune dead stub functions before O2
+
+The O0-then-O2 split solves correctness but not cost. By construction
+the mini-module still contains a function slot at every original
+funcIdx. On most sightglass kernels that's fine — the module has 20 to
+50 functions, and most of them end up either carrying real batch
+bodies or getting rewritten into t1_thunks. On wider call graphs the
+ratio inverts. A single OSR compile on `rust-html-rewriter`'s f79 was
+measured with 932 function definitions in the mini-module and only 7
+`call @fN` sites total. The remaining 925 stubs stayed as `ret iN 0`
+bodies with no uses anywhere in the module, but LLVM's default<O2>
+pipeline still visited them in every interprocedural pass
+(InterproceduralSCCP, GlobalOpt, inliner cost-model queries). Median
+OSR compile latency on that kernel was 139 ms before the fix; the
+work was almost entirely O2 walking stubs.
+
+### The fix
+
+After the two thunk passes have rewritten the slots that are actually
+called, walk the LLVM module and delete any function definition that
+no caller references. The check is deliberately narrow so it can't
+remove anything the rest of the pipeline needs:
+
+- Name matches `fN` exactly — starts with `f`, everything after is a
+  digit. This is the naming convention the WasmEdge frontend uses for
+  wasm-funcIdx-indexed functions. `fN_fwd_thunk` is skipped because
+  the underscore breaks the match; trap stubs (`tN`) and runtime
+  helpers (`wasmedge_*`) don't match at all.
+- The function is a definition, not a declaration.
+- `LLVMGetFirstUse(F)` returns null. Batch bodies survive because the
+  fwd_thunk calls each of them once; t1_thunks survive because batch
+  callers reference them. Only never-referenced stubs get erased.
+
+The loop runs between the internal-linkage demote and the
+`LLVMRunPasses("default<O2>")` call. It's about thirty lines of LLVM
+C API in `Tier2Compiler::compileRequest`.
+
+### What the O0 frontend actually emits
+
+Worth pinning down why the fwd_thunk's single call to a batch body
+counts as one "use" but the never-referenced stubs have zero. After
+`LC.compile(Mini)` the LLVM module has, for every defined wasm
+function in the original module, a `define protected dllexport` at
+that slot's name. The externally-visible linkage is a compile-time
+property — it doesn't create a user of the value. Only a `call
+@fN` instruction (or a function-pointer reference taken in some
+initializer) puts fN in a use list. On the rust-html-rewriter OSR
+module, the only function with any use is the one the fwd_thunk
+calls. The other 925 exist as defined-but-unused globals and are
+safe to erase from the module.
+
+### Measured effect
+
+On kernels with dozens of functions the prune removes a handful of
+stubs and WT is unchanged. On wide call graphs it removes the bulk of
+the module:
+
+| Kernel | stubs pruned per event | module size |
+|---|---:|---:|
+| rust-html-rewriter | 936 | 932 |
+| rust-compression | 601 | 596 |
+| rust-json | 445 | 444 |
+| rust-protobuf | 353 | 348 |
+| shootout-ctype | 54 | 53 |
+| shootout-ed25519 | 15 | 17 |
+
+Per-compile latency drops in the same proportion. Median OSR
+request-to-install latency on rust-html-rewriter went from 139 ms to
+44 ms; on rust-compression from 123 ms to 55 ms; on rust-json from
+89 ms to 38 ms. Small-module kernels stayed within a couple
+milliseconds of their pre-change numbers.
+
+The WT deltas (3-run median, sightglass-strong, Release):
+
+| Kernel | before | after | Δ |
+|---|---:|---:|---:|
+| gcc-loops | 9,740,935 | 7,906,801 | −18.8% |
+| shootout-fib2 | 7,344,392 | 6,546,319 | −10.9% |
+| rust-json | 3,699,185 | 3,318,174 | −10.3% |
+| rust-protobuf | 2,806,641 | 2,607,480 | −7.1% |
+| shootout-switch | 9,361,288 | 8,869,835 | −5.2% |
+| rust-compression | 8,819,766 | 8,452,552 | −4.2% |
+| rust-html-rewriter | 1,357,486 | 1,320,647 | −2.7% |
+
+Aggregate across 32 kernels (noop excluded): geomean tier-1/tier-2
+1.091× → 1.136×; geomean LLVM-JIT/tier-2 0.891× → 0.925×. Cold-start
+latency (`Inst.Lat`) is unchanged — the frontend O0 compile still
+runs on the full mini-module. Only the post-opt O2 stage gets
+shorter. Full numbers in
+`notes/benchmarking/total_improvement.md` §"616527b5 + P1".
+
+### Why this doesn't affect the O0 rationale
+
+The O0-then-O2 split above exists so that opt doesn't see `ret iN 0`
+stubs as live function bodies. That reasoning still holds for the
+functions that remain after the prune — the ones that `emitT1ThunkInPlace`
+rewrote into real dispatch bodies. Those functions have live uses (the
+batch callers) and real bodies (the t1_thunks), so opt sees them
+correctly. The prune only removes the ones with no uses, which opt
+would have folded to nothing anyway; removing them up front just
+saves the pipeline time it would otherwise spend finding out they
+were dead.
+
+Files: `lib/vm/tier2_compiler.cpp::compileRequest` (prune loop).
 
 ---
 
