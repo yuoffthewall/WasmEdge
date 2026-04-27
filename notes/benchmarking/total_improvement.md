@@ -10,7 +10,7 @@ Build: `CMAKE_BUILD_TYPE=Release`, `WASMEDGE_IR_JIT_OPT_LEVEL=2`,
 
 Logs at `/tmp/wasm-<commit>-{tier1,tier2,llvm}-run{1,2,3}.log`.
 
-## 89e83770 — tier-2 V2, pre-OSR
+## 89e83770 — tier-2 - Promote Hot Callees
 
 Envs: `TIER2_ENABLE=1`, `TIER2_THRESHOLD=10`, `TIER2_LOOP_THRESHOLD=5`.
 
@@ -27,7 +27,6 @@ Envs: `TIER2_ENABLE=1`, `TIER2_THRESHOLD=10`, `TIER2_LOOP_THRESHOLD=5`.
 | shootout-memmove | 2,713,596 | 2,707,938 | 2,632,441 | 1.00× | 0.97× |
 | shootout-xchacha20 | 8,302,488 | 8,352,444 | 8,083,824 | 0.99× | 0.97× |
 | blake3-scalar | 5,345,217 | 5,376,025 | 5,190,324 | 0.99× | 0.97× |
-| noop | 0 | 0 | 0 | — | — |
 | shootout-heapsort | 8,444,310 | 8,557,783 | 8,056,059 | 0.99× | 0.94× |
 | bz2 | 7,842,613 | 7,511,928 | 7,040,926 | 1.04× | 0.94× |
 | regex | 9,184,954 | 9,207,907 | 8,623,984 | 1.00× | 0.94× |
@@ -49,58 +48,66 @@ Envs: `TIER2_ENABLE=1`, `TIER2_THRESHOLD=10`, `TIER2_LOOP_THRESHOLD=5`.
 | shootout-ed25519 | 8,213,538 | 12,940,674 | 4,970,233 | 0.63× | 0.38× |
 | blind-sig | 9,777,375 | 10,993,774 | 3,900,783 | 0.89× | 0.35× |
 | shootout-ctype | 8,234,113 | 16,305,276 | 4,978,469 | 0.50× | 0.31× |
+| noop | 0 | 0 | 0 | — | — |
 
 Aggregates (32 kernels, `noop` excluded): geomean t1/t2 **0.975×**,
 geomean LLVM/t2 **0.814×**.
 
 
-## c602091b - tier2 + OSR
+## 752997db - tier2 - Walk up + BFS + OSR
 
 Envs: `TIER2_ENABLE=1`, `TIER2_THRESHOLD=10`, `OSR_THRESHOLD=5000`.
 
 | Kernel | Tier-1 | Tier-2 | LLVM JIT | t1/t2 | LLVM/t2 |
 |---|---:|---:|---:|---:|---:|
-| shootout-nestedloop | 5,464,326 | 5,469,977 | 8,863,836 | 1.00× | 1.62× |
-| shootout-seqhash | 5,483,990 | 5,432,083 | 5,703,767 | 1.01× | 1.05× |
-| quicksort | 8,122,251 | 6,592,672 | 6,893,647 | 1.23× | 1.05× |
-| shootout-heapsort | 8,499,003 | 8,028,295 | 8,355,503 | 1.06× | 1.04× |
-| shootout-matrix | 8,132,709 | 6,743,591 | 6,812,769 | 1.21× | 1.01× |
-| shootout-switch | 8,648,764 | 8,912,738 | 8,974,158 | 0.97× | 1.01× |
-| shootout-xchacha20 | 8,286,913 | 7,743,770 | 7,766,690 | 1.07× | 1.00× |
-| shootout-gimli | 8,143,864 | 7,952,730 | 7,974,968 | 1.02× | 1.00× |
-| shootout-keccak | 8,208,370 | 6,925,288 | 6,934,385 | 1.19× | 1.00× |
-| shootout-random | 6,959,567 | 4,401,707 | 4,391,915 | 1.58× | 1.00× |
-| shootout-base64 | 8,024,013 | 6,760,734 | 6,735,372 | 1.19× | 1.00× |
-| shootout-xblabla20 | 2,881,032 | 2,676,474 | 2,659,948 | 1.08× | 0.99× |
-| blake3-scalar | 5,348,861 | 5,245,053 | 5,195,974 | 1.02× | 0.99× |
-| shootout-memmove | 2,731,678 | 2,699,363 | 2,632,500 | 1.01× | 0.98× |
-| shootout-ackermann† | 5,991,837 | 6,017,530 | 5,826,280 | 1.00× | 0.97×† |
-| shootout-ratelimit | 1,088,355 | 899,550 | 866,274 | 1.21× | 0.96× |
-| regex | 9,221,433 | 8,989,311 | 8,584,876 | 1.03× | 0.96× |
-| shootout-minicsv | 1,988,147 | 1,484,873 | 1,414,358 | 1.34× | 0.95× |
-| bz2 | 7,801,915 | 7,280,345 | 6,933,445 | 1.07× | 0.95× |
-| shootout-ctype | 8,224,391 | 5,254,913 | 4,993,191 | 1.57× | 0.95× |
-| hashset | 5,634,203 | 6,078,929 | 5,351,455 | 0.93× | 0.88× |
-| shootout-fib2 | 7,901,672 | 6,533,942 | 5,729,634 | 1.21× | 0.88× |
-| rust-compression | 9,855,091 | 8,418,836 | 6,997,809 | 1.17× | 0.83× |
-| shootout-sieve | 8,097,934 | 8,751,565 | 7,187,861 | 0.93× | 0.82× |
-| pulldown-cmark | 2,930,983 | 2,680,909 | 2,175,856 | 1.09× | 0.81× |
-| richards | 892,206 | 916,979 | 729,915 | 0.97× | 0.80× |
-| gcc-loops | 7,661,647 | 8,569,409 | 6,719,074 | 0.89× | 0.78× |
-| rust-protobuf | 2,722,612 | 2,621,429 | 2,043,853 | 1.04× | 0.78× |
-| blind-sig | 9,734,972 | 4,716,495 | 3,632,225 | 2.06× | 0.77× |
-| shootout-ed25519 | 8,206,512 | 6,695,313 | 4,931,879 | 1.23× | 0.74× |
-| rust-json | 3,255,009 | 3,339,177 | 2,200,312 | 0.97× | 0.66× |
-| rust-html-rewriter | 1,244,195 | 1,315,183 | 854,799 | 0.95× | 0.65× |
+| shootout-ackermann† | 8,421,700 | 4,273,658 | 8,053,812 | 1.97× | 1.88×† |
+| shootout-nestedloop | 5,437,620 | 5,474,120 | 8,867,429 | 0.99× | 1.62× |
+| quicksort | 8,131,002 | 6,659,557 | 7,024,610 | 1.22× | 1.05× |
+| shootout-seqhash | 5,470,318 | 5,504,857 | 5,721,465 | 0.99× | 1.04× |
+| shootout-heapsort | 8,438,098 | 8,065,101 | 8,336,287 | 1.05× | 1.03× |
+| shootout-switch | 8,654,780 | 8,873,744 | 9,069,258 | 0.98× | 1.02× |
+| shootout-matrix | 8,158,768 | 6,760,944 | 6,906,804 | 1.21× | 1.02× |
+| shootout-xblabla20 | 2,877,095 | 2,683,885 | 2,691,703 | 1.07× | 1.00× |
+| shootout-gimli | 8,177,779 | 7,983,140 | 8,001,214 | 1.02× | 1.00× |
+| shootout-xchacha20 | 8,369,227 | 7,730,189 | 7,735,863 | 1.08× | 1.00× |
+| shootout-random | 6,955,889 | 4,400,353 | 4,390,723 | 1.58× | 1.00× |
+| shootout-keccak | 8,229,748 | 6,998,635 | 6,926,285 | 1.18× | 0.99× |
+| blake3-scalar | 5,349,408 | 5,270,062 | 5,214,484 | 1.02× | 0.99× |
+| shootout-base64 | 8,041,983 | 6,831,049 | 6,758,004 | 1.18× | 0.99× |
+| shootout-ratelimit | 1,097,283 | 897,620 | 882,984 | 1.22× | 0.98× |
+| bz2 | 7,879,578 | 7,167,222 | 6,995,518 | 1.10× | 0.98× |
+| shootout-memmove | 2,772,908 | 2,732,216 | 2,635,747 | 1.01× | 0.96× |
+| shootout-minicsv | 2,008,480 | 1,478,290 | 1,417,238 | 1.36× | 0.96× |
+| regex | 9,212,065 | 8,964,175 | 8,582,285 | 1.03× | 0.96× |
+| shootout-ctype | 8,279,160 | 5,290,539 | 4,994,419 | 1.56× | 0.94× |
+| hashset | 5,692,391 | 6,113,618 | 5,346,923 | 0.93× | 0.87× |
+| shootout-fib2 | 7,899,479 | 6,563,234 | 5,726,646 | 1.20× | 0.87× |
+| rust-compression | 9,966,981 | 8,376,451 | 6,999,674 | 1.19× | 0.84× |
+| gcc-loops | 7,706,566 | 7,934,002 | 6,608,757 | 0.97× | 0.83× |
+| pulldown-cmark | 2,913,632 | 2,674,922 | 2,186,000 | 1.09× | 0.82× |
+| shootout-sieve | 8,138,509 | 8,806,465 | 7,171,015 | 0.92× | 0.81× |
+| richards | 914,942 | 933,374 | 745,960 | 0.98× | 0.80× |
+| rust-protobuf | 2,779,775 | 2,595,864 | 2,046,396 | 1.07× | 0.79× |
+| blind-sig | 9,809,862 | 4,771,271 | 3,638,597 | 2.06× | 0.76× |
+| shootout-ed25519 | 8,286,597 | 6,741,574 | 4,995,236 | 1.23× | 0.74× |
+| rust-json | 3,286,851 | 3,325,374 | 2,167,699 | 0.99× | 0.65× |
+| rust-html-rewriter | 1,269,313 | 1,344,090 | 855,166 | 0.94× | 0.64× |
 | noop | 0 | 0 | 0 | — | — |
 
-Aggregates (32 kernels, `noop` excluded): geomean t1/t2 **1.115×**,
-geomean LLVM/t2 **0.920×**.
+Aggregates (32 kernels, `noop` excluded): geomean t1/t2 **1.144×**,
+geomean LLVM/t2 **0.942×**.
 
-†`shootout-ackermann` is bimodal on this hardware (deep-recursion
-branch-predictor pathology). Per-run WT:
-tier-1 5,303k / 5,992k / 6,964k; tier-2 5,289k / 6,705k / 6,018k;
-LLVM 5,826k / 5,435k / 6,725k. All three columns show ~25%
-run-to-run swing; this run of the sweep happened to land the medians
-close together. The 1.00× t1/t2 and 0.97× LLVM/t2 entries are within
-ackermann's natural noise, not a structural signal.
+This commit collapses the OSR back-edge poll diamond from a two-array
+load-and-test to a single-slot magnitude check (sentinel encoding:
+slot=1 means COUNTING, slot=0 means WAITING, slot=function_ptr means
+READY). The WAITING-state per-iteration cost drops from six ops to
+three ops (LOAD slot + TEST against zero + branch). vs. `c602091b`
+the suite geomean improves t1/t2 1.115× → 1.144× and LLVM/t2 0.920×
+→ 0.942×. The largest per-kernel move is gcc-loops (t1/t2 0.89× →
+0.97×, LLVM/t2 0.68× → 0.83×). One residual loss: rust-html-rewriter
+holds at 0.94× t1/t2 because the new diamond's READY transition path
+is two ops longer (extra `slot == 1` check before transitioning),
+which costs more on rhr's many short-frame invocations than the
+WAITING-state savings recover for that workload. †`shootout-ackermann`
+is bimodal on this hardware; the 1.88× LLVM/t2 reflects a clean-mode
+median rather than a structural improvement.

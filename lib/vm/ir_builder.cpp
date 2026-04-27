@@ -2273,13 +2273,19 @@ void WasmToIRBuilder::emitLoopBackEdge(LabelInfo &Target) {
     BackEdgeLocals[LocalIdx] = coerceToType(it->second, getLocalType(LocalIdx));
   }
 
-  // OSR back-edge instrumentation. Two-level diamond:
-  //   outer: if (OsrEntryTable[funcIdx*16+loopIdx] != NULL)
-  //            TRUE  -> serialise locals, tail-call the OSR entry, RETURN
-  //            FALSE -> counter diamond (existing Phase 1/2 behaviour)
-  //          MERGE (false path only; true path returned out of the fn)
-  // The OSR-entry poll + branch-not-taken is the only added per-iteration
-  // cost while waiting for tier-2 to land the entry.
+  // OSR back-edge instrumentation. Three-state diamond on OsrEntryTable[i]:
+  //   slot == 0     -> WAITING  (notify already fired, worker compiling).
+  //                    Fast path: LOAD slot + TEST + JZ. Three ops per iter.
+  //   slot == 1     -> COUNTING (initial sentinel; run counter logic).
+  //   slot >= 2     -> READY    (function pointer; serialise locals,
+  //                              tail-call the OSR entry, RETURN).
+  // The hot post-saturation path is WAITING: every iteration loads one
+  // pointer-sized word, tests against zero, and falls through. The
+  // BackEdgeCounters logic only runs while the slot is sentinel 1.
+  // jit_osr_notify saturates BackEdgeCounters AND writes 0 to OsrEntryTable
+  // so the polling collapses to the fast path. The worker writes the
+  // function pointer into OsrEntryTable on publish; that takes the slot
+  // out of WAITING into READY for the next iteration.
   if (OsrThreshold > 0 && Target.LoopIdx != UINT32_MAX &&
       Target.LoopIdx >= OsrMinLoop && Target.LoopIdx <= OsrMaxLoop) {
     const uintptr_t CounterByteOffset =
@@ -2294,18 +2300,79 @@ void WasmToIRBuilder::emitLoopBackEdge(LabelInfo &Target) {
     ir_ref EntrySlot =
         ir_ADD_A(OsrEntryTablePtr, ir_CONST_ADDR(EntrySlotByteOffset));
     ir_ref EntryVal = ir_LOAD_A(EntrySlot);
-    ir_ref EntryReady =
+    // Outer test: anything other than WAITING (0) takes the slow path.
+    // The common case after saturation is slot == 0, branch-not-taken.
+    ir_ref OsrNonWaiting =
         ir_NE(EntryVal, ir_CONST_ADDR(static_cast<uintptr_t>(0)));
     // Shared bisection gate: SKIP_STORES disables the locals snapshot on
-    // BOTH the transition path and the threshold-hit path (same class of
-    // IR that trips Bug 2). When set the transition still runs but reads
-    // stale locals, so outputs may be wrong; used only for IR-shape
-    // bisection.
+    // the transition path. When set the OSR entry will read stale locals,
+    // so outputs may be wrong; used only for IR-shape bisection.
     const char *SkipStoresEnv = std::getenv("WASMEDGE_OSR_SKIP_STORES");
     const bool SkipStores = SkipStoresEnv && SkipStoresEnv[0] != '0';
 
-    ir_ref TransitionIf = ir_IF(EntryReady);
-    ir_IF_TRUE(TransitionIf);
+    ir_ref OuterIf = ir_IF(OsrNonWaiting);
+
+    // TRUE: slot is 1 (COUNTING) or a function pointer (READY).
+    ir_IF_TRUE(OuterIf);
+    ir_ref IsCounting =
+        ir_EQ(EntryVal, ir_CONST_ADDR(static_cast<uintptr_t>(1)));
+    ir_ref CountingIf = ir_IF(IsCounting);
+
+    // COUNTING (slot == 1): run the existing counter diamond. Once the
+    // counter hits the threshold we fire jit_osr_notify, which both
+    // saturates BackEdgeCounters and writes 0 into OsrEntryTable[i] —
+    // every subsequent iteration takes the WAITING fast path.
+    ir_IF_TRUE(CountingIf);
+
+    ir_ref CounterAddr =
+        ir_ADD_A(BackEdgeCountersPtr, ir_CONST_ADDR(CounterByteOffset));
+    ir_ref CounterVal = ir_LOAD_U32(CounterAddr);
+    // MUST be unsigned: jit_osr_notify saturates the slot to UINT32_MAX,
+    // which is signed -1. Signed LT(-1, threshold) is TRUE, so the gate
+    // would NOT block the increment — the counter would wrap 0xFFFFFFFF
+    // → 0 every iteration and re-fire notify every `threshold` iterations
+    // (the exact pathology this gate is here to prevent). It is also
+    // load-bearing across the rare race where two host threads are still
+    // in the COUNTING state when one of them saturates: the saturated
+    // counter holds UINT32_MAX, so the other thread's ULT < threshold
+    // returns false and it skips the increment+store.
+    ir_ref ShouldCount = ir_ULT(CounterVal, ir_CONST_U32(OsrThreshold));
+    ir_ref CountIf = ir_IF(ShouldCount);
+    ir_IF_TRUE(CountIf);
+    ir_ref Incremented = ir_ADD_U32(CounterVal, ir_CONST_U32(1));
+    ir_STORE(CounterAddr, Incremented);
+    ir_ref Cmp = ir_EQ(Incremented, ir_CONST_U32(OsrThreshold));
+    ir_ref NotifyIf = ir_IF(Cmp);
+    ir_IF_TRUE(NotifyIf);
+
+    // The threshold-hit path used to re-serialize locals into OsrLocalsFrame
+    // here (Phase 2 behavior). That snapshot is now redundant — the
+    // transition path re-stores locals fresh on the iteration that takes
+    // the READY branch, so nothing downstream reads from the pre-entry
+    // snapshot. Keeping the stores here was actively harmful: the
+    // frontend's foldable-op CSE (_ir_fold_cse) dedupes identical
+    // ZEXT/BITCAST ops across the transition-path and threshold-hit-path
+    // stores, producing a single SSA definition reused in two disjoint
+    // control-flow branches. Emit only the notify call here.
+    uint8_t NotifyParams[3] = {IR_ADDR, IR_U32, IR_U32};
+    ir_ref NotifyProto =
+        ir_proto(ctx, IR_FASTCALL_FUNC, IR_VOID, 3, NotifyParams);
+    ir_ref NotifyFn =
+        ir_const_func_addr(ctx, (uintptr_t)&jit_osr_notify, NotifyProto);
+    ir_CALL_3(IR_VOID, NotifyFn, EnvPtr, ir_CONST_U32(FuncIdx),
+              ir_CONST_U32(Target.LoopIdx));
+    ir_ref NotifyEnd = ir_END();
+    ir_IF_FALSE(NotifyIf);
+    ir_ref NoNotifyEnd = ir_END();
+    ir_MERGE_2(NotifyEnd, NoNotifyEnd);
+    ir_ref CountIfTrueEnd = ir_END();
+    ir_IF_FALSE(CountIf);
+    ir_ref CountIfFalseEnd = ir_END();
+    ir_MERGE_2(CountIfTrueEnd, CountIfFalseEnd);
+    ir_ref CountingTrueEnd = ir_END();
+
+    // READY (slot >= 2): tail-call the published OSR entry and RETURN.
+    ir_IF_FALSE(CountingIf);
 
     // Fresh snapshot of locals into OsrLocalsFrame. Each slot is 8 bytes,
     // but we write type-native widths: i32/f32 → 4-byte store into the low
@@ -2313,10 +2380,8 @@ void WasmToIRBuilder::emitLoopBackEdge(LabelInfo &Target) {
     // reads u64 and truncates to i32/f32, so high bits are ignored). This
     // avoids emitting per-local ZEXT/BITCAST ops whose foldable-op CSE
     // previously deduped across sibling OSR diamonds — producing a single
-    // SSA def reused in disjoint control branches. GCM could clone that
-    // def, but the resulting shape tripped downstream codegen and SIGSEGV'd
-    // ~13 sightglass kernels at O2. Native-width stores remove the CSE
-    // substrate entirely.
+    // SSA def reused in disjoint control branches. Native-width stores
+    // remove the CSE substrate entirely.
     if (!SkipStores) {
       for (const auto &[LocalIdx, Val] : Locals) {
         if (LocalIdx >= OSR_LOCALS_FRAME_SLOTS)
@@ -2345,61 +2410,15 @@ void WasmToIRBuilder::emitLoopBackEdge(LabelInfo &Target) {
       ir_ref OsrCall = ir_CALL_N(OsrRet, TypedEntry, 2, OsrArgs);
       ir_RETURN(OsrCall);
     }
+    // CountingIf's IF_FALSE returns; no END to merge with.
 
-    // FALSE path: counter diamond. Gate the increment on `counter <
-    // threshold` so once jit_osr_notify saturates the counter to
-    // UINT32_MAX, the per-iteration cost collapses to one load + one
-    // compare + one branch. Without this gate the counter wraps through
-    // UINT32_MAX back to 0 each iteration and re-fires notify every
-    // `threshold` iterations — catastrophic in a hot inner loop.
-    // No MERGE with TRUE — TRUE returned.
-    ir_IF_FALSE(TransitionIf);
+    // IF_FALSE of the outer if: WAITING (slot == 0). Fast-path fall-through.
+    ir_IF_FALSE(OuterIf);
+    ir_ref WaitingEnd = ir_END();
 
-    ir_ref CounterAddr =
-        ir_ADD_A(BackEdgeCountersPtr, ir_CONST_ADDR(CounterByteOffset));
-    ir_ref CounterVal = ir_LOAD_U32(CounterAddr);
-    // MUST be unsigned: jit_osr_notify saturates the slot to UINT32_MAX,
-    // which is signed -1. Signed LT(-1, threshold) is TRUE, so the gate
-    // would NOT block the increment — the counter would wrap 0xFFFFFFFF
-    // → 0 every iteration and re-fire notify every `threshold` iterations
-    // (the exact pathology this gate is here to prevent).
-    ir_ref ShouldCount = ir_ULT(CounterVal, ir_CONST_U32(OsrThreshold));
-    ir_ref CountIf = ir_IF(ShouldCount);
-    ir_IF_TRUE(CountIf);
-    ir_ref Incremented = ir_ADD_U32(CounterVal, ir_CONST_U32(1));
-    ir_STORE(CounterAddr, Incremented);
-    ir_ref Cmp = ir_EQ(Incremented, ir_CONST_U32(OsrThreshold));
-    ir_ref NotifyIf = ir_IF(Cmp);
-    ir_IF_TRUE(NotifyIf);
-
-    // The threshold-hit path used to re-serialize locals into OsrLocalsFrame
-    // here (Phase 2 behavior). That snapshot is now redundant — Phase 4
-    // re-stores locals fresh on every iteration once the OSR entry is ready,
-    // so nothing downstream reads from the pre-entry snapshot. Keeping the
-    // stores here was actively harmful: the frontend's foldable-op CSE
-    // (_ir_fold_cse) dedupes identical ZEXT/BITCAST ops across the
-    // transition-path and threshold-hit-path stores, producing a single SSA
-    // definition reused in two disjoint control-flow branches. GCM then
-    // hoists the definition to a common dominator upstream of every loop on
-    // the OSR path, ballooning live ranges and regressing post-GCM passes
-    // into miscompiles (SIGSEGV on bz2 and others). Emit only the notify
-    // call here; the transition path owns the snapshot.
-
-    uint8_t NotifyParams[3] = {IR_ADDR, IR_U32, IR_U32};
-    ir_ref NotifyProto =
-        ir_proto(ctx, IR_FASTCALL_FUNC, IR_VOID, 3, NotifyParams);
-    ir_ref NotifyFn =
-        ir_const_func_addr(ctx, (uintptr_t)&jit_osr_notify, NotifyProto);
-    ir_CALL_3(IR_VOID, NotifyFn, EnvPtr, ir_CONST_U32(FuncIdx),
-              ir_CONST_U32(Target.LoopIdx));
-    ir_ref NotifyEnd = ir_END();
-    ir_IF_FALSE(NotifyIf);
-    ir_ref NoNotifyEnd = ir_END();
-    ir_MERGE_2(NotifyEnd, NoNotifyEnd);
-    ir_ref CountIfTrueEnd = ir_END();
-    ir_IF_FALSE(CountIf);
-    ir_ref CountIfFalseEnd = ir_END();
-    ir_MERGE_2(CountIfTrueEnd, CountIfFalseEnd);
+    // Merge from COUNTING (CountingTrueEnd) and WAITING (WaitingEnd).
+    // The READY branch returned, so it does not contribute.
+    ir_MERGE_2(CountingTrueEnd, WaitingEnd);
   }
 
   ir_ref BackEnd = ir_END();
