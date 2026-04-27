@@ -561,12 +561,16 @@ extern "C" void jit_tier_up_notify(WasmEdge::VM::JitExecEnv *env,
 extern "C" void jit_osr_notify(WasmEdge::VM::JitExecEnv *env,
                                uint32_t funcIdx, uint32_t loopIdx) {
   // Saturate the back-edge counter so tier-1 stops incrementing it.
-  // The tier-1 IR still polls OsrEntryTable every iteration: once the
-  // worker thread lands a compiled entry there, the next back-edge
-  // transfers execution out of tier-1.
+  // Also flip OsrEntryTable[i] from sentinel 1 (COUNTING) to 0 (WAITING)
+  // so subsequent iterations take the back-edge fast path (LOAD + JZ)
+  // until the worker publishes the function pointer (READY).
+  const uint32_t SlotIdx =
+      funcIdx * WasmEdge::VM::OSR_MAX_LOOPS_PER_FUNC + loopIdx;
   if (env->BackEdgeCounters) {
-    env->BackEdgeCounters[funcIdx * WasmEdge::VM::OSR_MAX_LOOPS_PER_FUNC +
-                          loopIdx] = UINT32_MAX;
+    env->BackEdgeCounters[SlotIdx] = UINT32_MAX;
+  }
+  if (env->OsrEntryTable) {
+    env->OsrEntryTable[SlotIdx] = nullptr;
   }
   spdlog::info("OSR back-edge triggered: func {} loop {}", funcIdx, loopIdx);
 
@@ -1057,13 +1061,23 @@ Executor::enterFunction(Runtime::StackManager &StackMgr,
       }
       // OSR entry table: one pointer slot per (funcIdx, loopIdx).
       // shared_ptr so the tier-2 worker can write safely if the cache
-      // outlives the invoke() call.
+      // outlives the invoke() call. Three-state encoding:
+      //   slot == (void*)1  -> COUNTING (initial sentinel)
+      //   slot == nullptr   -> WAITING  (jit_osr_notify saturated)
+      //   slot == fn ptr    -> READY    (worker published)
+      // Slots are initialised to the COUNTING sentinel so the tier-1
+      // back-edge fast path (LOAD + TEST != 0 + branch) only takes the
+      // slow path until the counter saturates, after which the slot
+      // becomes 0 and the fast path falls through every iteration.
       const uint32_t OsrEntrySlots =
           static_cast<uint32_t>(FuncInsts.size()) *
           WasmEdge::VM::OSR_MAX_LOOPS_PER_FUNC;
       if (Cache.OsrEntryTableSize != OsrEntrySlots) {
         Cache.OsrEntryTable =
-            std::shared_ptr<void *[]>(new void *[OsrEntrySlots]());
+            std::shared_ptr<void *[]>(new void *[OsrEntrySlots]);
+        for (uint32_t I = 0; I < OsrEntrySlots; ++I) {
+          Cache.OsrEntryTable[I] = reinterpret_cast<void *>(uintptr_t{1});
+        }
         Cache.OsrEntryTableSize = OsrEntrySlots;
       }
     }
