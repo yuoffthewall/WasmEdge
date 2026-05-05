@@ -146,8 +146,6 @@ public:
   static constexpr inline const unsigned int UWTableDefault = 0;
 #endif
 
-  static inline unsigned int InvariantGroup = 0;
-
 private:
   static inline std::once_flag Once;
   static inline void initOnce() noexcept {
@@ -227,8 +225,6 @@ private:
     ReadOnly = getEnumAttributeKind("readonly"sv);
     StrictFP = getEnumAttributeKind("strictfp"sv);
     UWTable = getEnumAttributeKind("uwtable"sv);
-
-    InvariantGroup = getMetadataKind("invariant.group"sv);
   }
 
   template <typename... ArgsT>
@@ -246,8 +242,12 @@ private:
   static unsigned int getEnumAttributeKind(std::string_view Name) noexcept {
     return LLVMGetEnumAttributeKindForName(Name.data(), Name.size());
   }
-  static unsigned int getMetadataKind(std::string_view Name) noexcept {
-    return LLVMGetMDKindID(Name.data(), static_cast<unsigned int>(Name.size()));
+
+public:
+  static unsigned int getMetadataKind(LLVMContextRef C,
+                                      std::string_view Name) noexcept {
+    return LLVMGetMDKindIDInContext(C, Name.data(),
+                                    static_cast<unsigned int>(Name.size()));
   }
 };
 
