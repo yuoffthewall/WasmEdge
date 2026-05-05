@@ -1490,8 +1490,14 @@ buildIRJitEntryThunks(Span<const IRJitEntryThunkReq> Reqs) {
   LLVMInitializeNativeAsmPrinter();
   LLVMInitializeNativeAsmParser();
 
+#if LLVM_VERSION_MAJOR >= 21
+  LLVMContextRef Ctx = LLVMContextCreate();
+  LLVMOrcThreadSafeContextRef TSCtx =
+      LLVMOrcCreateNewThreadSafeContextFromLLVMContext(Ctx);
+#else
   LLVMOrcThreadSafeContextRef TSCtx = LLVMOrcCreateNewThreadSafeContext();
   LLVMContextRef Ctx = LLVMOrcThreadSafeContextGetContext(TSCtx);
+#endif
   LLVMModuleRef LLMod =
       LLVMModuleCreateWithNameInContext("ir_jit_entry_thunks", Ctx);
 
