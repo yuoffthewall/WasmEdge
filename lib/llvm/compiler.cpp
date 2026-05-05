@@ -330,13 +330,13 @@ struct LLVM::Compiler::CompileContext {
     auto VPtr = Builder.createLoad(
         Int8PtrTy, Builder.createInBoundsGEP1(Int8PtrTy, Array,
                                               LLContext.getInt64(Index)));
-    VPtr.setMetadata(LLContext, LLVM::Core::InvariantGroup,
+    VPtr.setMetadata(LLContext, LLVM::Core::getMetadataKind(LLContext.unwrap(), "invariant.group"),
                      LLVM::Metadata(LLContext, {}));
 #else
     auto VPtrPtr = Builder.createLoad(
         Int8PtrPtrTy, Builder.createInBoundsGEP1(Int8PtrPtrTy, Array,
                                                  LLContext.getInt64(Index)));
-    VPtrPtr.setMetadata(LLContext, LLVM::Core::InvariantGroup,
+    VPtrPtr.setMetadata(LLContext, LLVM::Core::getMetadataKind(LLContext.unwrap(), "invariant.group"),
                         LLVM::Metadata(LLContext, {}));
     auto VPtr = Builder.createLoad(
         Int8PtrTy,
@@ -352,7 +352,7 @@ struct LLVM::Compiler::CompileContext {
     auto VPtr = Builder.createLoad(
         Int128PtrTy, Builder.createInBoundsGEP1(Int8PtrTy, Array,
                                                 LLContext.getInt64(Index)));
-    VPtr.setMetadata(LLContext, LLVM::Core::InvariantGroup,
+    VPtr.setMetadata(LLContext, LLVM::Core::getMetadataKind(LLContext.unwrap(), "invariant.group"),
                      LLVM::Metadata(LLContext, {}));
     auto Ptr = Builder.createBitCast(VPtr, Ty.getPointerTo());
     return {Ty, Ptr};
@@ -383,7 +383,7 @@ struct LLVM::Compiler::CompileContext {
     auto PtrTy = Ty.getPointerTo();
     auto PtrPtrTy = PtrTy.getPointerTo();
     auto IT = Builder.createLoad(IntrinsicsTablePtrTy, IntrinsicsTable);
-    IT.setMetadata(LLContext, LLVM::Core::InvariantGroup,
+    IT.setMetadata(LLContext, LLVM::Core::getMetadataKind(LLContext.unwrap(), "invariant.group"),
                    LLVM::Metadata(LLContext, {}));
     auto VPtr =
         Builder.createInBoundsGEP2(IntrinsicsTableTy, IT, LLContext.getInt64(0),
@@ -6024,6 +6024,24 @@ Expect<Data> Compiler::compile(const AST::Module &Module) noexcept {
   }
 
   spdlog::info("optimize done"sv);
+
+  // Optional dump for diagnostics. WASMEDGE_LLVM_DUMP_IR=<dir> writes the
+  // post-opt LLVM module to <dir>/llvm_<idx>.ll for offline analysis.
+  if (const char *DumpDir = ::getenv("WASMEDGE_LLVM_DUMP_IR")) {
+    static std::atomic<uint32_t> DumpCounter{0};
+    uint32_t I = DumpCounter.fetch_add(1, std::memory_order_relaxed);
+    std::string Path = std::string(DumpDir) + "/llvm_" + std::to_string(I) + ".ll";
+    char *ModStr = LLVMPrintModuleToString(LLModule.unwrap());
+    if (ModStr) {
+      if (FILE *F = std::fopen(Path.c_str(), "w")) {
+        std::fputs(ModStr, F);
+        std::fclose(F);
+        spdlog::info("llvm: dumped post-opt module to {}", Path);
+      }
+      LLVMDisposeMessage(ModStr);
+    }
+  }
+
   return Expect<Data>{std::move(D)};
 }
 
