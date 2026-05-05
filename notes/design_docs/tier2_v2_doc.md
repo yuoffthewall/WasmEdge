@@ -647,28 +647,86 @@ OSR inlining changes).
 
 ## File layout
 
-### Changed
+The tier-2 + OSR implementation lives in 11 files across two layers.
+Grouped by role:
 
-| File | Role |
+### Tier-2 / OSR core (`lib/vm/`, `include/vm/`)
+
+| File | What lives here |
 |---|---|
-| `include/executor/executor.h` | `IRJitEnvCache` gains `std::shared_ptr<const AST::Module> FullModule`. |
-| `lib/executor/instantiate/module.cpp` | Stash a `shared_ptr<AST::Module>` into `IRJitEnvCache` at IR JIT setup. |
-| `lib/executor/helper.cpp` | `jit_tier_up_notify` forwards the stashed `shared_ptr<AST::Module>` into `Tier2Manager::enqueue`. No more `ModuleFuncMap` construction. |
-| `include/vm/tier2_manager.h` / `lib/vm/tier2_manager.cpp` | `Request = {funcIdx, shared_ptr<AST::Module>, shared_ptr<FuncTable>}`. Worker walks AST instrs for direct callees and calls `Tier2Compiler::compileBatch`. |
-| `include/vm/tier2_compiler.h` / `lib/vm/tier2_compiler.cpp` | **Full rewrite.** Mini-module synthesis, fwd/t1 thunk emitters, O0-then-O2 pipeline, ORC plumbing. |
-| `lib/vm/CMakeLists.txt` | Links `wasmedgeLLVM` into the tier-2 target. |
+| `include/vm/tier2_manager.h` | `Tier2Manager` class declaration, `Request` struct, the two queues (`Queue_` regular, `OsrQueue_` OSR-priority), dedup sets (`Seen_`, `SeenOsr_`), constants (`MaxBatchSize_=12`, `BfsMaxDepth_=1`, `StaticFreqHot_=2`). |
+| `lib/vm/tier2_manager.cpp` | Worker thread loop, `enqueue` / `enqueueOsr` (single shared entry point with `IsOsr` flag), `walkUpRootLocked`, `bfsDownBatchLocked`, OSR-first priority logic, `~Tier2Manager` shutdown. |
+| `include/vm/tier2_compiler.h` | `Tier2Compiler` class declaration, `compileBatch` / `compileOsrEntry` declarations. |
+| `lib/vm/tier2_compiler.cpp` | The compile pipeline end-to-end: `synthesizeMiniModule` (regular), `synthesizeOsrModule` (OSR), `emitFwdThunk`, `emitT1ThunkInPlace`, `emitIRJitEntryThunk`, internal-linkage demote, dead-stub prune, `LLVMRunPasses("default<O2>")`, ORC LLJIT setup, symbol lookup. |
+
+### Tier-1 side (also `lib/vm/`)
+
+| File | What lives here |
+|---|---|
+| `include/vm/ir_jit_engine.h` | `JitExecEnv` struct (FuncTable, CallCounters, BackEdgeCounters, OsrEntryTable, OsrLocalsFrame fields). Constants `OSR_MAX_LOOPS_PER_FUNC=16`, `OSR_LOCALS_FRAME_SLOTS=256`. |
+| `lib/vm/ir_jit_engine.cpp` | `IRJitEngine::invoke` wiring — populates `JitExecEnv` per call, allocates/reuses `OsrLocalsFrame_`, exposes `wasmedge_tier2_get_jit_env` TLS accessor. |
+| `include/vm/ir_builder.h` | `WasmToIRBuilder` declaration, `OsrThreshold` config, `LabelInfo::LoopIdx`, `CurrLoopIdx`. |
+| `lib/vm/ir_builder.cpp` | Tier-1 codegen, the two pieces relevant here: per-function call counter + `jit_tier_up_notify` call site, and `emitLoopBackEdge` (the three-state sentinel diamond at every outermost-loop back-edge). Also hoists `BackEdgeCountersPtr` / `OsrEntryTablePtr` out of loops at function entry. |
+
+### Executor layer (`lib/executor/`)
+
+| File | What lives here |
+|---|---|
+| `include/executor/executor.h` | `IRJitEnvCache` struct — holds the per-module `FuncTable`, `CallCounters`, `BackEdgeCounters`, `OsrEntryTable`, and `shared_ptr<const AST::Module>` so the worker can carry the full AST across thread boundaries. |
+| `lib/executor/helper.cpp` | The two notify hooks: `jit_tier_up_notify(env, funcIdx)` and `jit_osr_notify(env, funcIdx, loopIdx)` — both forward into `Tier2Manager`. Also `IRJitEnvCache` allocation (vectors for counters, slot for `OsrEntryTable`). The OSR notify is where `BackEdgeCounters[i] = UINT32_MAX` and `OsrEntryTable[i] = nullptr` (sentinel flip COUNTING → WAITING) happen. |
+| `lib/executor/instantiate/module.cpp` | Reads env vars (`WASMEDGE_TIER2_ENABLE`, `TIER2_THRESHOLD`, `OSR_THRESHOLD`, `OSR_MIN/MAX_FUNC`, `OSR_MIN/MAX_LOOP`, `OSR_OPT_LEVEL`), wires them through to the IR JIT engine, builds the `IRJitEntryThunk` table, and creates the `Tier2Manager` instance. |
+
+### How they connect
+
+```
+                              env vars set at runtime
+                                       │
+                                       ▼
+                  module.cpp ── instantiates Tier2Manager
+                                       │
+                                       │ pointers handed to JitExecEnv
+                                       ▼
+                  ir_jit_engine.cpp ── invoke() populates env per call
+                                       │
+                                       ▼
+            ir_builder.cpp ── tier-1 codegen sees env via EnvPtr
+                  ├── emit per-call counter + jit_tier_up_notify
+                  └── emitLoopBackEdge: 3-state sentinel diamond
+                                       │
+                              counter trips
+                                       │
+                                       ▼
+                     helper.cpp ── jit_tier_up_notify / jit_osr_notify
+                                       │
+                                       ▼
+                  tier2_manager.cpp ── enqueue → Queue_ / OsrQueue_
+                                       │
+                                       │ (worker thread, OSR-priority)
+                                       ▼
+                  tier2_compiler.cpp ── synthesize, lower, post-process,
+                                       O2, ORC, atomic publish
+                                       │
+                                       ▼
+            FuncTable[N] = fwd_thunk    OR    OsrEntryTable[i] = entry
+```
+
+Flow: env-var parsing (`module.cpp`) → engine wiring
+(`ir_jit_engine.cpp`) → tier-1 codegen with hooks (`ir_builder.cpp`) →
+notify shims (`helper.cpp`) → manager queues (`tier2_manager.cpp`) →
+compile pipeline (`tier2_compiler.cpp`).
 
 ### Untouched on purpose
 
-- `lib/vm/ir_builder.cpp` — tier-1 codegen unchanged; fwd_thunks make
-  tier-2 entries ABI-compatible with tier-1 FuncTable dispatch, so no
-  edits to the tier-1 side.
-- `lib/vm/ir_jit_engine.cpp` — tier-1 engine unchanged (except it still
-  exposes `wasmedge_tier2_get_jit_env` as before).
-- `thirdparty/ir/*` — no changes. The 19 open `ir_emit_llvm` bugs no
-  longer affect tier-2 because tier-2 no longer uses that path.
-- `lib/llvm/compiler.cpp` — frontend used as-is. No hooks carved into
-  the AOT pipeline for tier-2.
+- `thirdparty/ir/*` — no tier-2-specific changes (the 2026-04-19 DESSA
+  fix in `ir_emit.c` was an OSR-induced register-pressure bug, not a
+  tier-2 path change).
+- `lib/llvm/compiler.cpp` — the AOT frontend is used as-is by tier-2
+  via `LLVM::Compiler::compile(Mini)`. The only frontend-side hooks
+  are: (a) `Volatile=true` on wasm loads/stores (lines 4653, 4720) —
+  shared with whole-module LLVM JIT, not tier-2-specific; (b) an
+  `IRJitEntryThunk` integration in `proxyTableGetFuncSymbol` to make
+  `call_indirect` from LLVM JIT bodies reach tier-1 IR-JIT'd targets
+  with the right ABI.
 
 ---
 
