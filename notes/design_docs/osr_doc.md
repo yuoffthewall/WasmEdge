@@ -142,56 +142,78 @@ else is single-threaded.
 ## 4. Tier-1 IR emission (`emitLoopBackEdge`)
 
 The back-edge diamond is emitted only when `OsrThreshold > 0` *and* the loop
-is the outermost in its function (per §7.1 below). Control-flow graph:
+is the outermost in its function (per §7.1 below).
+
+The slot at `OsrEntryTable[f*16+l]` is **sentinel-encoded** so the
+post-saturation polling collapses to a single load-test-branch:
+
+| Slot value | State | What the back-edge does |
+|---|---|---|
+| `1` | COUNTING | Run the counter logic (init value, set by `IRJitEngine::invoke` cache init) |
+| `0` | WAITING | Notify already fired; worker compiling. Fall through with no further work. |
+| `≥ 2` | READY | Function pointer published. Snapshot locals, tail-call, RETURN. |
+
+Control-flow graph:
 
 ```
                  back-edge point
                        │
-          outer_if: LOAD OsrEntryTable[f*16+l] ≠ NULL
-             ┌────────┴────────┐
-          (ready)             (not ready)
-             │                      │
-   serialize locals → frame   inner_if: LOAD counter < threshold
-             │             ┌────────┴────────┐
-   CALL(entry, env, frame)  (increment)      (saturated)
-             │             │                      │
-          RETURN          STORE counter+1         END
-                          inc_if: counter+1 == threshold?
-                         ┌────────┴────────┐
-                      (hit)             (miss)
-                         │                  │
-                  CALL jit_osr_notify        END
-                         │
-                         END
-                      MERGE (hit/miss)
-                      END (inc branch)
-                   MERGE (inc/saturated)
-                          │
-                       back-edge
+                LOAD OsrEntryTable[f*16+l]
+                       │
+          outer_if: slot ≠ 0  ──── FALSE (WAITING) ───┐
+             │                                        │
+           TRUE                                      END (fall through)
+             │
+       inner_if: slot == 1
+       ┌─────┴──────┐
+   TRUE (COUNTING)   FALSE (READY, slot is fn ptr)
+       │             │
+   counter logic     serialize locals → frame
+   (LOAD/ULT/inc/    CALL(slot, env, frame)
+    STORE/notify)    RETURN
+       │
+      END
+       │
+   MERGE (COUNTING / WAITING)
+       │
+    back-edge
 ```
 
-Per-iteration cost while waiting for OSR entry:
+Per-iteration cost in each state:
 
-- 1× `LOAD_A` (OsrEntryTable slot)
-- 1× `NE` against null
-- 1× conditional branch (not taken)
-- 1× `LOAD_U32` (counter)
-- 1× `LT` against threshold
-- 1× conditional branch
+- **WAITING** (the post-saturation hot path): `LOAD slot + TEST against 0 + JZ-not-taken`. Three ops, no memory store, no counter access.
+- **COUNTING** (pre-threshold): same three ops plus the original counter diamond — `LOAD counter + ULT vs threshold + branch + (if taken) increment + store + EQ vs threshold + branch + (if hit) call notify`.
+- **READY** (one transition iteration): outer test + inner test + locals snapshot + tail-call + return. Executed exactly once per loop entry.
 
-After `jit_osr_notify` saturates the counter to `UINT32_MAX` and before the
-tier-2 worker lands the entry, the per-iteration cost collapses to the first
-three instructions + the `LT` check + a branch-not-taken — no memory store.
-This matters because the window between notify and entry-install covers
-milliseconds of hot-loop iterations. Without the `LT` gate the counter wraps
-through `UINT32_MAX` back to 0 every iteration and re-fires `jit_osr_notify`
-every `threshold` iterations — catastrophic in a hot inner loop (75× slowdown
-observed on regex before the fix). See `lib/vm/ir_builder.cpp:2368-2432`.
+`jit_osr_notify` (`lib/executor/helper.cpp:564-576`) does **two** writes:
+saturates `BackEdgeCounters[i]` to `UINT32_MAX` *and* writes `0` into
+`OsrEntryTable[i]`. The `0` flips the slot from COUNTING to WAITING so the
+outer test takes the fast-path FALSE branch on every subsequent iteration —
+the counter LT check is bypassed entirely.
+
+The counter ULT check inside COUNTING remains load-bearing for the brief
+race window where two host threads are still in COUNTING when one of them
+saturates — the saturated thread's `UINT32_MAX` value blocks any
+re-increment by an unsigned LT. (Signed LT against threshold against `-1`
+would be true and would wrap the counter, re-firing notify every threshold
+iterations — the 75× regex regression observed before this gate was made
+unsigned.)
 
 The **transition path** is a side-exit from the loop: instead of taking the
-back-edge (`ir_END → LOOP_END`), the function returns the OSR entry's result.
-`ir_CALL_N`'s return type must match `Ctx.ret_type` exactly (with `VOID`
-translated to `ir_RETURN(IR_UNUSED)`). See `lib/vm/ir_builder.cpp:2345-2359`.
+back-edge (`ir_END → LOOP_END`), the function returns the OSR entry's
+result. `ir_CALL_N`'s return type must match `Ctx.ret_type` exactly (with
+`VOID` translated to `ir_RETURN(IR_UNUSED)`).
+
+Source: `lib/vm/ir_builder.cpp:2264-2422` (`emitLoopBackEdge`); the slot
+init to sentinel `1` is in `IRJitEngine::invoke` and the slot reset in
+`jit_osr_notify` at `lib/executor/helper.cpp:564-576`.
+
+This three-state diamond replaced an earlier two-array design (separate
+`BackEdgeCounters` poll + `OsrEntryTable` poll, 6 ops per iteration in
+WAITING). The collapse to a single sentinel-encoded slot drops the
+WAITING-state cost from 6 ops to 3 and is the change behind commit
+`89cb6dff`'s LLVM/t2 geomean improvement from 0.920× to 0.942×; the
+largest single-kernel win was gcc-loops (LLVM/t2 0.68× → 0.83×).
 
 ### LabelInfo: loop identification
 
@@ -238,9 +260,14 @@ back-edge-counter fires on.
    uint64_t*)` thunk. Because the OSR function's params *are* the wasm
    locals and `OsrLocalsFrame` is laid out identically to the tier-1 `args[]`
    buffer (widening rules below), the same unmarshalling code works verbatim.
-5. `emitT1ThunkInPlace` on every non-OSR callee — same as the batch path.
-6. `alwaysinline` on the OSR body function so O2 collapses it into the
-   fwd_thunk (same optimisation as the batch path's inline-through-thunk).
+5. `emitT1ThunkInPlace` on every non-OSR-batch callee — same as the batch path.
+6. **Demote every batch member (OSR target + batched helpers) to
+   `LLVMInternalLinkage`** (`tier2_compiler.cpp:1050-1065`). The frontend
+   emits `protected dllexport`; flipping to `internal` lets LLVM's inliner
+   apply its single-callsite bonus — the body folds into its fwd_thunk
+   without `alwaysinline`. This replaced an earlier `alwaysinline`
+   approach (P1c) that exploded code size on multi-callsite helpers
+   (e.g. 805 inlined copies of `__multi3` in the f8 batch).
 7. `LLVMRunPasses("default<O2>")` (configurable via `WASMEDGE_OSR_OPT_LEVEL`).
 8. ORC LLJIT → `LLVMOrcLLJITLookup("fN_fwd_thunk")` → native pointer.
 
@@ -261,14 +288,25 @@ types (the OSR signature uses the original wasm types, not uint64).
 
 ### Batch composition
 
-OSR compiles are currently singletons: only the OSR function itself is
-lowered; callees remain tier-1. This gives a clean separation — the OSR
-entry can benefit from O2 + inlining within the loop body without racing
-with a concurrent tier-2 batch compile of the same function. Phase 5.2
-(comparable-batch composition) is deferred to a follow-up when the loss
-cluster first needs it; empirically the loss-cluster kernels have small,
-self-contained loop bodies and don't require cross-function inlining to
-close most of the gap.
+OSR uses the **same `Tier2Manager::bfsDownBatchLocked`** that regular
+tier-2 uses (`lib/vm/tier2_manager.cpp:381-383`). The graph search shape
+(depth ≤ `BfsMaxDepth_ = 1`, size ≤ `MaxBatchSize_ = 12`, dynamic-counter
+OR static-frequency inclusion) is identical. Two arguments differ:
+
+- **Anchor.** Regular tier-2 anchors on the walked-up caller; OSR anchors
+  on the OSR target itself (a running tier-1 frame fixes which loop must
+  be migrated, so walk-up is skipped at `tier2_manager.cpp:368-371`).
+- **`SkipSeen`.** Regular tier-2 passes `false` (skip already-promoted
+  callees); OSR passes `true`. Already-promoted helpers are kept in the
+  OSR batch so LLVM can inline them into the loop body, instead of
+  dispatching through `FuncTable[N]` on every iteration. The difference
+  matters because OSR's whole point is to make *this loop* fast in one
+  module, not to share work with previous batches.
+
+Earlier OSR ran as singletons (only the OSR function lowered, helpers
+left as t1_thunks). That design is preserved in §12.1 below as history;
+ctype's WT dropped from 7,554k µs to 5,166k µs (within 1.8% of LLVM JIT)
+once helpers were batched in.
 
 ---
 
@@ -289,10 +327,14 @@ worker writes, (b) once written it is never overwritten, (c) on x86-64
 for the release store the worker pairs with.
 
 The `FuncTable` slot for a function and its `OsrEntryTable` row are
-**independent** publishing paths. A function can be tier-2 promoted at its
-entry *and* have OSR entries compiled for its loops; in practice, if the
-entry is already tier-2 `Seen_`, `enqueueOsr` short-circuits (the tier-1
-body is dead — nobody runs it).
+**independent** publishing paths. A function can be tier-2 promoted at
+its entry *and* have OSR entries compiled for its loops. `enqueueOsr`
+deliberately **does not** short-circuit on `Seen_`
+(`lib/vm/tier2_manager.cpp:344-347`): function-entry swap only redirects
+*future* calls, while the currently-running tier-1 frame stays in the
+tier-1 body until the loop exits — exactly the case OSR exists to
+rescue. Dedup against repeated *OSR* requests is handled separately by
+`SeenOsr_` (§7.3).
 
 ---
 
@@ -309,11 +351,15 @@ before emitting the diamond. Rationale:
 - The sightglass loss cluster puts its hot iteration in the outermost loop;
   OSR into an inner loop doesn't pay for itself.
 
-### 7.2 Already-tier-2 skip
+### 7.2 OSR runs even when the entry is already tier-2 promoted
 
-If `FuncTable[funcIdx]` has been swapped to a tier-2 fwd_thunk, the tier-1
-body is dead. `enqueueOsr` checks `Seen_` and short-circuits (see
-`lib/vm/tier2_manager.cpp:385-386`).
+`enqueueOsr` deliberately does **not** short-circuit on `Seen_`
+(`lib/vm/tier2_manager.cpp:344-347`). Function-entry tier-2 swap
+redirects *future* calls; the currently-running tier-1 frame keeps
+running tier-1 code until the loop exits. That mid-flight frame is
+exactly the case OSR exists to rescue — short-circuiting here would
+waste the rescue. Dedup against repeated *OSR* requests for the same
+`(funcIdx, loopIdx)` is `SeenOsr_`'s job (§7.3).
 
 ### 7.3 Dedup of duplicate OSR requests
 
@@ -559,12 +605,21 @@ mechanically working — `WASMEDGE_TIER2_TRACE_FUNC=9` on ctype confirms
 exactly one fwd_thunk entry (the single transition out of the
 one-shot caller into the OSR continuation). But the win is tiny.
 
-### 12.1 Root cause: singleton OSR batching blocks helper inlining
+### 12.1 Root cause: singleton OSR batching blocks helper inlining (history)
 
-`compileOsrEntry` treats the OSR function as a batch of one. Every
-non-batch defined function is stubbed and then rewritten in-place as
-a `t1_thunk` by `emitT1ThunkInPlace`, so inside the LLVM module that
-holds the OSR body, every direct `call` to a helper compiles to:
+> **Status:** the singleton design described below was the OSR shape on
+> 2026-04-17. It has been superseded — OSR now uses the same
+> `Tier2Manager::bfsDownBatchLocked` as regular tier-2 (with
+> `SkipSeen=true`), and batch members get `internal` linkage rather
+> than `alwaysinline` (P1c). The investigation that motivated the
+> change is preserved here for reference; for the current shape see §5
+> "Batch composition" and §6.
+
+`compileOsrEntry` (in the singleton design) treated the OSR function
+as a batch of one. Every non-batch defined function was stubbed and
+then rewritten in-place as a `t1_thunk` by `emitT1ThunkInPlace`, so
+inside the LLVM module that holds the OSR body, every direct `call`
+to a helper compiled to:
 
 ```
   env        = TLS_LOAD(jit_env_tls_offset)   ; inlined movq %fs:…
@@ -621,12 +676,19 @@ function-entry batch path:
 5. Keep the t1_thunk rewrite for the remaining non-batch stubs — that
    tier is still needed for cold helpers.
 
-**Implemented 2026-04-17**. `bfsOsrBatch` + `isOsrBatchPromotable`
-helpers in `lib/vm/tier2_compiler.cpp` do a BFS over Mini's direct
-`call` edges starting from the OSR function, depth cap 2, size cap
-12 (same geometry as `Tier2Manager::bfsDownBatchLocked`). Every batch
-member gets `internal` linkage + `alwaysinline`. `collectNonBatchCallees`
-is unchanged — it now excludes the enlarged batch so only truly-cold
+**Implemented 2026-04-17, then unified 2026-04-21.** The original
+landing added `bfsOsrBatch` + `isOsrBatchPromotable` helpers in
+`lib/vm/tier2_compiler.cpp` (depth 2, size 12). Those helpers were
+later merged into the regular `Tier2Manager::bfsDownBatchLocked`
+path, which OSR now invokes with `SkipSeen=true` (see
+`tier2_manager.cpp:381-383`). The 2026-04-21 sweep measured BFS
+depth 2 indistinguishable from depth 1 on sightglass-strong
+(`tier2_v2_doc.md` line 569), so the unified path uses depth 1 for
+both regular and OSR. Per-member `alwaysinline` was also dropped
+(P1c): batch members get `LLVMInternalLinkage` and the inliner's
+single-callsite bonus folds the body in without exploding code size
+on multi-callsite helpers like `__multi3`. `collectNonBatchCallees`
+is unchanged — it excludes the enlarged batch so only truly-cold
 helpers become t1_thunks.
 
 Measured effect (medians of 3, sightglass-strong O2,
