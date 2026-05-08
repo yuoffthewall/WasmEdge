@@ -30,18 +30,20 @@
 #include <utility>
 #include <vector>
 
-// Tier-2 helpers defined in ir_jit_engine.cpp.
-// wasmedge_tier2_get_jit_env: legacy accessor (ORC fallback path).
-// wasmedge_tier2_get_jit_env_tls_offset: returns the byte offset of
-//   the thread-local JitExecEnv* from the thread pointer (%fs:0 on
-//   x86_64-linux). Used to emit a direct %fs:OFFSET inline asm load
-//   in t1_thunks instead of calling through an ORC absolute symbol.
+// Tier-2 TLS accessors. Both are bound as ORC absolute symbols below; the
+// JIT'd code calls them to obtain its thread-local state.
+//   wasmedge_tier2_get_jit_env  → wasmedge_tier2_jit_env_tls (JitExecEnv*)
+//   wasmedge_tier2_get_exec_ctx → &Executor::ExecutionContext
+// We deliberately go through a function call rather than emitting direct
+// %fs:OFFSET inline asm. Inline %fs:OFFSET assumes TLS lives in the static
+// TLS block at a fixed offset from the thread pointer — that holds for
+// statically-linked binaries but breaks when WasmEdge is loaded as a
+// dlopen'd shared library (where TLS variables live in dynamically-
+// allocated DTV chunks resolved through __tls_get_addr / TLSDESC). The
+// function-call overhead is on a cross-batch dispatch boundary, not in
+// inner loops, so the cost is negligible.
 extern "C" void *wasmedge_tier2_get_jit_env(void);
-extern "C" ptrdiff_t wasmedge_tier2_get_jit_env_tls_offset(void);
-// Returns the byte offset of Executor::ExecutionContext (a thread_local
-// struct) from %fs:0. Used to emit a direct address computation in
-// fwd_thunks instead of calling the ORC-bound wasmedge_tier2_get_exec_ctx.
-extern "C" ptrdiff_t wasmedge_tier2_get_exec_ctx_tls_offset(void);
+extern "C" void *wasmedge_tier2_get_exec_ctx(void);
 
 // Debug helper gated by WASMEDGE_TIER2_TRACE_FUNC env var. Prints
 // (func_idx, arg0..arg3) on each fwd_thunk entry. Bound via ORC absolute
@@ -101,6 +103,38 @@ extern "C" void wasmedge_tier2_trace_thunk(uint32_t FuncIdx, uint64_t A0,
 namespace WasmEdge::VM {
 
 namespace {
+
+/// Emit a call to `wasmedge_tier2_get_jit_env`, returning the current
+/// thread's `JitExecEnv*`. The call is resolved via an ORC absolute-symbol
+/// binding installed when the tier-2 LLJIT is created (see
+/// installAbsoluteSymbols). See the file-top comment on
+/// `wasmedge_tier2_get_jit_env` for why we call rather than read TLS
+/// inline.
+LLVMValueRef emitJitEnvLoad(LLVMBuilderRef B, LLVMTypeRef PtrTy,
+                            LLVMModuleRef LLMod, const char *Name = "env") {
+  LLVMTypeRef FTy = LLVMFunctionType(PtrTy, nullptr, 0, /*IsVarArg=*/0);
+  LLVMValueRef Fn =
+      LLVMGetNamedFunction(LLMod, "wasmedge_tier2_get_jit_env");
+  if (Fn == nullptr) {
+    Fn = LLVMAddFunction(LLMod, "wasmedge_tier2_get_jit_env", FTy);
+  }
+  return LLVMBuildCall2(B, FTy, Fn, nullptr, 0, Name);
+}
+
+/// Emit a call to `wasmedge_tier2_get_exec_ctx`, returning the address of
+/// the current thread's `Executor::ExecutionContext` struct. Like
+/// `emitJitEnvLoad`, resolved via an ORC absolute-symbol binding.
+LLVMValueRef emitExecCtxAddr(LLVMBuilderRef B, LLVMTypeRef PtrTy,
+                             LLVMModuleRef LLMod,
+                             const char *Name = "exec_ctx") {
+  LLVMTypeRef FTy = LLVMFunctionType(PtrTy, nullptr, 0, /*IsVarArg=*/0);
+  LLVMValueRef Fn =
+      LLVMGetNamedFunction(LLMod, "wasmedge_tier2_get_exec_ctx");
+  if (Fn == nullptr) {
+    Fn = LLVMAddFunction(LLMod, "wasmedge_tier2_get_exec_ctx", FTy);
+  }
+  return LLVMBuildCall2(B, FTy, Fn, nullptr, 0, Name);
+}
 
 /// Build a synthetic mini AST::Module from \p Src that only keeps real
 /// bodies for functions in \p BatchSet. Every other defined function
@@ -270,27 +304,10 @@ void emitFwdThunk(LLVMModuleRef LLMod, LLVMContextRef Ctx, uint32_t ThunkIdx,
   LLVMBuilderRef B = LLVMCreateBuilderInContext(Ctx);
   LLVMPositionBuilderAtEnd(B, Entry);
 
-  // Compute &Executor::ExecutionContext directly from TLS via inline asm.
-  // ExecutionContext is a thread_local struct (not a pointer), so we need
-  // its address = thread_pointer + offset. Two instructions:
-  //   movq %fs:0, %reg    — get thread pointer
-  //   addq $OFFSET, %reg  — add fixed offset to get struct address
-  // This replaces the previous call to the ORC-bound
-  // wasmedge_tier2_get_exec_ctx accessor, eliminating a function-call
-  // round-trip per fwd_thunk entry.
-  static const ptrdiff_t ExecCtxTlsOff =
-      wasmedge_tier2_get_exec_ctx_tls_offset();
-  LLVMTypeRef AsmFTy = LLVMFunctionType(PtrTy, nullptr, 0, /*IsVarArg=*/0);
-  std::string AsmStr =
-      "movq %fs:0, $0\n\taddq $$" + std::to_string(ExecCtxTlsOff) + ", $0";
-  std::string AsmCon = "=r";
-  LLVMValueRef AsmVal = LLVMGetInlineAsm(
-      AsmFTy, AsmStr.c_str(), AsmStr.size(),
-      AsmCon.c_str(), AsmCon.size(),
-      /*HasSideEffects=*/0, /*IsAlignStack=*/0,
-      LLVMInlineAsmDialectATT, /*CanThrow=*/0);
-  LLVMValueRef ExecCtx =
-      LLVMBuildCall2(B, AsmFTy, AsmVal, nullptr, 0, "exec_ctx");
+  // Get &Executor::ExecutionContext for this thread via the ORC-bound
+  // accessor. See file-top comment for why we use a function call rather
+  // than inline %fs:OFFSET.
+  LLVMValueRef ExecCtx = emitExecCtxAddr(B, PtrTy, LLMod);
 
   // Unmarshal params from args[] scratch buffer.
   LLVMValueRef Args = LLVMGetParam(Thunk, 1);
@@ -486,22 +503,9 @@ void emitT1ThunkInPlace(LLVMModuleRef LLMod, LLVMContextRef Ctx,
     LLVMBuildStore(B, Raw, Slot);
   }
 
-  // Load JitExecEnv* directly from TLS via inline asm: movq %fs:OFFSET, %reg.
-  // The offset from the thread pointer is fixed once the DSO is loaded and
-  // identical across threads, so we compute it once and hardcode it.
-  // This replaces the previous call to the ORC-bound wasmedge_tier2_get_jit_env
-  // accessor, eliminating a function-call + TLS-accessor round-trip per
-  // cross-batch dispatch.
-  static const ptrdiff_t TlsOff = wasmedge_tier2_get_jit_env_tls_offset();
-  LLVMTypeRef AsmFTy = LLVMFunctionType(PtrTy, nullptr, 0, /*IsVarArg=*/0);
-  std::string AsmStr = "movq %fs:" + std::to_string(TlsOff) + ", $0";
-  std::string AsmCon = "=r";
-  LLVMValueRef AsmVal = LLVMGetInlineAsm(
-      AsmFTy, AsmStr.c_str(), AsmStr.size(),
-      AsmCon.c_str(), AsmCon.size(),
-      /*HasSideEffects=*/0, /*IsAlignStack=*/0,
-      LLVMInlineAsmDialectATT, /*CanThrow=*/0);
-  LLVMValueRef Env = LLVMBuildCall2(B, AsmFTy, AsmVal, nullptr, 0, "env");
+  // Load JitExecEnv* via the ORC-bound accessor. See file-top comment for
+  // why we use a function call rather than inline %fs:OFFSET.
+  LLVMValueRef Env = emitJitEnvLoad(B, PtrTy, LLMod);
 
   // FuncTable lives at offset 0 of JitExecEnv (void **FuncTable).
   LLVMValueRef FuncTablePtr =
@@ -1177,16 +1181,35 @@ Tier2Compiler::compileRequest(uint32_t RootFuncIdx,
   LLVMOrcExecutionSessionRef ES = LLVMOrcLLJITGetExecutionSession(JIT);
 
   {
-    LLVMOrcCSymbolMapPair Pairs[1];
-    Pairs[0].Name =
-        LLVMOrcExecutionSessionIntern(ES, "wasmedge_tier2_trace_thunk");
-    Pairs[0].Sym.Address = reinterpret_cast<LLVMOrcJITTargetAddress>(
-        reinterpret_cast<void *>(&wasmedge_tier2_trace_thunk));
-    Pairs[0].Sym.Flags.GenericFlags =
-        LLVMJITSymbolGenericFlagsExported | LLVMJITSymbolGenericFlagsCallable;
-    Pairs[0].Sym.Flags.TargetFlags = 0;
+    // ORC absolute-symbol bindings for tier-2 helpers the JIT'd code calls
+    // by name. Bound here (rather than relying on dlsym(RTLD_DEFAULT, ...))
+    // so resolution works regardless of how the WasmEdge libraries are
+    // linked into the host process — including dlopen'd shared libraries
+    // built with `-fvisibility=hidden`.
+    struct AbsSym {
+      const char *Name;
+      void *Addr;
+    };
+    const AbsSym Syms[] = {
+        {"wasmedge_tier2_trace_thunk",
+         reinterpret_cast<void *>(&wasmedge_tier2_trace_thunk)},
+        {"wasmedge_tier2_get_jit_env",
+         reinterpret_cast<void *>(&wasmedge_tier2_get_jit_env)},
+        {"wasmedge_tier2_get_exec_ctx",
+         reinterpret_cast<void *>(&wasmedge_tier2_get_exec_ctx)},
+    };
+    constexpr size_t NumSyms = sizeof(Syms) / sizeof(Syms[0]);
+    LLVMOrcCSymbolMapPair Pairs[NumSyms];
+    for (size_t I = 0; I < NumSyms; ++I) {
+      Pairs[I].Name = LLVMOrcExecutionSessionIntern(ES, Syms[I].Name);
+      Pairs[I].Sym.Address =
+          reinterpret_cast<LLVMOrcJITTargetAddress>(Syms[I].Addr);
+      Pairs[I].Sym.Flags.GenericFlags = LLVMJITSymbolGenericFlagsExported |
+                                         LLVMJITSymbolGenericFlagsCallable;
+      Pairs[I].Sym.Flags.TargetFlags = 0;
+    }
 
-    LLVMOrcMaterializationUnitRef MU = LLVMOrcAbsoluteSymbols(Pairs, 1);
+    LLVMOrcMaterializationUnitRef MU = LLVMOrcAbsoluteSymbols(Pairs, NumSyms);
     if (LLVMErrorRef Err = LLVMOrcJITDylibDefine(MainJD, MU)) {
       char *Msg = LLVMGetErrorMessage(Err);
       spdlog::error("tier2: define absolute symbols failed: {}",
@@ -1362,19 +1385,8 @@ bool emitIRJitEntryThunk(LLVMModuleRef LLMod, LLVMContextRef Ctx,
   LLVMBuilderRef B = LLVMCreateBuilderInContext(Ctx);
   LLVMPositionBuilderAtEnd(B, BB);
 
-  // Inline asm: `movq %fs:OFFSET, $0` → JitExecEnv* (tier-1 TLS).
-  static const ptrdiff_t TlsOff =
-      wasmedge_tier2_get_jit_env_tls_offset();
-  LLVMTypeRef AsmFTy = LLVMFunctionType(PtrTy, nullptr, 0, /*IsVarArg=*/0);
-  std::string AsmStr = "movq %fs:" + std::to_string(TlsOff) + ", $0";
-  std::string AsmCon = "=r";
-  LLVMValueRef AsmVal = LLVMGetInlineAsm(
-      AsmFTy, AsmStr.c_str(), AsmStr.size(),
-      AsmCon.c_str(), AsmCon.size(),
-      /*HasSideEffects=*/0, /*IsAlignStack=*/0,
-      LLVMInlineAsmDialectATT, /*CanThrow=*/0);
-  LLVMValueRef Env =
-      LLVMBuildCall2(B, AsmFTy, AsmVal, nullptr, 0, "jit_env");
+  // Load JitExecEnv* via the ORC-bound accessor.
+  LLVMValueRef Env = emitJitEnvLoad(B, PtrTy, LLMod, "jit_env");
 
   // Allocate 8-byte-slot args[] scratch.
   LLVMValueRef ArgsArr = nullptr;

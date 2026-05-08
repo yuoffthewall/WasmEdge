@@ -118,18 +118,14 @@ void *Executor::getThreadLocalExecutionContextPtr() noexcept {
   return &Executor::ExecutionContext;
 }
 
-// Returns the byte offset of Executor::ExecutionContext from the thread
-// pointer (%fs:0 on x86_64-linux). The offset is fixed once the DSO is
-// loaded and is the same for all threads, so the JIT can hardcode it.
-// Used by tier2_compiler.cpp to emit a direct %fs:OFFSET address
-// computation in fwd_thunks instead of calling through an ORC absolute
-// symbol.
-extern "C" ptrdiff_t wasmedge_tier2_get_exec_ctx_tls_offset(void) {
-  uintptr_t TP;
-  asm volatile("mov %%fs:0, %0" : "=r"(TP));
-  return reinterpret_cast<uintptr_t>(
-             Executor::getThreadLocalExecutionContextPtr()) -
-         TP;
+// C-linkage accessor for the tier-2 JIT. The compiled tier-2 code calls
+// this (via an ORC absolute-symbol binding) to obtain the address of the
+// per-thread Executor::ExecutionContext. We use a function call rather
+// than an inline %fs:OFFSET load so the access is correct under every
+// linkage mode — including dlopen'd shared libraries, where TLS lives in
+// dynamically-allocated chunks at no fixed offset from %fs:0.
+extern "C" void *wasmedge_tier2_get_exec_ctx(void) {
+  return Executor::getThreadLocalExecutionContextPtr();
 }
 
 Expect<void> Executor::proxyTrap(Runtime::StackManager &,

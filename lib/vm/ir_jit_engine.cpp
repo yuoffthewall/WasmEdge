@@ -26,28 +26,20 @@ static thread_local jmp_buf g_termination_buf;
 } // namespace
 
 // Thread-local JitExecEnv pointer, published by IRJitEngine::invoke before
-// dispatching into tier-1 JIT code. Tier-2 t1_thunks read this to get the
-// JitExecEnv* needed for the tier-1 ABI (arg0). Exposed with external C
-// linkage so tier2_compiler.cpp can compute its TLS offset at JIT compile
-// time and emit a direct %fs:OFFSET load instead of a function call.
+// dispatching into tier-1 JIT code. Tier-2 t1_thunks read this through the
+// `wasmedge_tier2_get_jit_env` accessor below.
 extern "C" {
 thread_local WasmEdge::VM::JitExecEnv *wasmedge_tier2_jit_env_tls;
 }
 
-// Legacy accessor — the hot path now uses a direct %fs:offset inline asm
-// emitted by tier2_compiler.cpp. Kept for the ORC absolute-symbol fallback
-// and any out-of-tree consumers.
+// C-linkage accessor for the tier-2 JIT. The compiled tier-2 code calls
+// this (via an ORC absolute-symbol binding) to obtain the current
+// thread's JitExecEnv*. We use a function call rather than an inline
+// %fs:OFFSET load so the access is correct under every linkage mode —
+// including dlopen'd shared libraries, where TLS lives in dynamically-
+// allocated chunks at no fixed offset from %fs:0.
 extern "C" void *wasmedge_tier2_get_jit_env(void) {
   return wasmedge_tier2_jit_env_tls;
-}
-
-// Returns the byte offset of wasmedge_tier2_jit_env_tls from the thread
-// pointer (%fs:0 on x86_64-linux). The offset is fixed once the DSO is
-// loaded and is the same for all threads, so the JIT can hardcode it.
-extern "C" ptrdiff_t wasmedge_tier2_get_jit_env_tls_offset(void) {
-  uintptr_t TP;
-  asm volatile("mov %%fs:0, %0" : "=r"(TP));
-  return reinterpret_cast<uintptr_t>(&wasmedge_tier2_jit_env_tls) - TP;
 }
 
 namespace {
@@ -150,13 +142,6 @@ IRJitEngine::compile(ir_ctx *Ctx) {
     return Unexpect(ErrCode::Value::RuntimeError);
   }
 
-  // Verify IR before compilation to catch invalid patterns that would crash
-  // the backend. With release build of IR library, this returns false instead
-  // of aborting on invalid IR.
-  if (!ir_check(Ctx)) {
-    return Unexpect(ErrCode::Value::RuntimeError);
-  }
-
   // Default O2; override with WASMEDGE_IR_JIT_OPT_LEVEL=0|1 for debug.
   int opt_level = 2;
   if (const char *e = std::getenv("WASMEDGE_IR_JIT_OPT_LEVEL")) {
@@ -171,12 +156,27 @@ IRJitEngine::compile(ir_ctx *Ctx) {
   static int _dbg_func_id = 0;
   int _dbg_cur_id = _dbg_func_id++;
 
+  // Dump _before.ir even if ir_check / ir_jit_compile is about to fail.
+  // Otherwise, debugging an IR-builder bug requires reasoning about IR we
+  // can't see. The "after" dump still only fires on success below.
   bool _dbg_dump = std::getenv("WASMEDGE_IR_JIT_DUMP") != nullptr;
+  if (_dbg_dump) {
+    if (const char *only = std::getenv("WASMEDGE_IR_JIT_DUMP_ID")) {
+      _dbg_dump = (std::atoi(only) == _dbg_cur_id);
+    }
+  }
   if (_dbg_dump) {
     char fname[256];
     snprintf(fname, sizeof(fname), "/tmp/wasmedge_ir_%03d_before.ir", _dbg_cur_id);
     FILE *f = fopen(fname, "w");
     if (f) { ir_save(Ctx, 0, f); fclose(f); }
+  }
+
+  // Verify IR before compilation to catch invalid patterns that would crash
+  // the backend. With release build of IR library, this returns false instead
+  // of aborting on invalid IR.
+  if (!ir_check(Ctx)) {
+    return Unexpect(ErrCode::Value::RuntimeError);
   }
 
   size_t CodeSize = 0;
