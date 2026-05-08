@@ -101,6 +101,7 @@ public:
     addHostFunc("clock_res_get", std::make_unique<StubClockResGet>());
     addHostFunc("random_get", std::make_unique<StubRandomGet>());
     addHostFunc("fd_fdstat_set_flags", std::make_unique<StubFdFdstatSetFlags>());
+    addHostFunc("fd_sync", std::make_unique<StubFdSync>());
     addHostFunc("path_remove_directory", std::make_unique<StubPathRemoveDirectory>());
     addHostFunc("path_unlink_file", std::make_unique<StubPathUnlinkFile>());
     addHostFunc("proc_exit", std::make_unique<StubProcExit>(Capture));
@@ -463,6 +464,15 @@ private:
   public:
     Expect body(const WasmEdge::Runtime::CallingFrame &, int32_t /* Fd */,
                 uint32_t /* FdFlags */) {
+      return SightglassWasi::WASI_ERRNO_SUCCESS;
+    }
+  };
+
+  // sqlite3.wasm calls fd_sync after writes. With virtual files held in memory
+  // this is a no-op; report success so the benchmark doesn't error out.
+  class StubFdSync : public WasmEdge::Runtime::HostFunction<StubFdSync> {
+  public:
+    Expect body(const WasmEdge::Runtime::CallingFrame &, int32_t /* Fd */) {
       return SightglassWasi::WASI_ERRNO_SUCCESS;
     }
   };
@@ -1319,27 +1329,20 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
   }
   std::sort(kernels.begin(), kernels.end());
 
-  // Always skip spidermonkey and tinygo kernels (unsupported).
-  {
-    std::vector<std::filesystem::path> filtered;
-    for (const auto &p : kernels) {
-      const std::string stem = p.stem().string();
-      if (stem.compare(0, 13, "spidermonkey-") == 0)
-        continue;
-      if (stem.compare(0, 7, "tinygo-") == 0)
-        continue;
-      filtered.push_back(p);
-    }
-    kernels = std::move(filtered);
-  }
-
-  // Optional: for fast CI / ctest, drop additional heavy kernels.
+  // Optional: for fast CI / ctest, drop heavy kernels. The default runs
+  // everything; QUICK mode skips kernels whose _start work is large enough
+  // to dominate test wall time in debug builds — spidermonkey processes
+  // 2300 users + serializes 27 MB of JSON (~5 minutes), and richards is
+  // similarly long. The CLI sweep only times the bench.start/end window
+  // and so doesn't hit this; the gtest harness times all of _start.
   const char *quickEnv = std::getenv("WASMEDGE_SIGHTGLASS_QUICK");
   if (quickEnv && quickEnv[0] == '1') {
     std::vector<std::filesystem::path> filtered;
     for (const auto &p : kernels) {
       const std::string stem = p.stem().string();
       if (stem == "richards")
+        continue;
+      if (stem.compare(0, 13, "spidermonkey-") == 0)
         continue;
       filtered.push_back(p);
     }
