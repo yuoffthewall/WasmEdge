@@ -212,6 +212,99 @@ echo $?
 grep -iE 'dumped|error|failed|mismatch|warning' /tmp/wasm-tier2-osr.log
 ```
 
+# Sightglass-cli engine plugin (paper-grade phase breakdown)
+
+For paper-grade measurements with **separate compilation /
+instantiation / execution timings**, use upstream sightglass-cli with a
+WasmEdge engine plugin instead of the in-tree `SightglassSuite`. The
+plugin lives at `tools/sightglass_engine/`; sightglass-cli `dlopen`s
+its `libwasmedge_engine.so` and drives the same VM API the in-tree
+harness does, but separates the three phases at the timer-callback
+level.
+
+## One-time setup
+
+```sh
+# 1. Build sightglass-cli (Rust, ~30s incremental).
+cd ~/Desktop/sightglass
+cargo build --release -p sightglass-cli
+# → ~/Desktop/sightglass/target/release/sightglass-cli
+
+# 2. Build the engine library (built whenever WASMEDGE_BUILD_IR_JIT=ON).
+cd ~/Desktop/wasmedge/build
+make wasmedge_engine -j32
+# → build/tools/sightglass_engine/libwasmedge_engine.so
+```
+
+## Run the sweep
+
+```sh
+# All-in-one driver: 3 processes × 10 iters × every non-SIMD kernel,
+# in IR_JIT and JIT modes. Outputs raw JSON per mode to /tmp/wasm-sg-sweep/.
+~/Desktop/wasmedge/utils/run_sightglass_cli_sweep.sh
+
+# Render the comparison table:
+python3 ~/Desktop/wasmedge/utils/sightglass_json_table.py /tmp/wasm-sg-sweep
+```
+
+Defaults can be overridden via env vars: `SG_PROCESSES`, `SG_ITERS`,
+`SG`, `ENGINE`, `SUITE`, `WASMEDGE_IR_JIT_OPT_LEVEL`.
+
+## Suite
+
+`bench/wasmedge.suite` — non-SIMD subset of the upstream sightglass
+benchmarks (`all.suite` filtered through `wasm2wat --disable-simd`).
+Regenerate if upstream sightglass changes.
+
+## Phase mapping
+
+| sightglass phase | What runs in WasmEdge | Today's metric in `notes/benchmarking/total_improvement.md` |
+|---|---|---|
+| Compilation    | `loadWasm` + `validate` | first part of `Inst.Lat` |
+| Instantiation  | `instantiate` (IR-JIT lowering / LLVM lowering for whole-module JIT lands here) | rest of `Inst.Lat` |
+| Execution      | `_start`, narrowed by `bench.start` / `bench.end` | `WT` |
+| TtV (derived)  | `Compilation + Instantiation + Execution` | `TtV` |
+
+## Direct invocation (single kernel, useful for debugging the shim)
+
+```sh
+WASMEDGE_SIGHTGLASS_MODE=IR_JIT \
+WASMEDGE_IR_JIT_OPT_LEVEL=2 \
+~/Desktop/sightglass/target/release/sightglass-cli benchmark \
+  --engine $(pwd)/tools/sightglass_engine/libwasmedge_engine.so \
+  --processes 1 --iterations-per-process 1 \
+  --raw --output-format json --output-file /tmp/single.json \
+  /path/to/some.wasm
+```
+
+The engine reads the same env vars the in-tree harness does
+(`WASMEDGE_SIGHTGLASS_MODE`, `WASMEDGE_IR_JIT_OPT_LEVEL`,
+`WASMEDGE_TIER2_*`, `WASMEDGE_OSR_*`). One mode per invocation;
+sightglass-cli forks a subprocess per measurement, so env state is
+captured per run.
+
+## Tier-2 + OSR through the shim
+
+All engine modes work through the dlopen'd shim, including
+`WASMEDGE_TIER2_ENABLE=1` with `WASMEDGE_OSR_THRESHOLD=N`. The earlier
+TLS-model bug in `lib/vm/tier2_compiler.cpp` — JIT'd tier-2 code
+emitting `%fs:OFFSET` inline asm that assumed initial-exec TLS layout
+— has been fixed; tier-2 codegen now calls the ORC-bound
+`wasmedge_tier2_get_jit_env` / `wasmedge_tier2_get_exec_ctx`
+accessors, so TLS access goes through the compiler's correct
+sequence regardless of how WasmEdge is linked into the host process.
+
+Sweep example for the full paper-grade three-way comparison:
+
+```sh
+SG_PROCESSES=3 SG_ITERS=10 \
+  utils/run_sightglass_cli_sweep.sh /tmp/wasm-sg-sweep
+# (extend run_sightglass_cli_sweep.sh to add tier2_osr if desired —
+#  set WASMEDGE_TIER2_ENABLE=1 WASMEDGE_TIER2_THRESHOLD=10
+#  WASMEDGE_OSR_THRESHOLD=5000 alongside MODE=IR_JIT.)
+python3 utils/sightglass_json_table.py /tmp/wasm-sg-sweep
+```
+
 # Plugin loader
 
 | Variable | Purpose |
