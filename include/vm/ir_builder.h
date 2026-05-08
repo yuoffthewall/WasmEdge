@@ -170,6 +170,16 @@ private:
     ir_ref TypeRef = pop();
     return {PtrRef, TypeRef};
   }
+  /// Peek the top RefVariant without removing it. Stack layout from pushRef
+  /// is [TypeRef, PtrRef] with PtrRef on top. Returns (PtrRef, TypeRef).
+  std::pair<ir_ref, ir_ref> peekRef() const noexcept {
+    if (ValueStack.size() < 2) {
+      return {IR_UNUSED, IR_UNUSED};
+    }
+    ir_ref PtrRef = ValueStack[ValueStack.size() - 1];
+    ir_ref TypeRef = ValueStack[ValueStack.size() - 2];
+    return {PtrRef, TypeRef};
+  }
 
   /// Process single instruction
   Expect<void> visitInstruction(const AST::Instruction &Instr);

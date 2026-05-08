@@ -2870,31 +2870,34 @@ Expect<void> WasmToIRBuilder::visitBrIf(const AST::Instruction &Instr) {
 
   // Get the target label
   LabelInfo &Target = LabelStack[LabelStack.size() - 1 - LabelIdx];
-  
+
   // Create conditional branch
   ir_ref IfRef = ir_IF(Condition);
-  
+
   // True branch: branch is taken
   ir_IF_TRUE(IfRef);
-  
+
   if (Target.Kind == ControlKind::Loop) {
     emitLoopBackEdge(Target);
   } else {
+    // Wasm spec: br_if leaves the result values on the stack for the
+    // fall-through (false) path. Peek the SSA refs here without removing
+    // them; the IR DAG keeps them live for both arms.
     if (Target.Arity > 0) {
       if (Target.ResultIsRef) {
-        auto [ptrRef, typeRef] = popRef();
+        auto [ptrRef, typeRef] = peekRef();
         Target.RefBranchResults.push_back({typeRef, ptrRef});
       } else {
-        Target.BranchResults.push_back(pop());
+        Target.BranchResults.push_back(ValueStack.back());
       }
     }
     ir_ref BrEnd = ir_END();
     Target.EndList.push_back(BrEnd);
     Target.EndLocals.push_back(Locals);
   }
-  
+
   ir_IF_FALSE(IfRef);
-  
+
   return {};
 }
 
@@ -2922,17 +2925,40 @@ Expect<void> WasmToIRBuilder::visitBrTable(const AST::Instruction &Instr) {
   // jump-table style code instead of a long chain of conditional branches.
   ir_ref SwitchRef = ir_SWITCH(IndexVal);
 
-  auto emitBrTableTarget = [this, ctx](LabelInfo &Target) {
+  // br_table forwards the same set of stack values to whichever target is
+  // taken (per-target arities must match per the validator). Snapshot them
+  // once up front so each target's BranchResults gets the live SSA refs;
+  // popping per-target would drain the stack and feed IR_UNUSED to all but
+  // the first target.
+  ir_ref SharedResult = IR_UNUSED;
+  ir_ref SharedRefType = IR_UNUSED;
+  ir_ref SharedRefPtr = IR_UNUSED;
+  bool SharedIsRef = false;
+  uint32_t SharedArity = 0;
+  if (!Labels.empty()) {
+    LabelInfo &Probe = LabelStack[LabelStack.size() - 1 - Labels[0].TargetIndex];
+    if (Probe.Kind != ControlKind::Loop && Probe.Arity > 0) {
+      SharedArity = Probe.Arity;
+      SharedIsRef = Probe.ResultIsRef;
+      if (SharedIsRef) {
+        std::tie(SharedRefPtr, SharedRefType) = popRef();
+      } else {
+        SharedResult = pop();
+      }
+    }
+  }
+
+  auto emitBrTableTarget = [this, ctx, SharedArity, SharedIsRef, SharedResult,
+                            SharedRefType, SharedRefPtr](LabelInfo &Target) {
     if (Target.Kind == ControlKind::Loop) {
       emitLoopBackEdge(Target);
       return;
     }
-    if (Target.Arity > 0) {
-      if (Target.ResultIsRef) {
-        auto [ptrRef, typeRef] = popRef();
-        Target.RefBranchResults.push_back({typeRef, ptrRef});
+    if (Target.Arity > 0 && SharedArity > 0) {
+      if (SharedIsRef) {
+        Target.RefBranchResults.push_back({SharedRefType, SharedRefPtr});
       } else {
-        Target.BranchResults.push_back(pop());
+        Target.BranchResults.push_back(SharedResult);
       }
     }
     ir_ref BrEnd = ir_END();
