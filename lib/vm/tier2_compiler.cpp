@@ -28,10 +28,20 @@
 #include <unordered_set>
 #include <vector>
 
-// Tier-2 helper defined in ir_jit_engine.cpp. Returns the thread-local
-// JitExecEnv* the running invoke() set up; used by t1_thunks that bridge
-// tier-2 SysV calls back into tier-1's (JitExecEnv*, uint64_t*) ABI.
+// Tier-2 TLS accessors. Both are bound as ORC absolute symbols below; the
+// JIT'd code calls them to obtain its thread-local state.
+//   wasmedge_tier2_get_jit_env  → g_tier2_current_env (JitExecEnv*)
+//   wasmedge_tier2_get_exec_ctx → &Executor::ExecutionContext
+// We deliberately go through a function call rather than emitting direct
+// %fs:OFFSET inline asm. Inline %fs:OFFSET assumes TLS lives in the static
+// TLS block at a fixed offset from the thread pointer — that holds for
+// statically-linked binaries but breaks when WasmEdge is loaded as a
+// dlopen'd shared library (where TLS variables live in dynamically-
+// allocated DTV chunks resolved through __tls_get_addr / TLSDESC). The
+// function-call overhead is on a cross-batch dispatch boundary, not in
+// inner loops, so the cost is negligible.
 extern "C" void *wasmedge_tier2_get_jit_env(void);
+extern "C" void *wasmedge_tier2_get_exec_ctx(void);
 
 // Debug helper gated by WASMEDGE_TIER2_TRACE_FUNC env var. Prints
 // (func_idx, arg0..arg3) on each fwd_thunk entry. Bound via ORC absolute
@@ -765,33 +775,36 @@ Tier2Compiler::compileBatch(Span<const uint32_t> BatchIdx,
   //     set by IRJitEngine::invoke, used by t1_thunks to dispatch tier-2
   //     → tier-1 calls via FuncTable[idx] with the tier-1 ABI.
   {
-    LLVMOrcCSymbolMapPair Pairs[3];
-    Pairs[0].Name =
-        LLVMOrcExecutionSessionIntern(ES, "wasmedge_tier2_get_exec_ctx");
-    Pairs[0].Sym.Address = reinterpret_cast<LLVMOrcJITTargetAddress>(
-        reinterpret_cast<void *>(
-            &Executor::Executor::getThreadLocalExecutionContextPtr));
-    Pairs[0].Sym.Flags.GenericFlags =
-        LLVMJITSymbolGenericFlagsExported | LLVMJITSymbolGenericFlagsCallable;
-    Pairs[0].Sym.Flags.TargetFlags = 0;
+    // ORC absolute-symbol bindings for tier-2 helpers the JIT'd code calls
+    // by name. Bound here (rather than relying on dlsym(RTLD_DEFAULT, ...))
+    // so resolution works regardless of how the WasmEdge libraries are
+    // linked into the host process — including dlopen'd shared libraries
+    // built with `-fvisibility=hidden`. wasmedge_tier2_get_exec_ctx is
+    // defined in proxy.cpp; the other two live in ir_jit_engine.cpp.
+    struct AbsSym {
+      const char *Name;
+      void *Addr;
+    };
+    const AbsSym Syms[] = {
+        {"wasmedge_tier2_trace_thunk",
+         reinterpret_cast<void *>(&wasmedge_tier2_trace_thunk)},
+        {"wasmedge_tier2_get_jit_env",
+         reinterpret_cast<void *>(&wasmedge_tier2_get_jit_env)},
+        {"wasmedge_tier2_get_exec_ctx",
+         reinterpret_cast<void *>(&wasmedge_tier2_get_exec_ctx)},
+    };
+    constexpr size_t NumSyms = sizeof(Syms) / sizeof(Syms[0]);
+    LLVMOrcCSymbolMapPair Pairs[NumSyms];
+    for (size_t I = 0; I < NumSyms; ++I) {
+      Pairs[I].Name = LLVMOrcExecutionSessionIntern(ES, Syms[I].Name);
+      Pairs[I].Sym.Address =
+          reinterpret_cast<LLVMOrcJITTargetAddress>(Syms[I].Addr);
+      Pairs[I].Sym.Flags.GenericFlags = LLVMJITSymbolGenericFlagsExported |
+                                         LLVMJITSymbolGenericFlagsCallable;
+      Pairs[I].Sym.Flags.TargetFlags = 0;
+    }
 
-    Pairs[1].Name =
-        LLVMOrcExecutionSessionIntern(ES, "wasmedge_tier2_get_jit_env");
-    Pairs[1].Sym.Address = reinterpret_cast<LLVMOrcJITTargetAddress>(
-        reinterpret_cast<void *>(&wasmedge_tier2_get_jit_env));
-    Pairs[1].Sym.Flags.GenericFlags =
-        LLVMJITSymbolGenericFlagsExported | LLVMJITSymbolGenericFlagsCallable;
-    Pairs[1].Sym.Flags.TargetFlags = 0;
-
-    Pairs[2].Name =
-        LLVMOrcExecutionSessionIntern(ES, "wasmedge_tier2_trace_thunk");
-    Pairs[2].Sym.Address = reinterpret_cast<LLVMOrcJITTargetAddress>(
-        reinterpret_cast<void *>(&wasmedge_tier2_trace_thunk));
-    Pairs[2].Sym.Flags.GenericFlags =
-        LLVMJITSymbolGenericFlagsExported | LLVMJITSymbolGenericFlagsCallable;
-    Pairs[2].Sym.Flags.TargetFlags = 0;
-
-    LLVMOrcMaterializationUnitRef MU = LLVMOrcAbsoluteSymbols(Pairs, 3);
+    LLVMOrcMaterializationUnitRef MU = LLVMOrcAbsoluteSymbols(Pairs, NumSyms);
     if (LLVMErrorRef Err = LLVMOrcJITDylibDefine(MainJD, MU)) {
       char *Msg = LLVMGetErrorMessage(Err);
       spdlog::error("tier2: define absolute symbols failed: {}",

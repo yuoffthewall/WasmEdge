@@ -118,6 +118,16 @@ void *Executor::getThreadLocalExecutionContextPtr() noexcept {
   return &Executor::ExecutionContext;
 }
 
+// C-linkage accessor for the tier-2 JIT. The compiled tier-2 code calls
+// this (via an ORC absolute-symbol binding) to obtain the address of the
+// per-thread Executor::ExecutionContext. We use a function call rather
+// than an inline %fs:OFFSET load so the access is correct under every
+// linkage mode — including dlopen'd shared libraries, where TLS lives in
+// dynamically-allocated chunks at no fixed offset from %fs:0.
+extern "C" void *wasmedge_tier2_get_exec_ctx(void) {
+  return Executor::getThreadLocalExecutionContextPtr();
+}
+
 Expect<void> Executor::proxyTrap(Runtime::StackManager &,
                                  const uint32_t Code) noexcept {
   return Unexpect(static_cast<ErrCategory>(Code >> 24), Code);
