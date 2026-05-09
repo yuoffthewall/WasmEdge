@@ -104,6 +104,44 @@ namespace WasmEdge::VM {
 
 namespace {
 
+bool installTier2AbsoluteSymbols(LLVMOrcLLJITRef JIT,
+                                 const char *Context) {
+  LLVMOrcJITDylibRef MainJD = LLVMOrcLLJITGetMainJITDylib(JIT);
+  LLVMOrcExecutionSessionRef ES = LLVMOrcLLJITGetExecutionSession(JIT);
+  struct AbsSym {
+    const char *Name;
+    void *Addr;
+  };
+  const AbsSym Syms[] = {
+      {"wasmedge_tier2_trace_thunk",
+       reinterpret_cast<void *>(&wasmedge_tier2_trace_thunk)},
+      {"wasmedge_tier2_get_jit_env",
+       reinterpret_cast<void *>(&wasmedge_tier2_get_jit_env)},
+      {"wasmedge_tier2_get_exec_ctx",
+       reinterpret_cast<void *>(&wasmedge_tier2_get_exec_ctx)},
+  };
+  constexpr size_t NumSyms = sizeof(Syms) / sizeof(Syms[0]);
+  LLVMOrcCSymbolMapPair Pairs[NumSyms];
+  for (size_t I = 0; I < NumSyms; ++I) {
+    Pairs[I].Name = LLVMOrcExecutionSessionIntern(ES, Syms[I].Name);
+    Pairs[I].Sym.Address =
+        reinterpret_cast<LLVMOrcJITTargetAddress>(Syms[I].Addr);
+    Pairs[I].Sym.Flags.GenericFlags = LLVMJITSymbolGenericFlagsExported |
+                                       LLVMJITSymbolGenericFlagsCallable;
+    Pairs[I].Sym.Flags.TargetFlags = 0;
+  }
+
+  LLVMOrcMaterializationUnitRef MU = LLVMOrcAbsoluteSymbols(Pairs, NumSyms);
+  if (LLVMErrorRef Err = LLVMOrcJITDylibDefine(MainJD, MU)) {
+    char *Msg = LLVMGetErrorMessage(Err);
+    spdlog::error("{}: define absolute symbols failed: {}",
+                  Context ? Context : "tier2", Msg ? Msg : "(null)");
+    LLVMDisposeErrorMessage(Msg);
+    return false;
+  }
+  return true;
+}
+
 /// Emit a call to `wasmedge_tier2_get_jit_env`, returning the current
 /// thread's `JitExecEnv*`. The call is resolved via an ORC absolute-symbol
 /// binding installed when the tier-2 LLJIT is created (see
@@ -1545,6 +1583,12 @@ buildIRJitEntryThunks(Span<const IRJitEntryThunkReq> Reqs) {
   }
 
   LLVMOrcJITDylibRef MainJD = LLVMOrcLLJITGetMainJITDylib(JIT);
+  if (!installTier2AbsoluteSymbols(JIT, "ir-jit entry thunks")) {
+    LLVMOrcDisposeLLJIT(JIT);
+    LLVMOrcDisposeThreadSafeModule(TSM);
+    LLVMOrcDisposeThreadSafeContext(TSCtx);
+    return Unexpect(ErrCode::Value::RuntimeError);
+  }
   if (LLVMErrorRef Err = LLVMOrcLLJITAddLLVMIRModule(JIT, MainJD, TSM)) {
     char *Msg = LLVMGetErrorMessage(Err);
     spdlog::error("ir-jit entry thunks: addLLVMIRModule failed: {}",

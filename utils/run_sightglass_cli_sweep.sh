@@ -23,10 +23,12 @@ OUT_DIR="${1:-/tmp/wasm-sg-sweep}"
 mkdir -p "$OUT_DIR"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export REPO_ROOT
 
 # SIGHTGLASS_DIR is the upstream sightglass checkout. Default points at the
 # location utils/setup_bench_deps.sh writes to. Override via the env var if
-# you keep sightglass elsewhere.
+# you keep sightglass elsewhere. Only needed for the upstream wasmedge.suite;
+# the in-tree strong suite uses ${REPO_ROOT}/test/ir/testdata/sightglass-strong.
 SIGHTGLASS_DIR="${SIGHTGLASS_DIR:-$REPO_ROOT/bench/upstream/sightglass}"
 export SIGHTGLASS_DIR
 
@@ -92,7 +94,14 @@ run_mode() {
 
 # Tier-1 (no tier-2). Phase costs: compilation = parse + IR-JIT lowering at
 # instantiate-time prep; instantiation = main IR-JIT pipeline.
-run_mode IR_JIT tier1
+run_mode IR_JIT tier1 \
+  env -u WASMEDGE_TIER2_ENABLE \
+      -u WASMEDGE_TIER2_THRESHOLD \
+      -u WASMEDGE_OSR_THRESHOLD \
+      -u WASMEDGE_OSR_MIN_FUNC \
+      -u WASMEDGE_OSR_MAX_FUNC \
+      -u WASMEDGE_OSR_MIN_LOOP \
+      -u WASMEDGE_OSR_MAX_LOOP
 
 # Tier-2 with OSR — IR JIT plus the LLVM background worker and OSR
 # back-edge instrumentation. The thresholds match the in-tree harness
@@ -103,7 +112,14 @@ run_mode IR_JIT tier2_osr \
       WASMEDGE_OSR_THRESHOLD=5000
 
 # Whole-module LLVM JIT — primary comparator.
-run_mode JIT llvm_jit
+run_mode JIT llvm_jit \
+  env -u WASMEDGE_TIER2_ENABLE \
+      -u WASMEDGE_TIER2_THRESHOLD \
+      -u WASMEDGE_OSR_THRESHOLD \
+      -u WASMEDGE_OSR_MIN_FUNC \
+      -u WASMEDGE_OSR_MAX_FUNC \
+      -u WASMEDGE_OSR_MIN_LOOP \
+      -u WASMEDGE_OSR_MAX_LOOP
 
 # Interpreter omitted by default (multi-minute kernels). Uncomment if needed.
 # run_mode Interpreter interp

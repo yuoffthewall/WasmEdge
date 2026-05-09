@@ -40,7 +40,7 @@ The real answer, from per-function bisection (numbers below):
 
 ## Reproduced setup
 
-`sightglass-strong/blind-sig.wasm`. Single-kernel runs, isolated, 3-run
+`sightglass-strong/blind-sig/benchmark.wasm`. Single-kernel runs, isolated, 3-run
 median, `WASMEDGE_QUIET=1`. WT is the time between the wasm's
 `bench.start` and `bench.end` calls — apples-to-apples across arms.
 

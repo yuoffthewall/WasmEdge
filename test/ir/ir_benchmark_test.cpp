@@ -1321,11 +1321,13 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
     GTEST_SKIP() << "Sightglass testdata not found. Run utils/download_sightglass.sh";
   }
 
-  // Discover all .wasm kernels (run all in testdata, not just preferred list)
+  // Discover all kernels (per-kernel-dir layout: <kernel>/benchmark.wasm)
   std::vector<std::filesystem::path> kernels;
   for (const auto &e : std::filesystem::directory_iterator(SightglassDir)) {
-    if (e.path().extension() == ".wasm")
-      kernels.push_back(e.path());
+    if (!e.is_directory()) continue;
+    auto wasm = e.path() / "benchmark.wasm";
+    if (std::filesystem::exists(wasm))
+      kernels.push_back(wasm);
   }
   std::sort(kernels.begin(), kernels.end());
 
@@ -1339,10 +1341,10 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
   if (quickEnv && quickEnv[0] == '1') {
     std::vector<std::filesystem::path> filtered;
     for (const auto &p : kernels) {
-      const std::string stem = p.stem().string();
-      if (stem == "richards")
+      const std::string kernel = p.parent_path().filename().string();
+      if (kernel == "richards")
         continue;
-      if (stem.compare(0, 13, "spidermonkey-") == 0)
+      if (kernel.compare(0, 13, "spidermonkey-") == 0)
         continue;
       filtered.push_back(p);
     }
@@ -1353,10 +1355,10 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
   const char *singleEnv = std::getenv("WASMEDGE_SIGHTGLASS_KERNEL");
   if (singleEnv && singleEnv[0] != '\0') {
     std::string single(singleEnv);
-    if (single.size() < 5 || single.compare(single.size() - 5, 5, ".wasm") != 0)
-      single += ".wasm";
+    if (single.size() >= 5 && single.compare(single.size() - 5, 5, ".wasm") == 0)
+      single.resize(single.size() - 5);
     auto it = std::remove_if(kernels.begin(), kernels.end(), [&single](const std::filesystem::path &p) {
-      return p.filename().string() != single && p.stem().string() != single;
+      return p.parent_path().filename().string() != single;
     });
     kernels.erase(it, kernels.end());
   }
@@ -1389,7 +1391,7 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
   std::cout << std::string(88, '-') << std::endl;
 
   for (const auto &wasmPath : kernels) {
-    std::string kernelName = wasmPath.stem().string();
+    std::string kernelName = wasmPath.parent_path().filename().string();
     std::cout << "Running kernel: " << kernelName << std::endl;
     StdioCapture interpCap, jitCap, irJitCap, aotCap;
     bool interpOk = false;
@@ -1397,40 +1399,24 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
     bool irJitOk = false;
     bool aotOk = false;
 
-    // Helper: load .input files for this kernel into a WasiStubModule's virtual FS
+    // Helper: load every input file in the kernel's directory into the WASI VFS
+    // under the same name the kernel reads (file names are already unprefixed).
     auto loadVirtualFiles = [&](WasiStubModule &stub) {
-      for (const auto &e : std::filesystem::directory_iterator(SightglassDir)) {
+      auto kernelDir = SightglassDir / kernelName;
+      if (!std::filesystem::is_directory(kernelDir)) return;
+      for (const auto &e : std::filesystem::directory_iterator(kernelDir)) {
+        if (!e.is_regular_file()) continue;
         auto fname = e.path().filename().string();
-        // Match files like "shootout-ackermann.m.input" for kernel "shootout-ackermann"
-        if (fname.size() > kernelName.size() + 1 &&
-            fname.substr(0, kernelName.size()) == kernelName &&
-            fname.find(".input") != std::string::npos) {
-          std::ifstream ifs(e.path(), std::ios::binary);
-          if (ifs) {
-            std::string content((std::istreambuf_iterator<char>(ifs)),
-                                std::istreambuf_iterator<char>());
-            stub.addVirtualFile(fname, std::move(content));
-          }
-        }
-      }
-      // Map kernel-prefixed default inputs to names benchmarks expect (default.input / default.input.md)
-      auto loadAs = [&](const std::string &prefixedName, const std::string &virtualName) {
-        auto path = SightglassDir / prefixedName;
-        if (!std::filesystem::exists(path) || !std::filesystem::is_regular_file(path))
-          return;
-        std::ifstream ifs(path, std::ios::binary);
-        if (!ifs) return;
+        if (fname == "benchmark.wasm" ||
+            fname == "benchmark.stdout.expected" ||
+            fname == "benchmark.stderr.expected")
+          continue;
+        std::ifstream ifs(e.path(), std::ios::binary);
+        if (!ifs) continue;
         std::string content((std::istreambuf_iterator<char>(ifs)),
                             std::istreambuf_iterator<char>());
-        stub.addVirtualFile(virtualName, std::move(content));
-      };
-      loadAs(kernelName + ".default.input", "default.input");
-      loadAs(kernelName + ".default.input.md", "default.input.md");
-      loadAs(kernelName + ".secret.der", "secret.der");
-      loadAs(kernelName + ".small.input", "small.input");
-      // Legacy: pulldown-cmark also accepts default.input.md without prefix
-      if (kernelName == "pulldown-cmark")
-        loadAs("default.input.md", "default.input.md");
+        stub.addVirtualFile(fname, std::move(content));
+      }
     };
 
     const char *modes[] = {"Interpreter", "IR_JIT", "JIT"};
@@ -1627,13 +1613,12 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
 
     // Correctness: compare captured stdio only for streams that have a golden file next to the
     // .wasm (empty golden file => empty string). Kernels without goldens still run for metrics.
-    const auto goldenStdout = SightglassDir / (kernelName + ".stdout.expected");
-    const auto goldenStderr = SightglassDir / (kernelName + ".stderr.expected");
+    const auto goldenStdout = SightglassDir / kernelName / "benchmark.stdout.expected";
+    const auto goldenStderr = SightglassDir / kernelName / "benchmark.stderr.expected";
     const bool hasStdoutGolden = std::filesystem::exists(goldenStdout);
     const bool hasStderrGolden = std::filesystem::exists(goldenStderr);
 
-    auto loadExpected = [&](const std::string &suffix) -> std::string {
-      auto path = SightglassDir / (kernelName + suffix);
+    auto loadExpected = [](const std::filesystem::path &path) -> std::string {
       std::ifstream ifs(path, std::ios::binary);
       if (!ifs) return "";
       return std::string((std::istreambuf_iterator<char>(ifs)),
@@ -1643,9 +1628,9 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
     std::string expectedStdout;
     std::string expectedStderr;
     if (hasStdoutGolden)
-      expectedStdout = loadExpected(".stdout.expected");
+      expectedStdout = loadExpected(goldenStdout);
     if (hasStderrGolden)
-      expectedStderr = loadExpected(".stderr.expected");
+      expectedStderr = loadExpected(goldenStderr);
 
     auto checkExpected = [&](const std::string &label, const StdioCapture &cap, bool ok) {
       if (!ok || (!hasStdoutGolden && !hasStderrGolden))

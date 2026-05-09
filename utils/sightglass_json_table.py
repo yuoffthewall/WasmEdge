@@ -31,10 +31,11 @@ def load(path: Path) -> dict:
     with open(path) as fh:
         records = json.load(fh)
     for r in records:
-        kernel = Path(r["wasm"]).stem
-        # The "noop" kernel reports its phase as "Execution" but the wasm
-        # does ~no real work between bench.start/end; keep it for parity
-        # with the in-tree harness's noop row.
+        # Per-kernel-dir layout (.../sightglass-strong/<kernel>/benchmark.wasm)
+        # produces basename "benchmark" for every kernel — fall back to the
+        # parent dir name. Old flat layout (<kernel>.wasm) is also accepted.
+        wasm_path = Path(r["wasm"])
+        kernel = wasm_path.parent.name if wasm_path.stem == "benchmark" else wasm_path.stem
         out[kernel][r["phase"]].append(int(r["count"]))
     return out
 
@@ -78,9 +79,11 @@ def render(modes: dict, baseline: str = "llvm_jit") -> None:
     # ---- Table 1: per-phase counts (cycles) for every mode ----
     print(f"# Sightglass — phase breakdown (median {modes_unit_hint(modes)} per kernel)")
     print()
+    non_baseline = [m for m in mode_labels if m != baseline]
+
     if baseline:
-        print(f"`vs {baseline}` columns are speedup ratios — "
-              f"`{baseline} count / mode count`. > 1 means the mode is "
+        print(f"`{baseline}/<mode>` columns are speedup ratios — "
+              f"`{baseline} count / <mode> count`. > 1 means `<mode>` is "
               f"faster than `{baseline}` at that phase.")
         print()
     cols = ["Kernel"]
@@ -88,8 +91,9 @@ def render(modes: dict, baseline: str = "llvm_jit") -> None:
         for ph in PHASES:
             cols.append(f"{mode} {ph[:5]}")
     if baseline:
-        for ph in PHASES:
-            cols.append(f"vs {baseline} {ph[:5]}")
+        for mode in non_baseline:
+            for ph in PHASES:
+                cols.append(f"{baseline}/{mode} {ph[:5]}")
     print("| " + " | ".join(cols) + " |")
     sep = ["---"] + ["---:"] * (len(cols) - 1)
     print("| " + " | ".join(sep) + " |")
@@ -101,20 +105,14 @@ def render(modes: dict, baseline: str = "llvm_jit") -> None:
                 row.append(fmt_count(modes[mode].get(k, {}).get(ph)))
         if baseline:
             base = modes.get(baseline, {}).get(k, {})
-            for ph in PHASES:
-                base_v = base.get(ph)
-                # For each non-baseline mode, compute ratio against baseline.
-                # We show one column per phase, but only against the *first*
-                # non-baseline mode to keep table width manageable.
-                others = [m for m in mode_labels if m != baseline]
-                if not others or not base_v:
-                    row.append("—")
-                    continue
-                this_v = modes[others[0]].get(k, {}).get(ph)
-                if not this_v or this_v <= 0:
-                    row.append("—")
-                else:
-                    row.append(fmt_ratio(base_v / this_v))
+            for mode in non_baseline:
+                for ph in PHASES:
+                    base_v = base.get(ph)
+                    this_v = modes[mode].get(k, {}).get(ph)
+                    if not base_v or not this_v or this_v <= 0:
+                        row.append("—")
+                    else:
+                        row.append(fmt_ratio(base_v / this_v))
         print("| " + " | ".join(row) + " |")
 
     # ---- Aggregates ----

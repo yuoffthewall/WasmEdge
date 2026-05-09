@@ -6,7 +6,7 @@
 #
 # Must be invoked from the cmake build directory. Expects
 # `./test/ir/wasmedgeIRBenchmarkTests` (built Release for perf) and
-# `../test/ir/testdata/sightglass-strong/*.wasm` to exist.
+# `../test/ir/testdata/sightglass-strong/*/benchmark.wasm` to exist.
 #
 # Usage:
 #   cd build
@@ -34,8 +34,8 @@ run_sweep() {
   local run="$1"; shift
   local logfile="${LOG_PREFIX}-${mode}-run${run}.log"
   echo "=== mode=${mode} run=${run} start $(date -Iseconds) ===" | tee "${logfile}"
-  for wasm in "${SUITE_DIR}"/*.wasm; do
-    kernel="$(basename "$wasm" .wasm)"
+  for wasm in "${SUITE_DIR}"/*/benchmark.wasm; do
+    kernel="$(basename "$(dirname "$wasm")")"
     echo "Testing $kernel:" | tee -a "${logfile}"
     "$@" \
       WASMEDGE_SIGHTGLASS_DIR=sightglass-strong \
@@ -50,7 +50,15 @@ run_sweep() {
 
 for run in 1 2 3; do
   # tier-1 arm: IR_JIT with tier-2 disabled.
-  run_sweep tier1 "${run}" env WASMEDGE_SIGHTGLASS_MODE=IR_JIT
+  run_sweep tier1 "${run}" env \
+    -u WASMEDGE_TIER2_ENABLE \
+    -u WASMEDGE_TIER2_THRESHOLD \
+    -u WASMEDGE_OSR_THRESHOLD \
+    -u WASMEDGE_OSR_MIN_FUNC \
+    -u WASMEDGE_OSR_MAX_FUNC \
+    -u WASMEDGE_OSR_MIN_LOOP \
+    -u WASMEDGE_OSR_MAX_LOOP \
+    WASMEDGE_SIGHTGLASS_MODE=IR_JIT
 
   # tier-2 + OSR arm.
   run_sweep tier2 "${run}" env \
@@ -60,7 +68,15 @@ for run in 1 2 3; do
     WASMEDGE_OSR_THRESHOLD=5000
 
   # LLVM JIT arm (whole-module).
-  run_sweep llvm "${run}" env WASMEDGE_SIGHTGLASS_MODE=JIT
+  run_sweep llvm "${run}" env \
+    -u WASMEDGE_TIER2_ENABLE \
+    -u WASMEDGE_TIER2_THRESHOLD \
+    -u WASMEDGE_OSR_THRESHOLD \
+    -u WASMEDGE_OSR_MIN_FUNC \
+    -u WASMEDGE_OSR_MAX_FUNC \
+    -u WASMEDGE_OSR_MIN_LOOP \
+    -u WASMEDGE_OSR_MAX_LOOP \
+    WASMEDGE_SIGHTGLASS_MODE=JIT
 done
 
 echo "=== all sweeps done $(date -Iseconds) ==="

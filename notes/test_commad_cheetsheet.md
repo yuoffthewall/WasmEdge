@@ -54,8 +54,8 @@ cd build && WASMEDGE_SIGHTGLASS_MODE=IR_JIT WASMEDGE_IR_JIT_OPT_LEVEL=2 WASMEDGE
 
 ```shell
 cd build && \
-for wasm in ../test/ir/testdata/sightglass/*.wasm; do
-  kernel="$(basename "$wasm" .wasm)"
+for wasm in ../test/ir/testdata/sightglass/*/benchmark.wasm; do
+  kernel="$(basename "$(dirname "$wasm")")"
   echo "Testing $kernel:"
   WASMEDGE_SIGHTGLASS_KERNEL="$kernel" \
   WASMEDGE_SIGHTGLASS_MODE=IR_JIT \
@@ -77,8 +77,8 @@ Switch between sets with `WASMEDGE_SIGHTGLASS_DIR` (relative paths resolve again
 
 ```shell
 cd build && \
-for wasm in ../test/ir/testdata/sightglass-strong/*.wasm; do
-  kernel="$(basename "$wasm" .wasm)"
+for wasm in ../test/ir/testdata/sightglass-strong/*/benchmark.wasm; do
+  kernel="$(basename "$(dirname "$wasm")")"
   echo "Testing $kernel:"
   WASMEDGE_SIGHTGLASS_DIR=sightglass-strong \
   WASMEDGE_SIGHTGLASS_KERNEL="$kernel" \
@@ -96,8 +96,8 @@ The trailing `grep` is required by the repo's testing rules (see `CLAUDE.md` rul
 
 ```shell
 cd build && \
-for wasm in ../test/ir/testdata/sightglass/*.wasm; do
-  kernel="$(basename "$wasm" .wasm)"
+for wasm in ../test/ir/testdata/sightglass/*/benchmark.wasm; do
+  kernel="$(basename "$(dirname "$wasm")")"
   echo "Testing $kernel:"
   WASMEDGE_SIGHTGLASS_KERNEL="$kernel" \
   WASMEDGE_SIGHTGLASS_MODE=IR_JIT \
@@ -196,8 +196,8 @@ This is the configuration referenced in `osr_doc.md` §11 (30/33 kernels pass at
 
 ```shell
 cd build && \
-for wasm in ../test/ir/testdata/sightglass-strong/*.wasm; do
-  kernel="$(basename "$wasm" .wasm)"
+for wasm in ../test/ir/testdata/sightglass-strong/*/benchmark.wasm; do
+  kernel="$(basename "$(dirname "$wasm")")"
   echo "Testing $kernel:"
   WASMEDGE_SIGHTGLASS_DIR=sightglass-strong \
   WASMEDGE_SIGHTGLASS_KERNEL="$kernel" \
@@ -250,11 +250,24 @@ python3 ~/Desktop/wasmedge/utils/sightglass_json_table.py /tmp/wasm-sg-sweep
 Defaults can be overridden via env vars: `SG_PROCESSES`, `SG_ITERS`,
 `SG`, `ENGINE`, `SUITE`, `WASMEDGE_IR_JIT_OPT_LEVEL`.
 
-## Suite
+## Suites
 
-`bench/wasmedge.suite` — non-SIMD subset of the upstream sightglass
-benchmarks (`all.suite` filtered through `wasm2wat --disable-simd`).
-Regenerate if upstream sightglass changes.
+Two are checked in:
+
+- `bench/wasmedge.suite` — non-SIMD subset of the **upstream** sightglass
+  benchmarks at `bench/upstream/sightglass/benchmarks/...` (cloned by
+  `utils/setup_bench_deps.sh`). Regenerate if upstream sightglass changes.
+- `bench/wasmedge-strong.suite` — the **in-tree strong set** at
+  `test/ir/testdata/sightglass-strong/<kernel>/benchmark.wasm` (39 kernels,
+  workTimeUs ~5–10 s, wasmtime-oracled goldens). No upstream clone needed.
+  Use for paper-grade measurements.
+
+Run the strong suite through the same driver:
+
+```sh
+SUITE=$(pwd)/bench/wasmedge-strong.suite \
+  utils/run_sightglass_cli_sweep.sh /tmp/wasm-sg-strong-sweep
+```
 
 ## Phase mapping
 
