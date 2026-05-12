@@ -234,16 +234,11 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
     }
 
     const auto &CodeSegs = CodeSec.getContent();
-    // ----------------------------------------------------------------
-    // Pre-pass: mark wasm functions we skip when IR-JIT-compiling this module.
-    // SkipJit is indexed by module function index (imports, then defined bodies).
-    // - Import entries are marked true for a contiguous index space; this compile
-    //   loop only walks defined functions (FuncIdx >= ImportFuncNum).
-    // - A defined function is skipped if its body is non-empty and starts with
-    //   `unreachable` (trap stub); these cannot be compiled by the IR backend.
-    // Calls to skipped functions are routed through jit_host_call which falls
-    // back to the interpreter.
-    // ----------------------------------------------------------------
+    // SkipJit is indexed by module function index (imports, then defined
+    // bodies). Imports are marked true; defined funcs default to false and
+    // may be flipped true by the bisection knob below. Skipped defined
+    // funcs JIT into a router stub (buildInterpRouter) that forwards to
+    // jit_host_call, so FuncTable[FuncIdx] is always a typed JIT entry.
     uint32_t TotalDefined = static_cast<uint32_t>(CodeSegs.size());
     std::vector<bool> SkipJit(ImportFuncNum + TotalDefined, false);
 
@@ -251,11 +246,25 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
       SkipJit[i] = true;
     }
 
-    for (uint32_t ci = 0; ci < TotalDefined; ci++) {
-      auto Instrs = CodeSegs[ci].getExpr().getInstrs();
-      if (!Instrs.empty() &&
-          Instrs.begin()->getOpCode() == OpCode::Unreachable) {
-        SkipJit[ImportFuncNum + ci] = true;
+    // Bisection knobs: skip JIT for funcs outside [MIN_FUNC, MAX_FUNC] so they
+    // route through host_call → interpreter. Lets us bracket which compiled
+    // wasm function triggers a misbehavior.
+    uint32_t JitMin = 0;
+    uint32_t JitMax = UINT32_MAX;
+    if (const char *T = std::getenv("WASMEDGE_IR_JIT_MIN_FUNC")) {
+      JitMin = static_cast<uint32_t>(std::atoll(T));
+    }
+    if (const char *T = std::getenv("WASMEDGE_IR_JIT_MAX_FUNC")) {
+      JitMax = static_cast<uint32_t>(std::atoll(T));
+    }
+    if (JitMin != 0 || JitMax != UINT32_MAX) {
+      spdlog::info("IR JIT bisect: compiling FuncIdx in [{}, {}]; outside route to interp",
+                   JitMin, JitMax);
+      for (uint32_t ci = 0; ci < TotalDefined; ci++) {
+        uint32_t fi = ImportFuncNum + ci;
+        if (fi < JitMin || fi > JitMax) {
+          SkipJit[fi] = true;
+        }
       }
     }
 
@@ -265,12 +274,10 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
       for (uint32_t ci = 0; ci < TotalDefined; ci++) {
         if (SkipJit[ImportFuncNum + ci]) {
           SkipCount++;
-          spdlog::info("IR JIT: trap stub at FuncIdx={} (ImportFuncNum={}, ci={})",
-                       ImportFuncNum + ci, ImportFuncNum, ci);
         }
       }
       if (SkipCount > 0) {
-        spdlog::info("IR JIT: skipping {}/{} defined funcs (unreachable trap stubs)",
+        spdlog::info("IR JIT: skipping {}/{} defined funcs (bisect-excluded)",
                      SkipCount, TotalDefined);
       }
     }
@@ -287,14 +294,6 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
       auto *FuncInst = ModInst->unsafeGetFunction(FuncIdx);
       
       if (!FuncInst) {
-        CodeIdx++;
-        FuncIdx++;
-        continue;
-      }
-
-      // Skip trap stubs (body starts with unreachable); see pre-pass above.
-      if (SkipJit[FuncIdx]) {
-        spdlog::debug("IR JIT: skip func {} (unreachable trap stub)", FuncIdx);
         CodeIdx++;
         FuncIdx++;
         continue;
@@ -379,7 +378,12 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
         }
         
         spdlog::debug("IR JIT: Building func {}", FuncIdx);
-        auto BuildRes = IRBuilder.buildFromInstructions(InstrVec);
+        // SkipJit (only set by the bisection knob now) emits a router-stub
+        // body that calls jit_host_call(env, FuncIdx, args). This keeps
+        // FuncTable[FuncIdx] populated with a typed JIT entry so direct
+        // callers don't need a null-check trampoline.
+        auto BuildRes = SkipJit[FuncIdx] ? IRBuilder.buildInterpRouter()
+                                         : IRBuilder.buildFromInstructions(InstrVec);
         if (!BuildRes.has_value()) {
           spdlog::info("IR JIT: func {} build failed: {}", FuncIdx,
                        static_cast<uint32_t>(BuildRes.error()));

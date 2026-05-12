@@ -108,6 +108,13 @@ public:
   /// Build IR from WebAssembly instruction sequence
   Expect<void> buildFromInstructions(Span<const AST::Instruction> Instrs);
 
+  /// Emit a stub body for functions skipped from real JIT (e.g. bisection
+  /// knob). The stub calls jit_host_call(env, FuncIdx, args) and returns
+  /// the result unboxed to the wasm-declared return type. This keeps
+  /// FuncTable[FuncIdx] populated with a typed JIT entry so direct calls
+  /// can use the typed-direct-call lowering uniformly.
+  Expect<void> buildInterpRouter();
+
   /// Finalize and get the IR context
   ir_ctx *getIRContext() noexcept { return &Ctx; }
 
@@ -275,7 +282,6 @@ private:
   ir_ref GlobalBasePtr;                     // Loaded from EnvPtr
   ir_ref MemoryBase;                        // Loaded from EnvPtr
   ir_ref HostCallFnPtr;                     // jit_host_call address from EnvPtr
-  ir_ref DirectOrHostFnPtr;                 // jit_direct_or_host (null-safe call) from EnvPtr
   ir_ref MemoryGrowFnPtr;                   // jit_memory_grow from EnvPtr
   ir_ref MemorySizeFnPtr;                   // jit_memory_size from EnvPtr
   ir_ref CallIndirectFnPtr;                 // jit_call_indirect from EnvPtr
