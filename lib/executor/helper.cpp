@@ -164,48 +164,6 @@ extern "C" uint64_t jit_host_call(WasmEdge::VM::JitExecEnv *env,
   return retVal;
 }
 
-/// Trampoline for direct "call": if funcPtr is null (import), dispatch via
-/// jit_host_call; otherwise call the JIT function. Prevents null deref when
-/// ImportFuncNum is wrong or table entry is null.
-/// retTypeCode: 0=void, 1=i32, 2=i64, 3=f32, 4=f64
-extern "C" uint64_t jit_direct_or_host(WasmEdge::VM::JitExecEnv *env,
-                                       void *funcPtr, uint32_t funcIdx,
-                                       uint64_t *args, uint32_t retTypeCode) {
-  if (!funcPtr)
-    return jit_host_call(env, funcIdx, args);
-  switch (retTypeCode) {
-  case 0: {
-    using Fn = void (*)(WasmEdge::VM::JitExecEnv *, uint64_t *);
-    reinterpret_cast<Fn>(funcPtr)(env, args);
-    return 0;
-  }
-  case 1: {
-    using Fn = uint64_t (*)(WasmEdge::VM::JitExecEnv *, uint64_t *);
-    return reinterpret_cast<Fn>(funcPtr)(env, args) & 0xFFFFFFFFu;
-  }
-  case 2: {
-    using Fn = uint64_t (*)(WasmEdge::VM::JitExecEnv *, uint64_t *);
-    return reinterpret_cast<Fn>(funcPtr)(env, args);
-  }
-  case 3: {
-    using Fn = float (*)(WasmEdge::VM::JitExecEnv *, uint64_t *);
-    float f = reinterpret_cast<Fn>(funcPtr)(env, args);
-    uint64_t u;
-    std::memcpy(&u, &f, sizeof(f));
-    return u;
-  }
-  case 4: {
-    using Fn = double (*)(WasmEdge::VM::JitExecEnv *, uint64_t *);
-    double d = reinterpret_cast<Fn>(funcPtr)(env, args);
-    uint64_t u;
-    std::memcpy(&u, &d, sizeof(d));
-    return u;
-  }
-  default:
-    return 0;
-  }
-}
-
 /// call_indirect trampoline: delegates to Executor::jitCallIndirect which has
 /// access to protected ModuleInstance members for proper type checking.
 extern "C" uint64_t jit_call_indirect(WasmEdge::VM::JitExecEnv *env,
@@ -1005,6 +963,11 @@ Executor::enterFunction(Runtime::StackManager &StackMgr,
         } else if (F->isCompiledFunction()) {
           Cache.FuncTable[I] = F->getSymbol().get();
         } else {
+          // No JIT entry and no AOT symbol. Should not occur in practice:
+          // trap stubs JIT into a call-then-trap body, bisected-out funcs
+          // JIT into a host-call router, and other defined funcs JIT into
+          // their real bodies. Only path here is a hard compile_fail; treat
+          // it as "trap on call" by routing to the unreachable trap stub.
           Cache.FuncTable[I] =
               reinterpret_cast<void *>(&WasmEdge::VM::jit_unreachable_trap);
         }

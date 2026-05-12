@@ -108,7 +108,7 @@ static bool irJitBoundCheckEnabled() {
 }  // namespace
 
 WasmToIRBuilder::WasmToIRBuilder() noexcept
-    : Initialized(false), CurrentPathTerminated(false), EnvPtr(0), FuncTablePtr(0), FuncTableSize(0), GlobalBasePtr(0), MemoryBase(0), HostCallFnPtr(0), DirectOrHostFnPtr(0), CallIndirectFnPtr(0), ArgsPtr(0), MemorySize(0), LocalCount(0), SharedCallArgs(0) {}
+    : Initialized(false), CurrentPathTerminated(false), EnvPtr(0), FuncTablePtr(0), FuncTableSize(0), GlobalBasePtr(0), MemoryBase(0), HostCallFnPtr(0), CallIndirectFnPtr(0), ArgsPtr(0), MemorySize(0), LocalCount(0), SharedCallArgs(0) {}
 
 WasmToIRBuilder::~WasmToIRBuilder() noexcept { reset(); }
 
@@ -128,7 +128,6 @@ void WasmToIRBuilder::reset() noexcept {
   GlobalBasePtr = 0;
   MemoryBase = 0;
   HostCallFnPtr = 0;
-  DirectOrHostFnPtr = 0;
   CallIndirectFnPtr = 0;
   ArgsPtr = 0;
   MemorySize = 0;
@@ -318,6 +317,27 @@ Expect<void> WasmToIRBuilder::initialize(
 
 Expect<void>
 WasmToIRBuilder::buildFromInstructions(Span<const AST::Instruction> Instrs) {
+  // Trap-stub fast path: if the function body starts with `unreachable`,
+  // emit a call to jit_unreachable_trap (longjmps out, never returns)
+  // followed by a structural RETURN. dstogov/ir's O1+ passes can't compile
+  // a function whose only terminator is UNREACHABLE — they walk the
+  // dominator tree from RETURN nodes and crash on the empty exit set.
+  // The RETURN here is dead at runtime; it exists only to give the backend
+  // a well-formed function shape.
+  if (!Instrs.empty() &&
+      Instrs.begin()->getOpCode() == OpCode::Unreachable) {
+    ir_ctx *ctx = &Ctx;
+    ir_ref FnAddr = ir_CONST_ADDR(
+        reinterpret_cast<uintptr_t>(&WasmEdge::VM::jit_unreachable_trap));
+    uint8_t Proto[2] = {IR_ADDR, IR_ADDR};
+    ir_ref P = ir_proto(ctx, IR_FASTCALL_FUNC, IR_I64, 2, Proto);
+    ir_ref Typed = ir_emit2(ctx, IR_OPT(IR_PROTO, IR_ADDR), FnAddr, P);
+    ir_ref TrapArgs[2] = {EnvPtr, ArgsPtr};
+    ir_CALL_N(IR_I64, Typed, 2, TrapArgs);
+    ir_RETURN(getOrEmitReturnValue());
+    return {};
+  }
+
   // Pre-pass: compute max callee arity for SharedCallArgs allocation.
   uint32_t maxArity = 0;
   for (const auto &Instr : Instrs) {
@@ -356,6 +376,39 @@ WasmToIRBuilder::buildFromInstructions(Span<const AST::Instruction> Instrs) {
     if (!Res) {
       return Unexpect(Res);
     }
+  }
+  return {};
+}
+
+Expect<void> WasmToIRBuilder::buildInterpRouter() {
+  // Body: jit_host_call(env, FuncIdx, args), then return the unboxed result.
+  // Caller (instantiate/module.cpp) uses this for bisection-knob-excluded
+  // funcs so FuncTable[FuncIdx] is always a typed JIT entry — direct callers
+  // don't need a null-check trampoline.
+  ir_ctx *ctx = &Ctx;
+  ir_ref FnAddr = ir_CONST_ADDR(
+      reinterpret_cast<uintptr_t>(&WasmEdge::VM::jit_host_call));
+  uint8_t Proto[3] = {IR_ADDR, IR_I32, IR_ADDR};
+  ir_ref P = ir_proto(ctx, IR_FASTCALL_FUNC, IR_I64, 3, Proto);
+  ir_ref Typed = ir_emit2(ctx, IR_OPT(IR_PROTO, IR_ADDR), FnAddr, P);
+  ir_ref CallArgs[3] = {EnvPtr, ir_CONST_I32(static_cast<int32_t>(FuncIdx)),
+                        ArgsPtr};
+  ir_ref Result = ir_CALL_N(IR_I64, Typed, 3, CallArgs);
+
+  if (Ctx.ret_type == static_cast<ir_type>(-1) || Ctx.ret_type == IR_VOID) {
+    ir_RETURN(IR_UNUSED);
+  } else if (Ctx.ret_type == IR_I32) {
+    ir_RETURN(ir_TRUNC_I32(Result));
+  } else if (Ctx.ret_type == IR_FLOAT) {
+    ir_ref Tmp = ir_ALLOCA(ir_CONST_I32(8));
+    ir_STORE(Tmp, Result);
+    ir_RETURN(ir_LOAD_F(Tmp));
+  } else if (Ctx.ret_type == IR_DOUBLE) {
+    ir_ref Tmp = ir_ALLOCA(ir_CONST_I32(8));
+    ir_STORE(Tmp, Result);
+    ir_RETURN(ir_LOAD_D(Tmp));
+  } else {
+    ir_RETURN(Result);
   }
   return {};
 }
@@ -3335,6 +3388,11 @@ Expect<void> WasmToIRBuilder::visitCall(const AST::Instruction &Instr) {
       }
     }
   } else {
+    // Direct `call N` for a defined (non-import) func. FuncTable[N] always
+    // holds a typed JIT entry — trap stubs JIT into a body that calls
+    // jit_unreachable_trap, and bisected-out funcs JIT into a body that
+    // calls jit_host_call (see buildInterpRouter). So we can do a typed
+    // direct call without a null check.
     ir_ref ValidFT = ensureValidRef(FuncTablePtr, IR_ADDR);
     ir_ref FuncPtr = ir_LOAD_A(ir_ADD_A(
         ValidFT,
@@ -3352,7 +3410,6 @@ Expect<void> WasmToIRBuilder::visitCall(const AST::Instruction &Instr) {
       CalleeArgs = ir_CONST_ADDR(0);
     }
 
-    uint8_t DirectProtoParams[2] = {IR_ADDR, IR_ADDR};
     ir_type DirectRetType;
     if (RetType == IR_FLOAT) {
       DirectRetType = IR_FLOAT;
@@ -3362,6 +3419,7 @@ Expect<void> WasmToIRBuilder::visitCall(const AST::Instruction &Instr) {
       DirectRetType = IR_I64;
     }
 
+    uint8_t DirectProtoParams[2] = {IR_ADDR, IR_ADDR};
     ir_ref DirectProto = ir_proto(ctx, IR_FASTCALL_FUNC, DirectRetType, 2,
                                   DirectProtoParams);
     ir_ref TypedFuncPtr =
