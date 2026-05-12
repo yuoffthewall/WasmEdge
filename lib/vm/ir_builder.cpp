@@ -1431,16 +1431,32 @@ Expect<void> WasmToIRBuilder::visitUnary(OpCode Op) {
   case OpCode::F32__neg:
     Result = ir_NEG_F(Operand);
     break;
-  // TODO: SQRT, CEIL, FLOOR, TRUNC, NEAREST require intrinsic calls
-  // For now, return the operand unchanged (placeholder)
+  // sqrt / ceil / floor / trunc / nearest lower to libm calls. dstogov/ir
+  // has no native ops for these; we bake in the libm symbol address as a
+  // constant and call through it. nearest uses nearbyintf (current rounding
+  // mode = round-to-nearest, ties to even), matching the wasm spec.
   case OpCode::F32__sqrt:
   case OpCode::F32__ceil:
   case OpCode::F32__floor:
   case OpCode::F32__trunc:
-  case OpCode::F32__nearest:
-    // Placeholder: would need to call C library functions
-    Result = Operand;
+  case OpCode::F32__nearest: {
+    void *Fn = nullptr;
+    switch (Op) {
+    case OpCode::F32__sqrt:    Fn = reinterpret_cast<void *>(static_cast<float (*)(float)>(&::sqrtf));      break;
+    case OpCode::F32__ceil:    Fn = reinterpret_cast<void *>(static_cast<float (*)(float)>(&::ceilf));      break;
+    case OpCode::F32__floor:   Fn = reinterpret_cast<void *>(static_cast<float (*)(float)>(&::floorf));     break;
+    case OpCode::F32__trunc:   Fn = reinterpret_cast<void *>(static_cast<float (*)(float)>(&::truncf));     break;
+    case OpCode::F32__nearest: Fn = reinterpret_cast<void *>(static_cast<float (*)(float)>(&::nearbyintf)); break;
+    default: break;
+    }
+    ir_ref FnAddr = ir_CONST_ADDR(reinterpret_cast<uintptr_t>(Fn));
+    uint8_t Proto[1] = {IR_FLOAT};
+    ir_ref P = ir_proto(ctx, IR_FASTCALL_FUNC, IR_FLOAT, 1, Proto);
+    ir_ref Typed = ir_emit2(ctx, IR_OPT(IR_PROTO, IR_ADDR), FnAddr, P);
+    ir_ref Args[1] = {Operand};
+    Result = ir_CALL_N(IR_FLOAT, Typed, 1, Args);
     break;
+  }
 
   // F64 unary
   case OpCode::F64__abs:
@@ -1449,15 +1465,28 @@ Expect<void> WasmToIRBuilder::visitUnary(OpCode Op) {
   case OpCode::F64__neg:
     Result = ir_NEG_D(Operand);
     break;
-  // TODO: SQRT, CEIL, FLOOR, TRUNC, NEAREST require intrinsic calls
   case OpCode::F64__sqrt:
   case OpCode::F64__ceil:
   case OpCode::F64__floor:
   case OpCode::F64__trunc:
-  case OpCode::F64__nearest:
-    // Placeholder: would need to call C library functions
-    Result = Operand;
+  case OpCode::F64__nearest: {
+    void *Fn = nullptr;
+    switch (Op) {
+    case OpCode::F64__sqrt:    Fn = reinterpret_cast<void *>(static_cast<double (*)(double)>(&::sqrt));      break;
+    case OpCode::F64__ceil:    Fn = reinterpret_cast<void *>(static_cast<double (*)(double)>(&::ceil));      break;
+    case OpCode::F64__floor:   Fn = reinterpret_cast<void *>(static_cast<double (*)(double)>(&::floor));     break;
+    case OpCode::F64__trunc:   Fn = reinterpret_cast<void *>(static_cast<double (*)(double)>(&::trunc));     break;
+    case OpCode::F64__nearest: Fn = reinterpret_cast<void *>(static_cast<double (*)(double)>(&::nearbyint)); break;
+    default: break;
+    }
+    ir_ref FnAddr = ir_CONST_ADDR(reinterpret_cast<uintptr_t>(Fn));
+    uint8_t Proto[1] = {IR_DOUBLE};
+    ir_ref P = ir_proto(ctx, IR_FASTCALL_FUNC, IR_DOUBLE, 1, Proto);
+    ir_ref Typed = ir_emit2(ctx, IR_OPT(IR_PROTO, IR_ADDR), FnAddr, P);
+    ir_ref Args[1] = {Operand};
+    Result = ir_CALL_N(IR_DOUBLE, Typed, 1, Args);
     break;
+  }
 
   default:
     return Unexpect(ErrCode::Value::RuntimeError);
