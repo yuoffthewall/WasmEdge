@@ -248,6 +248,10 @@ public:
   /// Getter of statistics.
   Statistics::Statistics &getStatistics() noexcept { return Stat; }
 
+  /// Wall-clock time (us) of the most recent instantiate() call's wasm-to-native
+  /// compilation work. Returns 0 for Interpreter mode and AOT-loaded modules.
+  double getLastCompileTimeUs() const noexcept;
+
 private:
   Expect<void> unsafeRegisterModule(std::string_view Name,
                                     const std::filesystem::path &Path);
@@ -344,6 +348,10 @@ private:
   Validator::Validator ValidatorEngine;
   Executor::Executor ExecutorEngine;
   /// @}
+
+  /// LLVM-JIT compile time captured in unsafeInstantiate. Reset to 0 at the
+  /// top of every instantiate so stale values cannot leak into non-JIT runs.
+  double LastLlvmCompileUs_{0.0};
 
   /// \name VM Storage.
   /// @{

@@ -12,6 +12,7 @@
 #include "vm/canonical_type_registry.h"
 #endif
 
+#include <chrono>
 #include <cstdint>
 #include <string_view>
 
@@ -144,6 +145,7 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
       !CodeSegsAOTCheck.empty() && CodeSegsAOTCheck[0].getSymbol();
   if (!Conf.getRuntimeConfigure().isForceInterpreter() && !isAOTModule) {
     VM::IRJitEngine &IREngine = getIRJitEngine();
+    auto IRJitCompStart = std::chrono::high_resolution_clock::now();
     VM::WasmToIRBuilder IRBuilder;
     
     // Collect global types for global.get/set instructions
@@ -337,6 +339,11 @@ Executor::instantiate(Runtime::StoreManager &StoreMgr, const AST::Module &Mod,
     
     spdlog::info("IR JIT: Compiled {}/{} functions successfully", 
                  SuccessCount, FuncIdx - ImportFuncNum);
+    auto IRJitCompEnd = std::chrono::high_resolution_clock::now();
+    IREngine.LastCompileTimeUs_ =
+        std::chrono::duration<double, std::micro>(
+            IRJitCompEnd - IRJitCompStart)
+            .count();
   }
 #endif
   (void)Conf; // Suppress unused warning when IR JIT disabled

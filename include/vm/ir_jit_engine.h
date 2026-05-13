@@ -186,6 +186,10 @@ public:
   /// Release IR graph
   void releaseIRGraph(ir_ctx *Ctx) noexcept;
 
+  /// Wall-clock time (us) of the most recent IR-JIT compile pass performed
+  /// during Executor::instantiate.
+  double LastCompileTimeUs_{0.0};
+
 private:
   /// Code buffer management
   struct CodeBuffer {
@@ -216,4 +220,3 @@ private:
 } // namespace WasmEdge
 
 #endif // WASMEDGE_BUILD_IR_JIT
-

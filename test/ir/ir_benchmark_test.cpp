@@ -101,6 +101,7 @@ public:
     addHostFunc("clock_res_get", std::make_unique<StubClockResGet>());
     addHostFunc("random_get", std::make_unique<StubRandomGet>());
     addHostFunc("fd_fdstat_set_flags", std::make_unique<StubFdFdstatSetFlags>());
+    addHostFunc("fd_sync", std::make_unique<StubFdSync>());
     addHostFunc("path_remove_directory", std::make_unique<StubPathRemoveDirectory>());
     addHostFunc("path_unlink_file", std::make_unique<StubPathUnlinkFile>());
     addHostFunc("proc_exit", std::make_unique<StubProcExit>(Capture));
@@ -463,6 +464,15 @@ private:
   public:
     Expect body(const WasmEdge::Runtime::CallingFrame &, int32_t /* Fd */,
                 uint32_t /* FdFlags */) {
+      return SightglassWasi::WASI_ERRNO_SUCCESS;
+    }
+  };
+
+  // sqlite3.wasm calls fd_sync after writes. With virtual files held in memory
+  // this is a no-op; report success so the benchmark doesn't error out.
+  class StubFdSync : public WasmEdge::Runtime::HostFunction<StubFdSync> {
+  public:
+    Expect body(const WasmEdge::Runtime::CallingFrame &, int32_t /* Fd */) {
       return SightglassWasi::WASI_ERRNO_SUCCESS;
     }
   };
@@ -1299,41 +1309,42 @@ TEST_F(IRBenchmarkTest, Benchmark_Quicksort) {
 TEST_F(IRBenchmarkTest, SightglassSuite) {
   auto TestDataPath = getTestDataPath();
   auto SightglassDir = TestDataPath / "sightglass";
+  if (const char *dirEnv = std::getenv("WASMEDGE_SIGHTGLASS_DIR");
+      dirEnv && dirEnv[0] != '\0') {
+    SightglassDir = std::filesystem::path(dirEnv);
+    if (!SightglassDir.is_absolute())
+      SightglassDir = TestDataPath / SightglassDir;
+  }
 
   if (!std::filesystem::exists(SightglassDir) ||
       !std::filesystem::is_directory(SightglassDir)) {
     GTEST_SKIP() << "Sightglass testdata not found. Run utils/download_sightglass.sh";
   }
 
-  // Discover all .wasm kernels (run all in testdata, not just preferred list)
+  // Discover all kernels (per-kernel-dir layout: <kernel>/benchmark.wasm)
   std::vector<std::filesystem::path> kernels;
   for (const auto &e : std::filesystem::directory_iterator(SightglassDir)) {
-    if (e.path().extension() == ".wasm")
-      kernels.push_back(e.path());
+    if (!e.is_directory()) continue;
+    auto wasm = e.path() / "benchmark.wasm";
+    if (std::filesystem::exists(wasm))
+      kernels.push_back(wasm);
   }
   std::sort(kernels.begin(), kernels.end());
 
-  // Always skip spidermonkey and tinygo kernels (unsupported).
-  {
-    std::vector<std::filesystem::path> filtered;
-    for (const auto &p : kernels) {
-      const std::string stem = p.stem().string();
-      if (stem.compare(0, 13, "spidermonkey-") == 0)
-        continue;
-      if (stem.compare(0, 7, "tinygo-") == 0)
-        continue;
-      filtered.push_back(p);
-    }
-    kernels = std::move(filtered);
-  }
-
-  // Optional: for fast CI / ctest, drop additional heavy kernels.
+  // Optional: for fast CI / ctest, drop heavy kernels. The default runs
+  // everything; QUICK mode skips kernels whose _start work is large enough
+  // to dominate test wall time in debug builds — spidermonkey processes
+  // 2300 users + serializes 27 MB of JSON (~5 minutes), and richards is
+  // similarly long. The CLI sweep only times the bench.start/end window
+  // and so doesn't hit this; the gtest harness times all of _start.
   const char *quickEnv = std::getenv("WASMEDGE_SIGHTGLASS_QUICK");
   if (quickEnv && quickEnv[0] == '1') {
     std::vector<std::filesystem::path> filtered;
     for (const auto &p : kernels) {
-      const std::string stem = p.stem().string();
-      if (stem == "richards")
+      const std::string kernel = p.parent_path().filename().string();
+      if (kernel == "richards")
+        continue;
+      if (kernel.compare(0, 13, "spidermonkey-") == 0)
         continue;
       filtered.push_back(p);
     }
@@ -1344,10 +1355,10 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
   const char *singleEnv = std::getenv("WASMEDGE_SIGHTGLASS_KERNEL");
   if (singleEnv && singleEnv[0] != '\0') {
     std::string single(singleEnv);
-    if (single.size() < 5 || single.compare(single.size() - 5, 5, ".wasm") != 0)
-      single += ".wasm";
+    if (single.size() >= 5 && single.compare(single.size() - 5, 5, ".wasm") == 0)
+      single.resize(single.size() - 5);
     auto it = std::remove_if(kernels.begin(), kernels.end(), [&single](const std::filesystem::path &p) {
-      return p.filename().string() != single && p.stem().string() != single;
+      return p.parent_path().filename().string() != single;
     });
     kernels.erase(it, kernels.end());
   }
@@ -1373,14 +1384,14 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
   std::cout << "\n=== Sightglass IR JIT Benchmark Suite ===" << std::endl;
   std::cout << std::left << std::setw(20) << "Kernel"
             << std::setw(14) << "Mode"
-            << std::setw(18) << "Inst.Lat(µs)"
+            << std::setw(18) << "Comp(µs)"
             << std::setw(18) << "WorkTime(µs)"
             << std::setw(18) << "TtV(µs)"
             << std::endl;
   std::cout << std::string(88, '-') << std::endl;
 
   for (const auto &wasmPath : kernels) {
-    std::string kernelName = wasmPath.stem().string();
+    std::string kernelName = wasmPath.parent_path().filename().string();
     std::cout << "Running kernel: " << kernelName << std::endl;
     StdioCapture interpCap, jitCap, irJitCap, aotCap;
     bool interpOk = false;
@@ -1388,40 +1399,24 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
     bool irJitOk = false;
     bool aotOk = false;
 
-    // Helper: load .input files for this kernel into a WasiStubModule's virtual FS
+    // Helper: load every input file in the kernel's directory into the WASI VFS
+    // under the same name the kernel reads (file names are already unprefixed).
     auto loadVirtualFiles = [&](WasiStubModule &stub) {
-      for (const auto &e : std::filesystem::directory_iterator(SightglassDir)) {
+      auto kernelDir = SightglassDir / kernelName;
+      if (!std::filesystem::is_directory(kernelDir)) return;
+      for (const auto &e : std::filesystem::directory_iterator(kernelDir)) {
+        if (!e.is_regular_file()) continue;
         auto fname = e.path().filename().string();
-        // Match files like "shootout-ackermann.m.input" for kernel "shootout-ackermann"
-        if (fname.size() > kernelName.size() + 1 &&
-            fname.substr(0, kernelName.size()) == kernelName &&
-            fname.find(".input") != std::string::npos) {
-          std::ifstream ifs(e.path(), std::ios::binary);
-          if (ifs) {
-            std::string content((std::istreambuf_iterator<char>(ifs)),
-                                std::istreambuf_iterator<char>());
-            stub.addVirtualFile(fname, std::move(content));
-          }
-        }
-      }
-      // Map kernel-prefixed default inputs to names benchmarks expect (default.input / default.input.md)
-      auto loadAs = [&](const std::string &prefixedName, const std::string &virtualName) {
-        auto path = SightglassDir / prefixedName;
-        if (!std::filesystem::exists(path) || !std::filesystem::is_regular_file(path))
-          return;
-        std::ifstream ifs(path, std::ios::binary);
-        if (!ifs) return;
+        if (fname == "benchmark.wasm" ||
+            fname == "benchmark.stdout.expected" ||
+            fname == "benchmark.stderr.expected")
+          continue;
+        std::ifstream ifs(e.path(), std::ios::binary);
+        if (!ifs) continue;
         std::string content((std::istreambuf_iterator<char>(ifs)),
                             std::istreambuf_iterator<char>());
-        stub.addVirtualFile(virtualName, std::move(content));
-      };
-      loadAs(kernelName + ".default.input", "default.input");
-      loadAs(kernelName + ".default.input.md", "default.input.md");
-      loadAs(kernelName + ".secret.der", "secret.der");
-      loadAs(kernelName + ".small.input", "small.input");
-      // Legacy: pulldown-cmark also accepts default.input.md without prefix
-      if (kernelName == "pulldown-cmark")
-        loadAs("default.input.md", "default.input.md");
+        stub.addVirtualFile(fname, std::move(content));
+      }
     };
 
     const char *modes[] = {"Interpreter", "IR_JIT", "JIT"};
@@ -1438,7 +1433,7 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
 
       WasmEdge::Configure Conf;
       Conf.getCompilerConfigure().setOptimizationLevel(
-          WasmEdge::CompilerConfigure::OptimizationLevel::O3);
+          WasmEdge::CompilerConfigure::OptimizationLevel::O2);
       // Interpreter: ForceInterpreter=true,  EnableJIT=false
       // JIT (LLVM):  ForceInterpreter=false, EnableJIT=true
       // IR_JIT:      ForceInterpreter=false, EnableJIT=false (IR JIT runs in Executor::instantiate)
@@ -1463,16 +1458,18 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
       }
       ASSERT_TRUE(VM.validate());
 
-      auto instStart = high_resolution_clock::now();
       auto instRes = VM.instantiate();
-      auto instEnd = high_resolution_clock::now();
       if (!instRes) {
         std::cerr << "instantiate failed: " << kernelName << " " << modeName
                   << " " << WasmEdge::ErrCode(instRes.error()) << std::endl;
         continue;
       }
 
-      double instLatencyUs = duration_cast<Micro>(instEnd - instStart).count();
+      // Comp = wasm→native compile time captured inside instantiate.
+      // LLVM JIT: Compiler.compile + JIT.load + loadExecutable.
+      // IR_JIT:   per-function dstogov/ir compile + entry-thunk build.
+      // Interpreter: 0 (no compile path runs).
+      double compUs = VM.getLastCompileTimeUs();
 
       std::vector<WasmEdge::ValVariant> noArgs;
       std::vector<WasmEdge::ValType> noTypes;
@@ -1499,7 +1496,7 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
       std::cout << std::left << std::setw(20) << kernelName
                 << std::setw(14) << modeName
                 << std::fixed << std::setprecision(2)
-                << std::setw(18) << instLatencyUs
+                << std::setw(18) << compUs
                 << std::setw(18) << workTimeUs
                 << std::setw(18) << ttvUs
                 << std::endl;
@@ -1514,7 +1511,7 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
       const char *modeName = "AOT";
       WasmEdge::Configure compileConf;
       compileConf.getCompilerConfigure().setOptimizationLevel(
-          WasmEdge::CompilerConfigure::OptimizationLevel::O3);
+          WasmEdge::CompilerConfigure::OptimizationLevel::O2);
       compileConf.getCompilerConfigure().setOutputFormat(
           WasmEdge::CompilerConfigure::OutputFormat::Native);
       compileConf.getRuntimeConfigure().setForceInterpreter(true);
@@ -1538,6 +1535,10 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
             if (!compiler.checkConfigure()) {
               std::cerr << "AOT checkConfigure failed: " << kernelName << std::endl;
             } else {
+              // AOT Comp = frontend compile + native codegen (.so emission).
+              // Symmetric with LLVM-JIT Comp: both cover wasm→native, just
+              // serialised to a shared object instead of held in memory.
+              auto aotCompStart = high_resolution_clock::now();
               auto compileRes = compiler.compile(*module);
               if (!compileRes) {
                 std::cerr << "AOT compile failed: " << kernelName
@@ -1546,8 +1547,13 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
                 std::filesystem::path soPath = std::filesystem::temp_directory_path() /
                     ("wasmedge_sightglass_" + kernelName + WASMEDGE_LIB_EXTENSION);
                 WasmEdge::LLVM::CodeGen codegen(compileConf);
-                if (!codegen.codegen(WasmEdge::Span<const WasmEdge::Byte>(*loadData),
-                                    std::move(*compileRes), soPath)) {
+                auto codegenRes =
+                    codegen.codegen(WasmEdge::Span<const WasmEdge::Byte>(*loadData),
+                                    std::move(*compileRes), soPath);
+                auto aotCompEnd = high_resolution_clock::now();
+                double aotCompileUs =
+                    duration_cast<Micro>(aotCompEnd - aotCompStart).count();
+                if (!codegenRes) {
                   std::cerr << "AOT codegen failed: " << kernelName << std::endl;
                 } else {
                   soPath = std::filesystem::absolute(soPath);
@@ -1571,14 +1577,11 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
                               << " " << WasmEdge::ErrCode(loadRes.error()) << std::endl;
                   } else {
                     ASSERT_TRUE(VM.validate());
-                    auto instStart = high_resolution_clock::now();
                     auto instRes = VM.instantiate();
-                    auto instEnd = high_resolution_clock::now();
                     if (!instRes) {
                       std::cerr << "AOT instantiate failed: " << kernelName
                                 << " " << WasmEdge::ErrCode(instRes.error()) << std::endl;
                     } else {
-                      double instLatencyUs = duration_cast<Micro>(instEnd - instStart).count();
                       std::vector<WasmEdge::ValVariant> noArgs;
                       std::vector<WasmEdge::ValType> noTypes;
                       auto execRes = VM.execute("_start", noArgs, noTypes);
@@ -1599,7 +1602,7 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
                         std::cout << std::left << std::setw(20) << kernelName
                                   << std::setw(14) << modeName
                                   << std::fixed << std::setprecision(2)
-                                  << std::setw(18) << instLatencyUs
+                                  << std::setw(18) << aotCompileUs
                                   << std::setw(18) << workTimeUs
                                   << std::setw(18) << ttvUs
                                   << std::endl;
@@ -1618,13 +1621,12 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
 
     // Correctness: compare captured stdio only for streams that have a golden file next to the
     // .wasm (empty golden file => empty string). Kernels without goldens still run for metrics.
-    const auto goldenStdout = SightglassDir / (kernelName + ".stdout.expected");
-    const auto goldenStderr = SightglassDir / (kernelName + ".stderr.expected");
+    const auto goldenStdout = SightglassDir / kernelName / "benchmark.stdout.expected";
+    const auto goldenStderr = SightglassDir / kernelName / "benchmark.stderr.expected";
     const bool hasStdoutGolden = std::filesystem::exists(goldenStdout);
     const bool hasStderrGolden = std::filesystem::exists(goldenStderr);
 
-    auto loadExpected = [&](const std::string &suffix) -> std::string {
-      auto path = SightglassDir / (kernelName + suffix);
+    auto loadExpected = [](const std::filesystem::path &path) -> std::string {
       std::ifstream ifs(path, std::ios::binary);
       if (!ifs) return "";
       return std::string((std::istreambuf_iterator<char>(ifs)),
@@ -1634,9 +1636,9 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
     std::string expectedStdout;
     std::string expectedStderr;
     if (hasStdoutGolden)
-      expectedStdout = loadExpected(".stdout.expected");
+      expectedStdout = loadExpected(goldenStdout);
     if (hasStderrGolden)
-      expectedStderr = loadExpected(".stderr.expected");
+      expectedStderr = loadExpected(goldenStderr);
 
     auto checkExpected = [&](const std::string &label, const StdioCapture &cap, bool ok) {
       if (!ok || (!hasStdoutGolden && !hasStderrGolden))
