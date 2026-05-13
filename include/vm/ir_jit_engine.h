@@ -223,6 +223,13 @@ public:
   /// Release compiled code
   void release(void *NativeFunc, size_t CodeSize) noexcept;
 
+  /// Wall-clock time (µs) of the most recent tier-1 IR-JIT compile pass
+  /// performed during `Executor::instantiate`. Includes wasm→IR lowering,
+  /// dstogov/ir backend codegen for every function, and (when tier-2 is on)
+  /// the LLVM entry-thunk build. Excludes async tier-2/OSR worker compile.
+  /// Written by `lib/executor/instantiate/module.cpp` IR-JIT block; read by
+  /// the benchmark harness.
+  double LastCompileTimeUs_{0.0};
 
 private:
   /// Code buffer management

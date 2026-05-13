@@ -35,6 +35,7 @@ Use **environment variables only** (no code changes). `SightglassSuite` runs the
 | `WASMEDGE_SIGHTGLASS_SKIP_AOT=1` | Skip the LLVM AOT column (compile-to-`.so`-then-run). Only needed when `MODE` is unset. |
 | `WASMEDGE_IR_JIT_OPT_LEVEL=2` | IR JIT compiler optimization level (same knob as the rest of the IR JIT pipeline). |
 | `WASMEDGE_IR_JIT_BOUND_CHECK=1` | Optional: enable memory bound checking. |
+| `WASMEDGE_IR_JIT_MIN_FUNC=N` / `WASMEDGE_IR_JIT_MAX_FUNC=N` | Per-function bisection: compile only `FuncIdx ∈ [MIN, MAX]` via IR JIT; outside the range routes to the interpreter via `jit_host_call`. Useful for isolating which wasm function triggers a JIT bug. |
 | `WASMEDGE_QUIET=1` | Suppress non-error logging in the benchmark binary (same as `--quiet`/`-q`). |
 
 Suggested prefix for IR JIT O2 / full kernel list:

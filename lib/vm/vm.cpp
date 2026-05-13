@@ -20,6 +20,7 @@
 #include "host/mock/wasmedge_tensorflow_module.h"
 #include "host/mock/wasmedge_tensorflowlite_module.h"
 #include "validator/validator.h"
+#include <chrono>
 #include <memory>
 #include <variant>
 
@@ -442,9 +443,14 @@ Expect<void> VM::unsafeInstantiate() {
     return Unexpect(ErrCode::Value::WrongVMWorkflow);
   }
 
+  // Reset so a stale value from a prior call cannot leak into Interpreter /
+  // AOT-load runs where the LLVM-JIT block below is skipped.
+  LastLlvmCompileUs_ = 0.0;
+
   if (Mod) {
     if (Conf.getRuntimeConfigure().isEnableJIT() && !Mod->getSymbol()) {
 #ifdef WASMEDGE_USE_LLVM
+      auto CompStart = std::chrono::high_resolution_clock::now();
       LLVM::Compiler Compiler(Conf);
       Compiler.checkConfigure()
           .map_error([](uint32_t Err) {
@@ -487,6 +493,10 @@ Expect<void> VM::unsafeInstantiate() {
             }
             return ErrCode::Value::Success;
           });
+      auto CompEnd = std::chrono::high_resolution_clock::now();
+      LastLlvmCompileUs_ =
+          std::chrono::duration<double, std::micro>(CompEnd - CompStart)
+              .count();
 #else
       spdlog::error("LLVM disabled, JIT is unsupported!"sv);
 #endif
@@ -505,6 +515,14 @@ Expect<void> VM::unsafeInstantiate() {
     spdlog::error(ErrCode::Value::WrongVMWorkflow);
     return Unexpect(ErrCode::Value::WrongVMWorkflow);
   }
+}
+
+double VM::getLastCompileTimeUs() const noexcept {
+  double Total = LastLlvmCompileUs_;
+#ifdef WASMEDGE_BUILD_IR_JIT
+  Total += ExecutorEngine.getIRJitEngine().LastCompileTimeUs_;
+#endif
+  return Total;
 }
 
 Expect<std::vector<std::pair<ValVariant, ValType>>>

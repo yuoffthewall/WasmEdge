@@ -1384,7 +1384,7 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
   std::cout << "\n=== Sightglass IR JIT Benchmark Suite ===" << std::endl;
   std::cout << std::left << std::setw(20) << "Kernel"
             << std::setw(14) << "Mode"
-            << std::setw(18) << "Inst.Lat(µs)"
+            << std::setw(18) << "Comp(µs)"
             << std::setw(18) << "WorkTime(µs)"
             << std::setw(18) << "TtV(µs)"
             << std::endl;
@@ -1458,16 +1458,18 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
       }
       ASSERT_TRUE(VM.validate());
 
-      auto instStart = high_resolution_clock::now();
       auto instRes = VM.instantiate();
-      auto instEnd = high_resolution_clock::now();
       if (!instRes) {
         std::cerr << "instantiate failed: " << kernelName << " " << modeName
                   << " " << WasmEdge::ErrCode(instRes.error()) << std::endl;
         continue;
       }
 
-      double instLatencyUs = duration_cast<Micro>(instEnd - instStart).count();
+      // Comp = wasm→native compile time captured inside instantiate.
+      // LLVM JIT: Compiler.compile + JIT.load + loadExecutable.
+      // IR_JIT:   per-function dstogov/ir compile + entry-thunk build.
+      // Interpreter: 0 (no compile path runs).
+      double compUs = VM.getLastCompileTimeUs();
 
       std::vector<WasmEdge::ValVariant> noArgs;
       std::vector<WasmEdge::ValType> noTypes;
@@ -1494,7 +1496,7 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
       std::cout << std::left << std::setw(20) << kernelName
                 << std::setw(14) << modeName
                 << std::fixed << std::setprecision(2)
-                << std::setw(18) << instLatencyUs
+                << std::setw(18) << compUs
                 << std::setw(18) << workTimeUs
                 << std::setw(18) << ttvUs
                 << std::endl;
@@ -1533,6 +1535,10 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
             if (!compiler.checkConfigure()) {
               std::cerr << "AOT checkConfigure failed: " << kernelName << std::endl;
             } else {
+              // AOT Comp = frontend compile + native codegen (.so emission).
+              // Symmetric with LLVM-JIT Comp: both cover wasm→native, just
+              // serialised to a shared object instead of held in memory.
+              auto aotCompStart = high_resolution_clock::now();
               auto compileRes = compiler.compile(*module);
               if (!compileRes) {
                 std::cerr << "AOT compile failed: " << kernelName
@@ -1541,8 +1547,13 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
                 std::filesystem::path soPath = std::filesystem::temp_directory_path() /
                     ("wasmedge_sightglass_" + kernelName + WASMEDGE_LIB_EXTENSION);
                 WasmEdge::LLVM::CodeGen codegen(compileConf);
-                if (!codegen.codegen(WasmEdge::Span<const WasmEdge::Byte>(*loadData),
-                                    std::move(*compileRes), soPath)) {
+                auto codegenRes =
+                    codegen.codegen(WasmEdge::Span<const WasmEdge::Byte>(*loadData),
+                                    std::move(*compileRes), soPath);
+                auto aotCompEnd = high_resolution_clock::now();
+                double aotCompileUs =
+                    duration_cast<Micro>(aotCompEnd - aotCompStart).count();
+                if (!codegenRes) {
                   std::cerr << "AOT codegen failed: " << kernelName << std::endl;
                 } else {
                   soPath = std::filesystem::absolute(soPath);
@@ -1566,14 +1577,11 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
                               << " " << WasmEdge::ErrCode(loadRes.error()) << std::endl;
                   } else {
                     ASSERT_TRUE(VM.validate());
-                    auto instStart = high_resolution_clock::now();
                     auto instRes = VM.instantiate();
-                    auto instEnd = high_resolution_clock::now();
                     if (!instRes) {
                       std::cerr << "AOT instantiate failed: " << kernelName
                                 << " " << WasmEdge::ErrCode(instRes.error()) << std::endl;
                     } else {
-                      double instLatencyUs = duration_cast<Micro>(instEnd - instStart).count();
                       std::vector<WasmEdge::ValVariant> noArgs;
                       std::vector<WasmEdge::ValType> noTypes;
                       auto execRes = VM.execute("_start", noArgs, noTypes);
@@ -1594,7 +1602,7 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
                         std::cout << std::left << std::setw(20) << kernelName
                                   << std::setw(14) << modeName
                                   << std::fixed << std::setprecision(2)
-                                  << std::setw(18) << instLatencyUs
+                                  << std::setw(18) << aotCompileUs
                                   << std::setw(18) << workTimeUs
                                   << std::setw(18) << ttvUs
                                   << std::endl;

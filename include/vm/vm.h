@@ -248,6 +248,15 @@ public:
   /// Getter of statistics.
   Statistics::Statistics &getStatistics() noexcept { return Stat; }
 
+  /// Wall-clock time (µs) of the most recent `instantiate()` call's
+  /// wasm→native compilation work. For LLVM-JIT mode this covers
+  /// `Compiler.compile` + `JIT.load` + `loadExecutable`. For IR-JIT mode
+  /// this covers the tier-1 IR-JIT block in `Executor::instantiate`
+  /// (per-function compile + entry-thunk build). Async tier-2/OSR worker
+  /// compile is intentionally NOT included. Returns 0 for Interpreter mode
+  /// and for AOT-loaded modules (no compile happens during instantiate).
+  double getLastCompileTimeUs() const noexcept;
+
 private:
   Expect<void> unsafeRegisterModule(std::string_view Name,
                                     const std::filesystem::path &Path);
@@ -344,6 +353,11 @@ private:
   Validator::Validator ValidatorEngine;
   Executor::Executor ExecutorEngine;
   /// @}
+
+  /// LLVM-JIT compile time captured in unsafeInstantiate. Reset to 0 at
+  /// the top of every instantiate so a stale value from a prior call
+  /// cannot leak into Interpreter / AOT-load runs.
+  double LastLlvmCompileUs_{0.0};
 
   /// \name VM Storage.
   /// @{
