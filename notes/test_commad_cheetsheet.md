@@ -35,6 +35,7 @@ Use **environment variables only** (no code changes). `SightglassSuite` runs the
 | `WASMEDGE_SIGHTGLASS_SKIP_AOT=1` | Skip the LLVM AOT column (compile-to-`.so`-then-run). Only needed when `MODE` is unset. |
 | `WASMEDGE_IR_JIT_OPT_LEVEL=2` | IR JIT compiler optimization level (same knob as the rest of the IR JIT pipeline). |
 | `WASMEDGE_IR_JIT_BOUND_CHECK=1` | Optional: enable memory bound checking. |
+| `WASMEDGE_IR_JIT_MIN_FUNC=N` / `WASMEDGE_IR_JIT_MAX_FUNC=N` | Per-function bisection: compile only `FuncIdx ∈ [MIN, MAX]` via IR JIT; outside the range routes to the interpreter via `jit_host_call`. Useful for isolating which wasm function triggers a JIT bug. |
 | `WASMEDGE_QUIET=1` | Suppress non-error logging in the benchmark binary (same as `--quiet`/`-q`). |
 
 Suggested prefix for IR JIT O2 / full kernel list:
@@ -54,8 +55,8 @@ cd build && WASMEDGE_SIGHTGLASS_MODE=IR_JIT WASMEDGE_IR_JIT_OPT_LEVEL=2 WASMEDGE
 
 ```shell
 cd build && \
-for wasm in ../test/ir/testdata/sightglass/*.wasm; do
-  kernel="$(basename "$wasm" .wasm)"
+for wasm in ../test/ir/testdata/sightglass/*/benchmark.wasm; do
+  kernel="$(basename "$(dirname "$wasm")")"
   echo "Testing $kernel:"
   WASMEDGE_SIGHTGLASS_KERNEL="$kernel" \
   WASMEDGE_SIGHTGLASS_MODE=IR_JIT \
@@ -77,8 +78,8 @@ Switch between sets with `WASMEDGE_SIGHTGLASS_DIR` (relative paths resolve again
 
 ```shell
 cd build && \
-for wasm in ../test/ir/testdata/sightglass-strong/*.wasm; do
-  kernel="$(basename "$wasm" .wasm)"
+for wasm in ../test/ir/testdata/sightglass-strong/*/benchmark.wasm; do
+  kernel="$(basename "$(dirname "$wasm")")"
   echo "Testing $kernel:"
   WASMEDGE_SIGHTGLASS_DIR=sightglass-strong \
   WASMEDGE_SIGHTGLASS_KERNEL="$kernel" \
@@ -96,8 +97,8 @@ The trailing `grep` is required by the repo's testing rules (see `CLAUDE.md` rul
 
 ```shell
 cd build && \
-for wasm in ../test/ir/testdata/sightglass/*.wasm; do
-  kernel="$(basename "$wasm" .wasm)"
+for wasm in ../test/ir/testdata/sightglass/*/benchmark.wasm; do
+  kernel="$(basename "$(dirname "$wasm")")"
   echo "Testing $kernel:"
   WASMEDGE_SIGHTGLASS_KERNEL="$kernel" \
   WASMEDGE_SIGHTGLASS_MODE=IR_JIT \
@@ -196,8 +197,8 @@ This is the configuration referenced in `osr_doc.md` §11 (30/33 kernels pass at
 
 ```shell
 cd build && \
-for wasm in ../test/ir/testdata/sightglass-strong/*.wasm; do
-  kernel="$(basename "$wasm" .wasm)"
+for wasm in ../test/ir/testdata/sightglass-strong/*/benchmark.wasm; do
+  kernel="$(basename "$(dirname "$wasm")")"
   echo "Testing $kernel:"
   WASMEDGE_SIGHTGLASS_DIR=sightglass-strong \
   WASMEDGE_SIGHTGLASS_KERNEL="$kernel" \
@@ -205,7 +206,7 @@ for wasm in ../test/ir/testdata/sightglass-strong/*.wasm; do
   WASMEDGE_IR_JIT_OPT_LEVEL=2 \
   WASMEDGE_TIER2_ENABLE=1 \
   WASMEDGE_TIER2_THRESHOLD=10 \
-  WASMEDGE_OSR_THRESHOLD=5000 \
+  WASMEDGE_OSR_THRESHOLD=1000 \
   stdbuf -oL timeout 60 ./test/ir/wasmedgeIRBenchmarkTests --gtest_filter='*SightglassSuite*' 2>&1
 done | tee /tmp/wasm-tier2-osr.log
 echo $?
@@ -250,11 +251,24 @@ python3 ~/Desktop/wasmedge/utils/sightglass_json_table.py /tmp/wasm-sg-sweep
 Defaults can be overridden via env vars: `SG_PROCESSES`, `SG_ITERS`,
 `SG`, `ENGINE`, `SUITE`, `WASMEDGE_IR_JIT_OPT_LEVEL`.
 
-## Suite
+## Suites
 
-`bench/wasmedge.suite` — non-SIMD subset of the upstream sightglass
-benchmarks (`all.suite` filtered through `wasm2wat --disable-simd`).
-Regenerate if upstream sightglass changes.
+Two are checked in:
+
+- `bench/wasmedge.suite` — non-SIMD subset of the **upstream** sightglass
+  benchmarks at `bench/upstream/sightglass/benchmarks/...` (cloned by
+  `utils/setup_bench_deps.sh`). Regenerate if upstream sightglass changes.
+- `bench/wasmedge-strong.suite` — the **in-tree strong set** at
+  `test/ir/testdata/sightglass-strong/<kernel>/benchmark.wasm` (39 kernels,
+  workTimeUs ~5–10 s, wasmtime-oracled goldens). No upstream clone needed.
+  Use for paper-grade measurements.
+
+Run the strong suite through the same driver:
+
+```sh
+SUITE=$(pwd)/bench/wasmedge-strong.suite \
+  utils/run_sightglass_cli_sweep.sh /tmp/wasm-sg-strong-sweep
+```
 
 ## Phase mapping
 

@@ -1,6 +1,14 @@
+# Investigation rules
+
+**Answer from facts, not guesses.** When asked to investigate, analyze, or explain, every claim must be backed by evidence you can point to — file:line, log output, IR dump, git history, measured numbers. If you don't have evidence, say so explicitly ("I haven't verified this" / "I'd need to check X") rather than filling the gap with a plausible-sounding guess. Speculation dressed up as fact misleads the user and wastes debugging cycles.
+
+**Explain in plain words.** Plain doesn't mean vague — still be precise. No anatomical or physical metaphors ("has teeth," "bites," "load-bearing," "muscular," "sharp edge," "meaty"); use literal terms instead ("actively filters," "rejects," "takes effect at threshold X," "is enforced," "the gate does nothing at threshold Y").
+
 # Testing rules
 
 Apply to any test run in this repo.
+
+0. **Invoke the `sightglass` skill before running any sightglass/IR-JIT build or test command.** Do this even if you think you know the invocation — the skill holds the canonical commands and current env-var defaults. If the skill is already loaded this session, you can skip re-invoking.
 
 1. **No Interpreter mode for benchmarks.** Minutes per kernel, useless signal. Use `WASMEDGE_SIGHTGLASS_MODE=IR_JIT` (or `JIT`/`AOT` to compare backends). For a non-JIT oracle, use standalone `wasmtime`.
 

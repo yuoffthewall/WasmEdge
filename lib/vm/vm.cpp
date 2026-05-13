@@ -443,6 +443,8 @@ Expect<void> VM::unsafeInstantiate() {
     return Unexpect(ErrCode::Value::WrongVMWorkflow);
   }
 
+  // Reset so a stale value from a prior call cannot leak into Interpreter /
+  // AOT-load runs where the LLVM-JIT block below is skipped.
   LastLlvmCompileUs_ = 0.0;
 
   if (Mod) {

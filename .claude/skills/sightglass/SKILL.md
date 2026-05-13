@@ -1,6 +1,6 @@
 ---
 name: sightglass
-description: Run the WasmEdge Sightglass benchmark suite for IR JIT correctness/perf checks. Use when the user asks to "run sightglass", "test IR JIT", or wants to verify a kernel set against the Interpreter/LLVM JIT/AOT baselines.
+description: Run the WasmEdge Sightglass benchmark suite for IR JIT correctness/perf checks. Use when you need to "run sightglass", "test IR JIT", "run the benchmark" or wants to verify a kernel set against the Interpreter/LLVM JIT/AOT baselines.
 ---
 
 # Sightglass benchmark runner

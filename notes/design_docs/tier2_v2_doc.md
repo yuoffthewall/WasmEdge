@@ -597,19 +597,23 @@ requests total, one per `(func, loop)` pair.
 
 ---
 
-## Known failure modes (2026-04-18)
+## Known failure modes (2026-04-19)
 
 Full-sweep runs of `sightglass-strong` at
-`TIER2_THRESHOLD=10 OSR_THRESHOLD=5000` — 32 / 33 kernels pass. One
-residual:
+`TIER2_THRESHOLD=10 OSR_THRESHOLD=5000` — **33 / 33 kernels pass**.
+No residuals.
 
-| Kernel    | Arm    | Failure                                      |
-|---        |---     |---                                           |
-| blind-sig | tier-2 | SEGV inside the OSR'd body (pre-existing, tracked in `notes/bugs/osr_bugs.md`) |
+The earlier 2026-04-18 residual (blind-sig tier-2 SEGV) was rooted in
+`thirdparty/ir` DESSA parallel-copy: when two virtual registers
+legitimately shared a spill slot (stack-slot coloring over
+non-overlapping live ranges), the parallel-copy algorithm sequenced
+copies such that a later read saw an earlier write. Fixed by
+canonicalizing spill-slot-aliased labels in `ir_emit_dessa_moves`
+before invoking `ir_dessa_parallel_copy`. Full writeup in
+`notes/bugs/osr_bugs.md` Bug 2.
 
-tier-1 alone is clean across all 33 kernels (`rust-compression` no
-longer traps after the tier-1 codegen work that landed alongside the
-OSR inlining changes).
+tier-1 alone is clean across all 33 kernels; LLVM JIT is clean across
+all 33 kernels.
 
 ### Fixed on this pass
 
@@ -776,8 +780,9 @@ done > /tmp/tier2-all.log 2>&1
 grep -iE 'dumped|failed|error|mismatch' /tmp/tier2-all.log || echo "All passed"
 ```
 
-Current status: **32 / 32 kernels pass**, at least one `tier2: upgraded`
-line per non-trivial kernel, no core dumps.
+Current status: **33 / 33 kernels pass** on both `sightglass/` and
+`sightglass-strong/`, at least one `tier2: upgraded` line per
+non-trivial kernel, no core dumps.
 
 Bug histories closed by the rewrite:
 
@@ -816,12 +821,17 @@ Bug histories closed by the rewrite:
 6. **Scope-filter hit rate is not measured.** We should emit a counter
    for "tier-up requests skipped due to non-scalar signature" to drive
    the v128 scope-expansion decision.
-7. **blind-sig tier-2 residual.** SEGV inside the OSR'd body; last
-   active bug in the tier-2+OSR matrix. Tracked in
-   `notes/bugs/osr_bugs.md` — same OSR-specific store-chain / codegen
-   family that the base64/minicsv/ratelimit triage already picked
-   apart; blind-sig is suspected to hit a different trigger and is not
-   yet root-caused.
+7. **blind-sig tier-2 residual — CLOSED 2026-04-19.** Was the last
+   active bug in the tier-2+OSR matrix. Root cause turned out to be
+   downstream of the OSR / tier-1 codegen work entirely: `thirdparty/ir`
+   `ir_emit_dessa_moves` did not account for two virtual registers
+   sharing one spill slot (stack-slot coloring over non-overlapping
+   live ranges) — the parallel-copy algorithm then sequenced copies
+   such that a later read saw an earlier write. Fixed by
+   canonicalizing spill-slot-aliased labels before handing the copy
+   list to `ir_dessa_parallel_copy`. Tracked in
+   `notes/bugs/osr_bugs.md` Bug 2. Sightglass-strong is now 33/33
+   under tier2+OSR at O2.
 
 ---
 
