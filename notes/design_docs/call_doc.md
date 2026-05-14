@@ -270,7 +270,6 @@ The JIT does not use C++ exceptions. All traps use `setjmp`/`longjmp`:
   entering JIT code.
 - Trampolines `longjmp` back with a code:
   - **1** -> Terminated (`proc_exit`)
-  - **2** -> Memory out of bounds (`jit_oob_trap`)
   - **3** -> Unreachable (`jit_unreachable_trap`)
 
 Unreachable trap stubs are placed in `FuncTable` for functions that weren't

@@ -95,16 +95,10 @@ extern "C" uint64_t jit_direct_or_host(JitExecEnv *env, void *funcPtr,
 /// JMP buf for unwinding on proc_exit (Terminated). Used by jit_host_call to
 /// longjmp back to invoke() so we do not return to JIT and run unreachable.
 extern "C" void *wasmedge_ir_jit_get_termination_buf(void);
-/// OOB trap handler: longjmps back to invoke() with value 2 (→ MemoryOutOfBounds).
-extern "C" void jit_oob_trap(void);
 /// Trap stub for uncompiled wasm functions (e.g. `unreachable` trap stubs).
 /// Same signature as JIT functions; placed in FuncTable for null-safety.
 /// Longjmps with value 3 (→ Unreachable).
 extern "C" int64_t jit_unreachable_trap(void *env, uint64_t *args);
-/// Wasm linear-memory bounds: ea = base+offset (i32 wrap); trap if zext(ea)+access_size > MemorySizeBytes.
-/// Outlined so IR JIT does not emit IF/UNREACHABLE per access (avoids ir_reg_alloc hang at O1+).
-extern "C" void jit_bounds_check(JitExecEnv *env, uint32_t base, uint32_t offset,
-                                 uint32_t access_size);
 /// call_indirect trampoline: resolves table[tableIdx][elemIdx], type-checks
 /// against typeIdx, then dispatches to JIT native code or interpreter.
 /// retTypeCode: 0=void, 1=i32, 2=i64, 3=f32, 4=f64

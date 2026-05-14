@@ -96,15 +96,6 @@ extern "C" void *wasmedge_ir_jit_get_termination_buf(void) {
   return &g_termination_buf;
 }
 
-/// OOB trap handler: longjmps back to invoke() with value 2 (MemoryOutOfBounds).
-extern "C" void jit_oob_trap(void) {
-  void *buf = wasmedge_ir_jit_get_termination_buf();
-  if (buf) {
-    longjmp(*static_cast<jmp_buf *>(buf), 2);
-  }
-  std::abort();
-}
-
 /// Trap stub for uncompiled wasm functions (e.g. functions starting with
 /// `unreachable`).  Has the same signature as JIT-compiled functions so it
 /// can be placed in FuncTable.  Longjmps with value 3 (→ Unreachable).
@@ -250,10 +241,6 @@ Expect<void> IRJitEngine::invoke(void *NativeFunc,
   void *termBuf = wasmedge_ir_jit_get_termination_buf();
   if (termBuf) {
     int jmpVal = setjmp(*static_cast<jmp_buf *>(termBuf));
-    if (jmpVal == 2) {
-      // OOB trap from jit_oob_trap (inline bounds check)
-      return Unexpect(ErrCode::Value::MemoryOutOfBounds);
-    }
     if (jmpVal == 3) {
       // Unreachable trap from jit_unreachable_trap (uncompiled trap stub)
       return Unexpect(ErrCode::Value::Unreachable);
