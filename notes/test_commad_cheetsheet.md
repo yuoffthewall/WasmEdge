@@ -31,7 +31,6 @@ Use **environment variables only** (no code changes). `SightglassSuite` runs the
 | `WASMEDGE_SIGHTGLASS_QUICK=0` | Run **every** `*.wasm` under `test/ir/testdata/sightglass/` (if `ctest` sets `QUICK=1`, override with `0`). |
 | `WASMEDGE_SIGHTGLASS_SKIP_INTERP=1` | Skip the WasmEdge interpreter(too slow) in `SightglassSuite`. |
 | `WASMEDGE_SIGHTGLASS_KERNEL=name` | Optional: single kernel (with or without `.wasm`). |
-| `WASMEDGE_IR_JIT_BOUND_CHECK=1` | Optional: enable memory bound checking. |
 
 Suggested prefix for IR JIT O2 / full kernel list:
 
@@ -58,7 +57,6 @@ for wasm in ../test/ir/testdata/sightglass/*.wasm; do
   WASMEDGE_SIGHTGLASS_MODE=IR_JIT \
   WASMEDGE_SIGHTGLASS_QUICK=1 \
   WASMEDGE_IR_JIT_OPT_LEVEL=2 \
-  WASMEDGE_IR_JIT_BOUND_CHECK=0 \
   stdbuf -oL timeout 30 ./test/ir/wasmedgeIRBenchmarkTests --gtest_filter='*SightglassSuite*' 2>&1
 done | tee /tmp/wasm-test.log
 ```

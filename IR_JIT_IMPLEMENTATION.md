@@ -354,13 +354,10 @@ std::variant<WasmFunction, Symbol<CompiledFunction>,
   - **`jit_call_indirect`** — full table resolution, type check, then JIT fast path or interpreter.
 
 ### 4.4 Traps and non-local returns.
-  `IRJitEngine::invoke` installs **`setjmp`** on a buffer from **`wasmedge_ir_jit_get_termination_buf`**. **`jit_oob_trap`** uses **`longjmp`** with value **2** → **`MemoryOutOfBounds`**. Other non-zero returns (e.g. **`Terminated`** from `proc_exit` via **`jit_host_call`**) unwind without returning into generated code. This keeps trap semantics aligned with the interpreter.
+  `IRJitEngine::invoke` installs **`setjmp`** on a buffer from **`wasmedge_ir_jit_get_termination_buf`**. Non-zero `longjmp` values unwind without returning into generated code: **3** → **`Unreachable`** (from `jit_unreachable_trap`), other non-zero → **`Terminated`** (e.g. from `proc_exit` via `jit_host_call`). This keeps trap semantics aligned with the interpreter.
 
 ### 4.5 Moving linear memory. 
   **`jit_memory_grow`** updates **`env->MemoryBase`** when the engine’s memory buffer is reallocated; generated code must always load the base from **`JitExecEnv`**, not cache a stale pointer across grow.
-
-### 4.6 Optional env-driven checks. 
-  **`jit_bounds_check`** is an outlined helper for linear-memory bounds; **in-IR** checks can be enabled with **`WASMEDGE_IR_JIT_BOUND_CHECK`** (see `WasmToIRBuilder::buildBoundsCheck`).
 
 
 The diagram below is the **same instantiate vs invoke split** as §1, zoomed into how IR JIT sits next to host and LLVM paths inside the executor.
@@ -801,7 +798,6 @@ cd build
 | `WASMEDGE_SIGHTGLASS_MODE` | Run only this mode: `Interpreter`, `IR_JIT`, `JIT`, or `AOT`. Use **`IR_JIT`** to exercise only the IR JIT column. |
 | `WASMEDGE_SIGHTGLASS_QUICK` | `1` (default in some paths) runs a subset; set **`0`** to run every `*.wasm` under `test/ir/testdata/sightglass/`. |
 | `WASMEDGE_IR_JIT_OPT_LEVEL` | `0`, `1`, or `2` — passed through to `ir_jit_compile` (default **2**). Lower when chasing codegen issues. |
-| `WASMEDGE_IR_JIT_BOUND_CHECK` | Set to **`1`** to emit extra in-IR memory bounds checks (see `WasmToIRBuilder::buildBoundsCheck`). |
 | `WASMEDGE_SIGHTGLASS_SKIP_INTERP=1` | Skip Interpreter (often slow) in `SightglassSuite`. |
 | `WASMEDGE_SIGHTGLASS_SKIP_AOT=1` | In test: skip AOT (e.g. when not built with LLVM). |
 | `SIGHTGLASS_TIMEOUT` | Per-run timeout in seconds (script only; default 15). |
@@ -824,7 +820,7 @@ for wasm in ../test/ir/testdata/sightglass/*.wasm; do
   kernel="$(basename "$wasm" .wasm)"
   echo "Testing $kernel:"
   WASMEDGE_SIGHTGLASS_KERNEL="$kernel" WASMEDGE_SIGHTGLASS_MODE=IR_JIT \
-    WASMEDGE_SIGHTGLASS_QUICK=1 WASMEDGE_IR_JIT_OPT_LEVEL=2 WASMEDGE_IR_JIT_BOUND_CHECK=0 \
+    WASMEDGE_SIGHTGLASS_QUICK=1 WASMEDGE_IR_JIT_OPT_LEVEL=2 \
     stdbuf -oL timeout 30 ./test/ir/wasmedgeIRBenchmarkTests --gtest_filter='*SightglassSuite*' 2>&1
 done | tee /tmp/wasm-test.log
 ```
