@@ -99,12 +99,6 @@ static void collectLocalWritesInSpan(Span<const AST::Instruction> InstrSpan,
   }
 }
 
-// WASMEDGE_IR_JIT_BOUND_CHECK=1 enables IR JIT linear-memory bounds checks before
-// each load/store; unset or any other value leaves them disabled (default).
-static bool irJitBoundCheckEnabled() {
-  const char *E = std::getenv("WASMEDGE_IR_JIT_BOUND_CHECK");
-  return E && E[0] == '1' && E[1] == '\0';
-}
 }  // namespace
 
 WasmToIRBuilder::WasmToIRBuilder() noexcept
@@ -1788,58 +1782,6 @@ ir_ref WasmToIRBuilder::buildMemoryAddress(ir_ref Base, uint32_t Offset) {
   return EffectiveAddr;
 }
 
-void WasmToIRBuilder::buildBoundsCheck(ir_ref Base, uint32_t Offset,
-                                       uint32_t AccessSize) {
-  if (!irJitBoundCheckEnabled())
-    return;
-
-  ir_ctx *ctx = &Ctx;
-
-  // Effective address ea must match buildMemoryAddress: i32 base + offset with
-  // 32-bit wrap, then end = zext_u64(ea) + access_size (Wasm spec).
-  // Trap if end > MemorySizeBytes (jit_bounds_check loads size from env — correct
-  // after memory.grow).
-  //
-  // Use a single outlined call instead of IF + LOAD + UGT + jit_oob_trap +
-  // UNREACHABLE: the extra control flow and unreachable block tickles a
-  // non-terminating linear scan in thirdparty ir_reg_alloc at O1/O2.
-  ir_ref EnvPtrVal = ensureValidRef(EnvPtr, IR_ADDR);
-  ir_ref BaseU32 = coerceToType(Base, IR_U32);
-  uint8_t ProtoParams[4] = {IR_ADDR, IR_U32, IR_U32, IR_U32};
-  ir_ref Proto =
-      ir_proto(ctx, IR_FASTCALL_FUNC, IR_VOID, 4, ProtoParams);
-  ir_ref Fn = ir_const_func_addr(ctx, (uintptr_t)&jit_bounds_check, Proto);
-  ir_CALL_4(IR_VOID, Fn, EnvPtrVal, BaseU32,
-            ir_CONST_I32(static_cast<int32_t>(Offset)),
-            ir_CONST_I32(static_cast<int32_t>(AccessSize)));
-}
-
-/// Return the number of bytes accessed by a memory load/store opcode.
-static uint32_t getMemoryAccessSize(OpCode Op) {
-  switch (Op) {
-  case OpCode::I32__load:    case OpCode::I32__store:
-  case OpCode::F32__load:    case OpCode::F32__store:
-  case OpCode::I64__load32_s: case OpCode::I64__load32_u:
-  case OpCode::I64__store32:
-    return 4;
-  case OpCode::I64__load:    case OpCode::I64__store:
-  case OpCode::F64__load:    case OpCode::F64__store:
-    return 8;
-  case OpCode::I32__load16_s: case OpCode::I32__load16_u:
-  case OpCode::I32__store16:
-  case OpCode::I64__load16_s: case OpCode::I64__load16_u:
-  case OpCode::I64__store16:
-    return 2;
-  case OpCode::I32__load8_s: case OpCode::I32__load8_u:
-  case OpCode::I32__store8:
-  case OpCode::I64__load8_s: case OpCode::I64__load8_u:
-  case OpCode::I64__store8:
-    return 1;
-  default:
-    return 0;
-  }
-}
-
 Expect<void> WasmToIRBuilder::visitMemory(const AST::Instruction &Instr) {
   OpCode Op = Instr.getOpCode();
   uint32_t Offset = Instr.getMemoryOffset();
@@ -1854,7 +1796,6 @@ Expect<void> WasmToIRBuilder::visitMemory(const AST::Instruction &Instr) {
   if (IsLoad) {
     // Load operations: pop address, load from memory, push result
     ir_ref BaseAddr = pop(); // Address from stack (i32)
-    buildBoundsCheck(BaseAddr, Offset, getMemoryAccessSize(Op));
     ir_ref EffectiveAddr = buildMemoryAddress(BaseAddr, Offset);
 
     switch (Op) {
@@ -1939,7 +1880,6 @@ Expect<void> WasmToIRBuilder::visitMemory(const AST::Instruction &Instr) {
     // Store operations: pop value, pop address, store to memory
     ir_ref Value = pop();      // Value to store
     ir_ref BaseAddr = pop();   // Address from stack (i32)
-    buildBoundsCheck(BaseAddr, Offset, getMemoryAccessSize(Op));
     ir_ref EffectiveAddr = buildMemoryAddress(BaseAddr, Offset);
 
     switch (Op) {
