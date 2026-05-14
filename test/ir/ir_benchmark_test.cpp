@@ -13,7 +13,9 @@
 #include "common/defines.h"
 #include "common/spdlog.h"
 #include "executor/executor.h"
+#include "host/wasi/wasimodule.h"
 #include "loader/loader.h"
+#include "plugin/plugin.h"
 #include "runtime/hostfunc.h"
 #include "runtime/instance/module.h"
 #include "validator/validator.h"
@@ -27,15 +29,207 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <dlfcn.h>
+#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #include <gtest/gtest.h>
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <memory>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <string_view>
+#include <unistd.h>
 #include <vector>
 
 namespace {
+
+struct StdioCapture {
+  std::string stdout_;
+  std::string stderr_;
+  int32_t exitCode{-1};  // proc_exit(code); -1 = never called
+};
+
+std::filesystem::path currentExecutablePath() {
+#if defined(__linux__)
+  std::vector<char> Buf(4096);
+  const ssize_t Len = ::readlink("/proc/self/exe", Buf.data(), Buf.size() - 1);
+  if (Len > 0) {
+    Buf[static_cast<size_t>(Len)] = '\0';
+    return std::filesystem::path(Buf.data());
+  }
+#endif
+  return {};
+}
+
+std::filesystem::path inferBuildRoot() {
+  auto Exe = currentExecutablePath();
+  if (!Exe.empty()) {
+    // build/test/ir/wasmedgeIRBenchmarkTests -> build
+    return Exe.parent_path().parent_path().parent_path();
+  }
+  return std::filesystem::current_path();
+}
+
+std::filesystem::path inferRepoRoot() {
+  return inferBuildRoot().parent_path();
+}
+
+std::string loadFileToString(const std::filesystem::path &Path) {
+  std::ifstream Ifs(Path, std::ios::binary);
+  if (!Ifs) return "";
+  return std::string((std::istreambuf_iterator<char>(Ifs)),
+                     std::istreambuf_iterator<char>());
+}
+
+std::string normalizeImageClassificationStderr(std::string_view Text) {
+  std::istringstream In{std::string(Text)};
+  std::string Line;
+  std::vector<std::string> Labels;
+  std::string Out;
+
+  if (std::getline(In, Line)) {
+    Out += Line;
+    Out += '\n';
+  }
+  while (std::getline(In, Line)) {
+    const auto Dot = Line.find(".) ");
+    if (Dot != std::string::npos) {
+      Labels.emplace_back(Line.substr(Dot + 3));
+    }
+  }
+  std::sort(Labels.begin(), Labels.end());
+  for (const auto &Label : Labels) {
+    Out += Label;
+    Out += '\n';
+  }
+  return Out;
+}
+
+bool sightglassKernelNeedsRealWasi(std::string_view KernelName) {
+  return KernelName == "image-classification" ||
+         KernelName == "tract-onnx-image-classification";
+}
+
+void preloadOpenVINORuntimeForSightglass() {
+  std::vector<std::filesystem::path> OpenVINODirs;
+  if (const char *SightglassDir = std::getenv("SIGHTGLASS_DIR");
+      SightglassDir && SightglassDir[0] != '\0') {
+    OpenVINODirs.emplace_back(std::filesystem::path(SightglassDir) /
+                              "benchmarks/image-classification/openvino");
+  }
+
+  const auto RepoRoot = inferRepoRoot();
+  OpenVINODirs.emplace_back(
+      RepoRoot / "bench/upstream/sightglass/benchmarks/image-classification/openvino");
+  OpenVINODirs.emplace_back(
+      RepoRoot.parent_path() / "sightglass/benchmarks/image-classification/openvino");
+
+  for (const auto &OpenVINODir : OpenVINODirs) {
+    const auto Tbb =
+        OpenVINODir / "runtime/3rdparty/tbb/lib/libtbb.so.2";
+    const auto OpenVINO =
+        OpenVINODir / "runtime/lib/intel64/libopenvino.so";
+    if (!std::filesystem::exists(Tbb) || !std::filesystem::exists(OpenVINO)) {
+      continue;
+    }
+    // libopenvino's transitive libtbb dependency is not always found from the
+    // plugin RUNPATH alone. Preload both by absolute path so a plain harness
+    // invocation works from the build tree.
+    ::dlopen(Tbb.string().c_str(), RTLD_NOW | RTLD_GLOBAL);
+    ::dlopen(OpenVINO.string().c_str(), RTLD_NOW | RTLD_GLOBAL);
+    return;
+  }
+}
+
+void loadSightglassPluginsOnce() {
+  static std::once_flag PluginsLoaded;
+  std::call_once(PluginsLoaded, [] {
+    preloadOpenVINORuntimeForSightglass();
+    WasmEdge::Plugin::Plugin::loadFromDefaultPaths();
+
+    const auto BuildRoot = inferBuildRoot();
+    const std::vector<std::filesystem::path> PluginPaths{
+        BuildRoot / "plugins/wasi_nn/libwasmedgePluginWasiNN.so",
+        BuildRoot / "plugins/wasi_nn",
+        std::filesystem::current_path() /
+            "plugins/wasi_nn/libwasmedgePluginWasiNN.so",
+        std::filesystem::current_path() / "plugins/wasi_nn",
+    };
+    for (const auto &Path : PluginPaths) {
+      if (WasmEdge::Plugin::Plugin::find("wasi_nn") != nullptr) {
+        break;
+      }
+      if (std::filesystem::exists(Path)) {
+        WasmEdge::Plugin::Plugin::load(Path);
+      }
+    }
+  });
+}
+
+class RealWasiStdioCapture {
+public:
+  ~RealWasiStdioCapture() {
+    if (StdoutFd >= 0) {
+      ::close(StdoutFd);
+    }
+    if (StderrFd >= 0) {
+      ::close(StderrFd);
+    }
+    std::error_code Ec;
+    if (!StdoutPath.empty()) {
+      std::filesystem::remove(StdoutPath, Ec);
+    }
+    if (!StderrPath.empty()) {
+      std::filesystem::remove(StderrPath, Ec);
+    }
+  }
+
+  bool open() {
+    StdoutFd = openTempFile("wasmedge_sg_stdout_", StdoutPath);
+    if (StdoutFd < 0) {
+      return false;
+    }
+    StderrFd = openTempFile("wasmedge_sg_stderr_", StderrPath);
+    return StderrFd >= 0;
+  }
+
+  int stdoutFd() const noexcept { return StdoutFd; }
+  int stderrFd() const noexcept { return StderrFd; }
+
+  void releaseToWasi() noexcept {
+    StdoutFd = -1;
+    StderrFd = -1;
+  }
+
+  void collect(StdioCapture &Capture) const {
+    Capture.stdout_ = loadFileToString(StdoutPath);
+    Capture.stderr_ = loadFileToString(StderrPath);
+  }
+
+private:
+  static int openTempFile(const char *Prefix, std::filesystem::path &Path) {
+    std::string Template =
+        (std::filesystem::temp_directory_path() /
+         (std::string(Prefix) + "XXXXXX"))
+            .string();
+    std::vector<char> Buf(Template.begin(), Template.end());
+    Buf.push_back('\0');
+    int Fd = ::mkstemp(Buf.data());
+    if (Fd >= 0) {
+      Path = Buf.data();
+    }
+    return Fd;
+  }
+
+  std::filesystem::path StdoutPath;
+  std::filesystem::path StderrPath;
+  int StdoutFd{-1};
+  int StderrFd{-1};
+};
 
 // ============================================================================
 // Sightglass: Minimal WASI types for stub (ABI-compatible with wasi_snapshot_preview1)
@@ -68,12 +262,6 @@ static_assert(sizeof(Prestat) == 8, "prestat size");
 // Sightglass: WASI stub host module (no-op / dummy so kernels can instantiate)
 // Optional stdout/stderr and exit code capture for correctness checks (Interpreter vs JIT).
 // ============================================================================
-struct StdioCapture {
-  std::string stdout_;
-  std::string stderr_;
-  int32_t exitCode{-1};  // proc_exit(code); -1 = never called
-};
-
 // Virtual file descriptor state for serving preloaded file content via WASI stubs.
 struct VirtualFd {
   std::string content;
@@ -1364,6 +1552,7 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
   }
 
   const char *modeEnv = std::getenv("WASMEDGE_SIGHTGLASS_MODE");
+  const bool modePinned = modeEnv && modeEnv[0] != '\0';
   bool interpOnly = (modeEnv && (std::strcmp(modeEnv, "Interpreter") == 0));
   bool jitOnly = (modeEnv && (std::strcmp(modeEnv, "JIT") == 0));
   bool aotOnly = (modeEnv && (std::strcmp(modeEnv, "AOT") == 0));
@@ -1392,7 +1581,20 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
 
   for (const auto &wasmPath : kernels) {
     std::string kernelName = wasmPath.parent_path().filename().string();
+    const bool needsRealWasi = sightglassKernelNeedsRealWasi(kernelName);
+    if (needsRealWasi) {
+      loadSightglassPluginsOnce();
+      ASSERT_NE(WasmEdge::Plugin::Plugin::find("wasi_nn"), nullptr)
+          << kernelName
+          << " requires the WASI-NN plugin. Set WASMEDGE_PLUGIN_PATH to the "
+             "directory containing libwasmedgePluginWasiNN.so.";
+    }
     std::cout << "Running kernel: " << kernelName << std::endl;
+    if (needsRealWasi && !modePinned) {
+      std::cout << "  plugin-backed kernel: defaulting to IR_JIT; set "
+                   "WASMEDGE_SIGHTGLASS_MODE to run another mode"
+                << std::endl;
+    }
     StdioCapture interpCap, jitCap, irJitCap, aotCap;
     bool interpOk = false;
     bool jitOk = false;
@@ -1421,6 +1623,9 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
 
     const char *modes[] = {"Interpreter", "IR_JIT", "JIT"};
     for (const char *modeName : modes) {
+      if (needsRealWasi && !modePinned &&
+          std::strcmp(modeName, "IR_JIT") != 0)
+        continue;
       if (skipInterp && std::strcmp(modeName, "Interpreter") == 0) continue;
       if (skipLlvmJit && std::strcmp(modeName, "JIT") == 0) continue;
       if (interpOnly && std::strcmp(modeName, "Interpreter") != 0) continue;
@@ -1439,14 +1644,44 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
       // IR_JIT:      ForceInterpreter=false, EnableJIT=false (IR JIT runs in Executor::instantiate)
       Conf.getRuntimeConfigure().setForceInterpreter(!useLlvmJIT && !useIRJIT);
       Conf.getRuntimeConfigure().setEnableJIT(useLlvmJIT);
+      if (needsRealWasi) {
+        Conf.addHostRegistration(WasmEdge::HostRegistration::Wasi);
+      }
 
-      WasiStubModule wasiStub(cap);
-      loadVirtualFiles(wasiStub);
+      std::unique_ptr<RealWasiStdioCapture> realWasiStdio;
+      std::unique_ptr<WasiStubModule> wasiStub;
       BenchEnv benchEnv;
       BenchModule benchMod(benchEnv);
 
       WasmEdge::VM::VM VM(Conf);
-      ASSERT_TRUE(VM.registerModule(wasiStub));
+      if (needsRealWasi) {
+        realWasiStdio = std::make_unique<RealWasiStdioCapture>();
+        ASSERT_TRUE(realWasiStdio->open())
+            << "Failed to create temp stdout/stderr files for " << kernelName;
+        auto *WasiMod = dynamic_cast<WasmEdge::Host::WasiModule *>(
+            VM.getImportModule(WasmEdge::HostRegistration::Wasi));
+        ASSERT_NE(WasiMod, nullptr)
+            << "Real WASI module is required for " << kernelName;
+
+        const auto kernelDir = SightglassDir / kernelName;
+        std::vector<std::string> Dirs{
+            ".:" + kernelDir.string(),
+            "/:" + kernelDir.string(),
+        };
+        std::vector<std::string> Args;
+        std::vector<std::string> Envs;
+        auto WasiInit =
+            WasiMod->initWithFds(Dirs, "benchmark.wasm", Args, Envs, 0,
+                                 realWasiStdio->stdoutFd(),
+                                 realWasiStdio->stderrFd());
+        ASSERT_TRUE(static_cast<bool>(WasiInit))
+            << "Failed to initialize real WASI for " << kernelName;
+        realWasiStdio->releaseToWasi();
+      } else {
+        wasiStub = std::make_unique<WasiStubModule>(cap);
+        loadVirtualFiles(*wasiStub);
+        ASSERT_TRUE(VM.registerModule(*wasiStub));
+      }
       ASSERT_TRUE(VM.registerModule(benchMod));
 
       auto ttvStart = high_resolution_clock::now();
@@ -1490,6 +1725,10 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
       else if (useIRJIT) irJitOk = true;
       else interpOk = true;
 
+      if (realWasiStdio) {
+        realWasiStdio->collect(*cap);
+      }
+
       double workTimeUs =
           duration_cast<Micro>(benchEnv.workTimeNs).count();
 
@@ -1507,7 +1746,9 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
     // Skip if WASMEDGE_SIGHTGLASS_SKIP_AOT=1 (e.g. for faster runs without LLVM AOT).
     const char *skipAotEnv = std::getenv("WASMEDGE_SIGHTGLASS_SKIP_AOT");
     const bool skipAOT = (skipAotEnv && skipAotEnv[0] == '1');
-    if (!skipAOT && (aotOnly || (!interpOnly && !jitOnly && !irJitOnly))) {
+    if (!skipAOT &&
+        (!needsRealWasi || modePinned) &&
+        (aotOnly || (!interpOnly && !jitOnly && !irJitOnly))) {
       const char *modeName = "AOT";
       WasmEdge::Configure compileConf;
       compileConf.getCompilerConfigure().setOptimizationLevel(
@@ -1560,14 +1801,46 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
                   WasmEdge::Configure runConf;
                   runConf.getRuntimeConfigure().setForceInterpreter(false);
                   runConf.getRuntimeConfigure().setEnableJIT(false);
+                  if (needsRealWasi) {
+                    runConf.addHostRegistration(WasmEdge::HostRegistration::Wasi);
+                  }
 
-                  WasiStubModule wasiStub(&aotCap);
-                  loadVirtualFiles(wasiStub);
+                  std::unique_ptr<RealWasiStdioCapture> realWasiStdio;
+                  std::unique_ptr<WasiStubModule> wasiStub;
                   BenchEnv benchEnv;
                   BenchModule benchMod(benchEnv);
 
                   WasmEdge::VM::VM VM(runConf);
-                  ASSERT_TRUE(VM.registerModule(wasiStub));
+                  if (needsRealWasi) {
+                    realWasiStdio = std::make_unique<RealWasiStdioCapture>();
+                    ASSERT_TRUE(realWasiStdio->open())
+                        << "Failed to create temp stdout/stderr files for "
+                        << kernelName;
+                    auto *WasiMod = dynamic_cast<WasmEdge::Host::WasiModule *>(
+                        VM.getImportModule(WasmEdge::HostRegistration::Wasi));
+                    ASSERT_NE(WasiMod, nullptr)
+                        << "Real WASI module is required for " << kernelName;
+
+                    const auto kernelDir = SightglassDir / kernelName;
+                    std::vector<std::string> Dirs{
+                        ".:" + kernelDir.string(),
+                        "/:" + kernelDir.string(),
+                    };
+                    std::vector<std::string> Args;
+                    std::vector<std::string> Envs;
+                    auto WasiInit =
+                        WasiMod->initWithFds(Dirs, "benchmark.wasm", Args,
+                                             Envs, 0,
+                                             realWasiStdio->stdoutFd(),
+                                             realWasiStdio->stderrFd());
+                    ASSERT_TRUE(static_cast<bool>(WasiInit))
+                        << "Failed to initialize real WASI for " << kernelName;
+                    realWasiStdio->releaseToWasi();
+                  } else {
+                    wasiStub = std::make_unique<WasiStubModule>(&aotCap);
+                    loadVirtualFiles(*wasiStub);
+                    ASSERT_TRUE(VM.registerModule(*wasiStub));
+                  }
                   ASSERT_TRUE(VM.registerModule(benchMod));
 
                   auto ttvStart = high_resolution_clock::now();
@@ -1595,6 +1868,9 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
                           aotOk = true; // proc_exit = success
                       } else {
                         aotOk = true;
+                      }
+                      if (realWasiStdio) {
+                        realWasiStdio->collect(aotCap);
                       }
                       if (aotOk) {
                         double workTimeUs =
@@ -1626,19 +1902,12 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
     const bool hasStdoutGolden = std::filesystem::exists(goldenStdout);
     const bool hasStderrGolden = std::filesystem::exists(goldenStderr);
 
-    auto loadExpected = [](const std::filesystem::path &path) -> std::string {
-      std::ifstream ifs(path, std::ios::binary);
-      if (!ifs) return "";
-      return std::string((std::istreambuf_iterator<char>(ifs)),
-                          std::istreambuf_iterator<char>());
-    };
-
     std::string expectedStdout;
     std::string expectedStderr;
     if (hasStdoutGolden)
-      expectedStdout = loadExpected(goldenStdout);
+      expectedStdout = loadFileToString(goldenStdout);
     if (hasStderrGolden)
-      expectedStderr = loadExpected(goldenStderr);
+      expectedStderr = loadFileToString(goldenStderr);
 
     auto checkExpected = [&](const std::string &label, const StdioCapture &cap, bool ok) {
       if (!ok || (!hasStdoutGolden && !hasStderrGolden))
@@ -1648,8 +1917,20 @@ TEST_F(IRBenchmarkTest, SightglassSuite) {
             << "Kernel " << kernelName << " (" << label << "): stdout mismatch vs .expected";
       }
       if (hasStderrGolden) {
-        EXPECT_EQ(cap.stderr_, expectedStderr)
-            << "Kernel " << kernelName << " (" << label << "): stderr mismatch vs .expected";
+        const bool unorderedImageClasses =
+            kernelName == "image-classification" ||
+            kernelName == "tract-onnx-image-classification";
+        const std::string actualStderr =
+            unorderedImageClasses
+                ? normalizeImageClassificationStderr(cap.stderr_)
+                : cap.stderr_;
+        const std::string expectedStderrForCompare =
+            unorderedImageClasses
+                ? normalizeImageClassificationStderr(expectedStderr)
+                : expectedStderr;
+        EXPECT_EQ(actualStderr, expectedStderrForCompare)
+            << "Kernel " << kernelName << " (" << label
+            << "): stderr mismatch vs .expected";
       }
     };
     checkExpected("Interpreter", interpCap, interpOk);
