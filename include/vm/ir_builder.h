@@ -138,6 +138,11 @@ private:
     uint32_t Arity;            // Number of values expected at branch (0 or 1)
     ir_type ResultType;        // IR type of result (IR_VOID if no result)
     bool ResultIsRef = false;  // True when block/if result type is ref (two stack slots)
+    // True iff the underlying wasm BlockType is empty (no params, no results).
+    // Tracked separately from Arity because Arity collapses both "empty" and
+    // "multi-value typed (type index)" to 0; the OSR synthesiser distinguishes
+    // them, so visitLoop's OSR-eligibility predicate must too.
+    bool BlockTypeEmpty = true;
     uint32_t StackBase;        // Stack base for this label
     bool InElseBranch;         // For if: are we in the else branch?
     bool HasElse;              // For if: does this have an else clause?

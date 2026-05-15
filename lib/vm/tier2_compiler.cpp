@@ -601,17 +601,27 @@ void emitT1ThunkInPlace(LLVMModuleRef LLMod, LLVMContextRef Ctx,
 
 /// Find the instruction index of the \p LoopIdx-th OSR-eligible Loop in
 /// \p Seg's body, matching WasmToIRBuilder::visitLoop's enumeration:
-/// increment the counter for a Loop whose enclosing scope stack contains
-/// no Loop and no If (intervening Blocks are allowed; the OSR synthesiser
-/// rebuilds them). Returns `Instrs.size()` if not found.
+/// increment the counter for a Loop whose own BlockType is empty AND
+/// whose enclosing scope stack contains no Loop, no If, and no typed
+/// (non-empty BlockType) Block. The synthesiser in appendOsrFunctionSlot
+/// rejects all the other shapes, so the frontend declines to assign
+/// LoopIdx for them; this enumeration must match exactly. Returns
+/// `Instrs.size()` if not found.
 uint32_t findOsrLoopStart(const AST::CodeSegment &Seg,
                           uint32_t LoopIdx) noexcept {
   const auto Instrs = Seg.getExpr().getInstrs();
-  std::vector<OpCode> Stack;
+  struct StackEnt {
+    OpCode Op;
+    bool BlockTypeEmpty;
+  };
+  std::vector<StackEnt> Stack;
   uint32_t Count = 0;
-  auto enclosedByLoopOrIf = [&]() {
-    for (OpCode O : Stack) {
-      if (O == OpCode::Loop || O == OpCode::If) {
+  auto osrIneligible = [&]() {
+    for (const auto &E : Stack) {
+      if (E.Op == OpCode::Loop || E.Op == OpCode::If) {
+        return true;
+      }
+      if (E.Op == OpCode::Block && !E.BlockTypeEmpty) {
         return true;
       }
     }
@@ -620,17 +630,21 @@ uint32_t findOsrLoopStart(const AST::CodeSegment &Seg,
   for (size_t I = 0; I < Instrs.size(); ++I) {
     OpCode Op = Instrs[I].getOpCode();
     switch (Op) {
-    case OpCode::Loop:
-      if (!enclosedByLoopOrIf()) {
+    case OpCode::Loop: {
+      const bool LoopEmpty = Instrs[I].getBlockType().isEmpty();
+      if (LoopEmpty && !osrIneligible()) {
         if (Count == LoopIdx)
           return static_cast<uint32_t>(I);
         ++Count;
       }
-      Stack.push_back(Op);
+      Stack.push_back({Op, LoopEmpty});
       break;
+    }
     case OpCode::Block:
+      Stack.push_back({Op, Instrs[I].getBlockType().isEmpty()});
+      break;
     case OpCode::If:
-      Stack.push_back(Op);
+      Stack.push_back({Op, Instrs[I].getBlockType().isEmpty()});
       break;
     case OpCode::End:
       if (!Stack.empty()) {

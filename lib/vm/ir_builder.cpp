@@ -2460,6 +2460,7 @@ Expect<void> WasmToIRBuilder::visitBlock(const AST::Instruction &Instr) {
   
   // Get result type from block type
   const BlockType &BType = Instr.getBlockType();
+  Label.BlockTypeEmpty = BType.isEmpty();
   if (!BType.isEmpty() && BType.isValType()) {
     Label.Arity = 1;
     Label.ResultType = wasmTypeToIRType(BType.getValType());
@@ -2468,7 +2469,7 @@ Expect<void> WasmToIRBuilder::visitBlock(const AST::Instruction &Instr) {
     Label.Arity = 0;
     Label.ResultType = IR_VOID;
   }
-  
+
   Label.StackBase = static_cast<uint32_t>(ValueStack.size());
   Label.InElseBranch = false;
   Label.HasElse = false;
@@ -2493,6 +2494,7 @@ Expect<void> WasmToIRBuilder::visitLoop(const AST::Instruction &Instr) {
   Label.ElseEnd = IR_UNUSED;
 
   const BlockType &BType = Instr.getBlockType();
+  Label.BlockTypeEmpty = BType.isEmpty();
   if (!BType.isEmpty() && BType.isValType()) {
     Label.Arity = 1;
     Label.ResultType = wasmTypeToIRType(BType.getValType());
@@ -2508,22 +2510,31 @@ Expect<void> WasmToIRBuilder::visitLoop(const AST::Instruction &Instr) {
   Label.TrueBranchTerminated = false;
   Label.ElseBranchTerminated = false;
 
-  // OSR: assign per-function loop index only for Loops that are not
-  // enclosed by another Loop AND whose enclosing Block chain contains no
-  // If (conditions required by synthesizeOsrModule, which rebuilds the
-  // enclosing Block scopes but cannot mid-enter an If's then/else arm).
+  // OSR: assign per-function loop index only for Loops the synthesiser in
+  // appendOsrFunctionSlot can actually rebuild. That requires:
+  //   - no enclosing Loop or If (mid-entering an If's then/else arm or a
+  //     parent Loop's iteration state is not expressible);
+  //   - no enclosing typed Block (a typed `block t ... end` demands a
+  //     t-valued stack at entry and at end, neither of which exists when
+  //     the OSR entry begins execution at the inner Loop header);
+  //   - the Loop's own BlockType is empty (a typed `loop (param/result t)`
+  //     similarly demands a t-valued stack at entry).
   // CurrLoopIdx advances in lockstep with findOsrLoopStart's enumeration
-  // over the same criteria: a counter over the instruction stream that
-  // matches this predicate. The OsrMinLoop/OsrMaxLoop filter suppresses
-  // instrumentation without disturbing the counter.
-  bool EnclosedByLoopOrIf = false;
+  // over the same criteria, so both sides agree on loop numbering. The
+  // OsrMinLoop/OsrMaxLoop filter suppresses instrumentation without
+  // disturbing the counter.
+  bool OsrIneligible = !Label.BlockTypeEmpty;
   for (const auto &L : LabelStack) {
     if (L.Kind == ControlKind::Loop || L.Kind == ControlKind::If) {
-      EnclosedByLoopOrIf = true;
+      OsrIneligible = true;
+      break;
+    }
+    if (L.Kind == ControlKind::Block && !L.BlockTypeEmpty) {
+      OsrIneligible = true;
       break;
     }
   }
-  if (OsrThreshold > 0 && !EnclosedByLoopOrIf &&
+  if (OsrThreshold > 0 && !OsrIneligible &&
       CurrLoopIdx < OSR_MAX_LOOPS_PER_FUNC) {
     const uint32_t Idx = CurrLoopIdx++;
     if (Idx >= OsrMinLoop && Idx <= OsrMaxLoop) {
@@ -2591,6 +2602,7 @@ Expect<void> WasmToIRBuilder::visitIf(const AST::Instruction &Instr) {
   
   // Get result type from block type
   const BlockType &BType = Instr.getBlockType();
+  Label.BlockTypeEmpty = BType.isEmpty();
   if (!BType.isEmpty() && BType.isValType()) {
     Label.Arity = 1;
     Label.ResultType = wasmTypeToIRType(BType.getValType());
@@ -2599,13 +2611,13 @@ Expect<void> WasmToIRBuilder::visitIf(const AST::Instruction &Instr) {
     Label.Arity = 0;
     Label.ResultType = IR_VOID;
   }
-  
+
   Label.StackBase = static_cast<uint32_t>(ValueStack.size());
   Label.InElseBranch = false;
   Label.HasElse = false;
   Label.TrueBranchTerminated = false;
   Label.ElseBranchTerminated = false;
-  
+
   // Save locals state before entering if (needed for PHIs at merge)
   Label.PreIfLocals = Locals;
 
