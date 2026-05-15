@@ -281,7 +281,7 @@ public:
     addHostFunc("fd_filestat_get", std::make_unique<StubFdFilestatGet>());
     addHostFunc("fd_close", std::make_unique<StubFdClose>(this));
     addHostFunc("fd_read", std::make_unique<StubFdRead>(this));
-    addHostFunc("fd_seek", std::make_unique<StubFdSeek>());
+    addHostFunc("fd_seek", std::make_unique<StubFdSeek>(this));
     addHostFunc("fd_write", std::make_unique<StubFdWrite>(Capture));
     addHostFunc("path_open", std::make_unique<StubPathOpen>(this));
     addHostFunc("path_filestat_get", std::make_unique<StubPathFilestatGet>(this));
@@ -479,15 +479,39 @@ private:
 
   class StubFdSeek : public WasmEdge::Runtime::HostFunction<StubFdSeek> {
   public:
-    Expect body(const WasmEdge::Runtime::CallingFrame &Frame, int32_t, int64_t, uint32_t /* whence */,
+    explicit StubFdSeek(WasiStubModule *Mod) : Module(Mod) {}
+    Expect body(const WasmEdge::Runtime::CallingFrame &Frame, int32_t Fd, int64_t Off, uint32_t Whence,
                 uint32_t ResultPtr) {
       auto *Mem = getMem(Frame);
-      if (Mem) {
-        auto *p = Mem->getPointer<uint64_t *>(ResultPtr);
-        if (p) *p = 0;
+      if (!Mem) return WasmEdge::Unexpect(WasmEdge::ErrCode::Value::HostFuncError);
+      // Track per-fd offset on the VirtualFd record so fread sees the right
+      // position. fseek(SEEK_END,0) is how spidermonkey-* probe input length;
+      // returning 0 here used to make the JS engine see an empty file.
+      // WASI preview1 whence: 0=SET, 1=CUR, 2=END.
+      uint64_t NewOff = 0;
+      if (Module) {
+        auto It = Module->openFds.find(Fd);
+        if (It != Module->openFds.end()) {
+          auto &Vfd = It->second;
+          int64_t Base = 0;
+          switch (Whence) {
+            case 0: Base = 0; break;
+            case 1: Base = static_cast<int64_t>(Vfd.offset); break;
+            case 2: Base = static_cast<int64_t>(Vfd.content.size()); break;
+          }
+          int64_t Target = Base + Off;
+          if (Target < 0) Target = 0;
+          if (Target > static_cast<int64_t>(Vfd.content.size()))
+            Target = static_cast<int64_t>(Vfd.content.size());
+          Vfd.offset = static_cast<size_t>(Target);
+          NewOff = static_cast<uint64_t>(Target);
+        }
       }
+      auto *p = Mem->getPointer<uint64_t *>(ResultPtr);
+      if (p) *p = NewOff;
       return SightglassWasi::WASI_ERRNO_SUCCESS;
     }
+    WasiStubModule *Module;
   };
 
   class StubFdWrite : public WasmEdge::Runtime::HostFunction<StubFdWrite> {
@@ -629,7 +653,16 @@ private:
       auto *Mem = getMem(Frame);
       if (Mem && BufLen > 0) {
         auto *p = Mem->getPointer<uint8_t *>(BufPtr);
-        if (p) std::memset(p, 0, BufLen);
+        if (p) {
+          // Deterministic non-zero PRNG (xorshift64*). A previous all-zero
+          // fill caused spidermonkey-* kernels to spin because the JS engine
+          // rejects an all-zero entropy seed and retries indefinitely.
+          static thread_local uint64_t S = 0x9E3779B97F4A7C15ULL;
+          for (uint32_t I = 0; I < BufLen; ++I) {
+            S ^= S >> 12; S ^= S << 25; S ^= S >> 27;
+            p[I] = static_cast<uint8_t>((S * 0x2545F4914F6CDD1DULL) >> 56);
+          }
+        }
       }
       return SightglassWasi::WASI_ERRNO_SUCCESS;
     }
