@@ -58,7 +58,17 @@ public:
 
   ~LogEnv() noexcept {
     std::unique_lock Lock(Mutex);
-    spdlog::drop(LogFileName);
+    // Only drop the file logger if one was actually registered; the
+    // unique registry name is `LogRegName` (mirrors func.cpp:46).
+    // Dropping by `LogFileName` would default to "" when no file
+    // logger was set up — and "" is also the default logger's name,
+    // so spdlog::registry::drop() would null out the default logger
+    // for the whole process. That caused tier2 worker spdlog::info
+    // calls to crash on `default_logger_raw()->info(...)` shortly
+    // after every VM that loads wasi_logging tears down.
+    if (FileLogger) {
+      spdlog::drop(LogRegName);
+    }
     RegisteredID.erase(InstanceID);
   }
 
