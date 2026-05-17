@@ -241,205 +241,191 @@ if (ctx->use_lists[ref].count == 0) {
 
 ---
 
-## Bug 3: SCCP Heap-Use-After-Free on Constant-Pool Realloc
+## Bug 3: SCCP Promotion Stale Writes After Constant-Pool Realloc
 
-**Status: FIXED (proper fix applied in ir_sccp.c; earlier workaround
-of pre-allocating a larger constant pool is no longer load-bearing)**
+**Status: FIXED**
 
 ### Syndrome
-Two distinct assertion failures seen in practice, both secondary
-symptoms of the same heap-use-after-free that corrupts the IR graph:
 
-1. `ir_cfg.c:305: ir_build_cfg: Assertion '((ir_op_flags[insn->op] & (1<<12)) != 0)' failed`
-   during `ir_jit_compile` at O2 — `ir_build_cfg` encounters a
-   non-BB-start instruction where it expects one.
-2. `ir_sccp.c:1916: ir_promote_i2i: Assertion '0' failed` and
-   `ir_private.h:1067: ir_next_control: Assertion '0' failed`, observed
-   on pulldown-cmark after reshaping `visitBrTable` to use
-   `ir_SWITCH` + `ir_CASE_VAL`/`ir_CASE_DEFAULT`.
+This bug has shown up as several different O2-only IR corruption
+symptoms. The `tract-onnx-image-classification` reproducer trapped under
+IR JIT with tier2 instrumentation enabled:
 
-All only reproduce at `-O2` (SCCP runs); O0/O1 pass. The crash is
-non-deterministic and depends on heap layout — setting the unrelated
-env var `WASMEDGE_SIGHTGLASS_QUICK=1` changes allocations enough to
-mask it.
-
-### Reproducers
+```text
+[error] execution failed: unreachable, Code: 0x40a
+When executing function name: "_start"
+execute _start failed: tract-onnx-image-classification IR_JIT 1034
 ```
-WASMEDGE_SIGHTGLASS_KERNEL=regex WASMEDGE_SIGHTGLASS_MODE=IR_JIT \
+
+The same failure still reproduced with tier2 enabled but actual tier2
+compilation disabled:
+
+```sh
+cd build
+WASMEDGE_SIGHTGLASS_DIR=sightglass-strong \
+WASMEDGE_SIGHTGLASS_KERNEL=tract-onnx-image-classification \
+WASMEDGE_SIGHTGLASS_MODE=IR_JIT \
 WASMEDGE_IR_JIT_OPT_LEVEL=2 \
-./test/ir/wasmedgeIRBenchmarkTests --gtest_filter='*SightglassSuite*'
-```
-and the pulldown-cmark kernel under the same env.
-
-### Root Cause (confirmed with ASan and GDB)
-`ir_promote_i2i`, `ir_promote_d2f`, and `ir_promote_f2d` hold raw
-`ir_insn *insn` pointers into `ctx->ir_base` across recursive calls.
-Those recursive calls can create new constants via `ir_const()`. When
-the constant pool is full, `ir_const()` -> `ir_next_const()` ->
-`ir_grow_bottom()` calls `ir_mem_realloc()`, which **reallocates the
-entire `ir_base` buffer** and updates `ctx->ir_base`. Every `insn`
-pointer on the call stack is now dangling, and subsequent reads/writes
-through them touch freed memory.
-
-ASan stack trace (original reproducer, regex kernel):
-```
-WRITE of size 4 at 0x521000185778 thread T0
-    #0 ir_promote_i2i           ir_sccp.c:1920
-    #1 ir_iter_opt              ir_sccp.c:3641
-    #2 ir_sccp                  ir_sccp.c:3791
-    #3 ir_jit_compile           ir.h:1036
-
-freed by thread T0 here:
-    #0 __interceptor_realloc
-    #1 ir_grow_bottom           ir.c:317
-    #2 ir_next_const            ir.c:329
-    #3 ir_const_ex              ir.c:552
-    #4 ir_const                 ir.c:564
+WASMEDGE_TIER2_ENABLE=1 \
+WASMEDGE_TIER2_THRESHOLD=1000000000 \
+WASMEDGE_TIER2_MAX_COMPILE=0 \
+stdbuf -oL timeout 120 ./test/ir/wasmedgeIRBenchmarkTests \
+  --gtest_filter='*SightglassSuite*' \
+  > /tmp/tract-high.log 2>&1
+grep -iE 'dumped|error|failed|mismatch|warning' /tmp/tract-high.log
 ```
 
-### Why our changes exposed it
+That made the failure a tier1 IR-JIT O2 bug, not a bad LLVM tier2
+module.
 
-**Direct-call change (regex, original repro).** The old code reused a
-single function pointer (`DirectOrHostFn`, loaded once at function
-entry) for all direct calls, requiring few constants per function. The
-new code creates a unique `ir_CONST_ADDR(funcIdx * sizeof(void*))` per
-call site. For large Wasm functions with many calls, this exhausts the
-initial 4-entry constant pool (`IR_CONSTS_LIMIT_MIN`), triggering the
-realloc during SCCP.
+### Root cause
 
-**SWITCH lowering (pulldown-cmark).** The old if-chain gave
-`IndexVal` N uses (one `ir_EQ` per case); the new SWITCH gives it
-exactly 1 use. This didn't directly cause the realloc, but it changed
-the SCCP optimization landscape:
+`ir_promote_i2i`, `ir_promote_d2f`, and `ir_promote_f2d` recursively
+promote source trees while eliminating narrowing or widening nodes. When
+a promoted input is a constant, the recursive call creates a new constant
+with `ir_const()`. If the constant pool is full, `ir_const()` can grow the
+bottom of the IR allocation and reallocate `ctx->ir_base`.
 
-- TRUNC-promotion (`ir_may_promote_trunc` / `ir_promote_i2i`) found
-  new promotion opportunities on PHI nodes with many constant inputs
-  (13 cases from the br_table).
-- Promoting 13 constants from `I32` to `U8` required creating new
-  `U8` constants that did not previously exist in the constant pool.
-- The burst of `ir_const()` calls exhausted `consts_limit` and
-  triggered `ir_grow_bottom()` mid-recursion.
-
-With the old if-chain the same PHI had fewer promotable paths (the
-cascaded control flow produced different PHI structures), so the
-constant pool never grew during promotion.
-
-### Crash A — `ir_promote_i2i` PHI-loop pointer invalidation
-
-The PHI handler in `ir_promote_i2i` iterated over inputs with a raw
-pointer `p`:
+The old code wrote recursive promotion results directly into the current
+instruction:
 
 ```c
-case IR_PHI:
-    for (p = insn->ops + 2, n = insn->inputs_count - 1; n > 0; p++, n--) {
-        input = *p;
-        if (input != ref) {
-            *p = ir_promote_i2i(ctx, type, input, ref, worklist);
-            // ^^^ may realloc ir_base, invalidating p
-        }
-    }
+insn->op1 = ir_promote_i2i(ctx, type, insn->op1, ref, worklist);
 ```
 
-After the recursive call reallocated `ir_base`, `*p` on the next
-iteration read from freed memory. In the pulldown-cmark run the
-garbage value (67112) was far beyond `ctx->insns_count` (1943); the
-instruction at that bogus address had opcode 249 (not a valid IR op),
-falling through to the `default` case and hitting `IR_ASSERT(0)` at
-line 1916.
-
-GDB evidence:
-```
-#7  ir_promote_i2i(ctx, type=IR_U8, ref=67112, use=1700, ...)   <- garbage ref
-#8  ir_promote_i2i(ctx, type=IR_U8, ref=1700, use=1742, ...)    <- PHI
-#9  ir_iter_opt(ctx, worklist)                                    <- TRUNC at 1742
-```
-`ctx->insns_count = 1943`, so ref=67112 is wildly out of bounds, and
-`ir_op_name[249]` returns NULL.
-
-### Crash B — `ir_iter_opt` stale-`insn` writeback
-
-After fixing Crash A, a second pulldown-cmark function crashed in
-`ir_build_cfg` (which runs after SCCP). The `ir_iter_opt` call site
-for TRUNC promotion wrote back through a stale `insn` pointer:
+and for PHI inputs:
 
 ```c
-case IR_TRUNC:
-    if (ir_may_promote_trunc(ctx, insn->type, insn->op1)) {
-        ir_ref ref = ir_promote_i2i(ctx, insn->type, insn->op1, i, worklist);
-        insn->op1 = ref;   // <-- insn is stale after realloc!
-        ir_iter_replace_insn(ctx, i, ref, worklist);
-    }
+ctx->ir_base[ref].ops[k] =
+    ir_promote_i2i(ctx, type, input, ref, worklist);
 ```
 
-`insn` pointed into the old (freed) `ir_base`. Writing `ref` (=131,
-a PHI) through the dangling pointer overwrote an unrelated
-instruction's field. Specifically, `END(104).op1` was corrupted from
-104 to 131 (a PHI ref), so `ir_next_control` could not find a
-control-flow successor for instruction 104.
+C does not require the left-hand destination address to be computed after
+the right-hand call. At O2, the compiler could compute the destination
+address in the old `ctx->ir_base`, then the recursive `ir_promote_*()`
+call could create a constant and reallocate `ctx->ir_base`. The final
+assignment then stored through a stale address instead of updating the
+live IR instruction.
 
-GDB evidence:
+The bug also affected chained assignments such as:
+
+```c
+insn->op2 = insn->op1 = ir_promote_i2i(...);
 ```
-insn[104]: op=IF_FALSE  op1=103        <- control node
-insn[105]: op=END       op1=131        <- should be 104, corrupted to 131 (a PHI)
-insn[131]: op=PHI       op1=130        <- data node, not a control predecessor
+
+because either destination can be based on the stale `insn` pointer.
+
+### Evidence
+
+The reduced reproducer is:
+
+```text
+TRUNC_U8(PHI(i32 254, i32 255))
 ```
 
-### Earlier workaround (in ir_builder.cpp)
-Pre-allocate a 256-entry constant pool instead of the minimum 4:
-```cpp
-ir_init(&Ctx, ir_flags, 256, IR_INSNS_LIMIT_MIN);
-//                       ^^^ was IR_CONSTS_LIMIT_MIN (= 4)
+with a small constant table so promoting the two PHI inputs forces
+constant-table growth.
+
+The old backend produced a partially promoted conditional:
+
+```text
+uint8_t d_9 = COND(d_2, c_254, c_257)
 ```
-This masked the regex reproducer by avoiding the realloc during
-optimization, but it only postponed the bug — the pulldown-cmark
-repro later exhausted the pool again because the SWITCH lowering
-burst-created many new U8 constants. The proper fix below replaces
-this workaround as the load-bearing defense.
 
-### Proper fix (in `thirdparty/ir/ir_sccp.c`, 25 insertions, 10 deletions)
+where `c_254` was still the original `int32_t` constant and `c_257` was
+the new `uint8_t` constant. The fixed backend promotes both operands:
 
-Make the promotion helpers resilient to `ir_base` moving under them:
+```text
+uint8_t d_9 = COND(d_2, c_256, c_257)
+```
 
-1. **Rewrite `ir_promote_i2i`'s PHI handler as index-based iteration**,
-   re-deriving the address from `ctx->ir_base[ref]` each step so the
-   loop never reads through a pointer that may have been freed:
+The larger failing tract dump also showed stale use-list state after
+SCCP/iteration:
 
-   ```c
-   case IR_PHI: {
-       ir_ref ic = insn->inputs_count;
-       ir_ref k;
-       for (k = 2; k <= ic; k++) {
-           input = ctx->ir_base[ref].ops[k];
-           if (input != ref) {
-               ctx->ir_base[ref].ops[k] = ir_promote_i2i(ctx, type, input, ref, worklist);
-           }
-       }
-       ctx->ir_base[ref].type = type;
-       return ref;
-   }
-   ```
+```text
+ir_base[3944] is in use list of ir_base[36]
+ir_base[4101] is in use list of ir_base[36]
+```
 
-2. **Reload `insn = &ctx->ir_base[ref]` after every recursive
-   `ir_promote_*` call** in the NEG/ABS/NOT, binary-op, and COND
-   handlers of `ir_promote_i2i`; same reload pattern in
-   `ir_promote_d2f` and `ir_promote_f2d` for their NEG/ABS and
-   binary-op handlers.
+That is consistent with a stale write: the live operand graph and the
+use lists no longer described the same IR.
 
-3. **Fix `ir_iter_opt` writeback sites.** Replace `insn->op1 = ref`
-   with `ctx->ir_base[i].op1 = ref` in all `ir_iter_opt` promote call
-   sites (FP2FP, FP2INT, TRUNC), so the write always goes through the
-   current `ir_base` pointer. Also reload `insn` before
-   `goto folding` in the FP2INT path.
+Earlier regex and pulldown-cmark investigations exposed the same class of
+bug with ASan/GDB: recursive promotion held raw `ir_insn *` pointers into
+`ctx->ir_base`, while `ir_const()` could reallocate the backing buffer.
 
-An alternative (not taken) would be to change `ir_grow_bottom` to a
-growth strategy that never moves the buffer (e.g., a linked-list of
-pages); the per-caller reload approach is smaller and local to SCCP.
+### Fix
+
+The fix is to never write to an instruction operand across a recursive
+promotion call. The promotion helpers now:
+
+1. Read the old operand.
+2. Call the recursive `ir_promote_*()` helper and store the result in a
+   temporary `ir_ref`.
+3. Reload `insn = &ctx->ir_base[ref]` after the recursive call.
+4. Store the promoted operand into the reloaded instruction.
+
+Fixed pattern:
+
+```c
+ir_ref promoted = ir_promote_i2i(ctx, type, insn->op1, ref, worklist);
+insn = &ctx->ir_base[ref]; /* reload - ir_const() may realloc ir_base */
+insn->op1 = promoted;
+```
+
+The same rule is applied to:
+
+- unary integer promotions (`NEG`, `ABS`, `NOT`)
+- binary integer promotions (`ADD`, `SUB`, `MUL`, `MIN`, `MAX`,
+  `OR`, `AND`, `XOR`, `SHL`)
+- `COND` value operands
+- double-to-float promotion
+- float-to-double promotion
+
+The PHI path now uses operand helpers after recursion:
+
+```c
+input = ir_insn_op(&ctx->ir_base[ref], k);
+if (input != ref) {
+    ir_ref promoted = ir_promote_i2i(ctx, type, input, ref, worklist);
+    ir_insn_set_op(&ctx->ir_base[ref], k, promoted);
+}
+```
+
+The `ir_iter_opt` promotion call sites already write back through
+`ctx->ir_base[i]` and reload before folding, so this patch completes the
+same realloc-safe rule inside the promotion helpers themselves.
+
+### Regression test
+
+`IRBackendTest.SCCPPromotesPhiAfterConstTableGrowth` builds the reduced
+IR shape with a deliberately tiny constant table:
+
+```text
+TRUNC_U8(PHI(i32 254, i32 255))
+```
+
+After `ir_sccp(ctx)`, the PHI must be converted into an `IR_U8`
+`IR_COND` whose two value operands are both `IR_U8` constants with values
+`254` and `255`.
 
 ### Verification
-All 38 sightglass kernels pass at `-O2`, including pulldown-cmark
-(previously crashed) and shootout-switch (the SWITCH-lowering
-optimization target). regex (the original ASan reproducer) also
-passes without needing the 256-entry pre-allocation to mask the race.
+
+Every validation run redirected output to a log and grepped the log with:
+
+```sh
+grep -iE 'dumped|error|failed|mismatch|warning' LOG
+```
+
+Passing results:
+
+| Check | Result |
+|---|---|
+| Standalone IR tool on the reduced failing dump at O2 | exit 0, grep found no matches |
+| `tract-onnx-image-classification`, IR_JIT O2, tier2 enabled, threshold `1000000000`, max compile `0` | exit 0, grep found no matches |
+| `tract-onnx-image-classification`, IR_JIT O2, original threshold `10` | exit 0, grep found no matches |
+| `IRBackendTest.SCCPPromotesPhiAfterConstTableGrowth` | exit 0, grep found no matches |
+| `git diff --check` and `git -C thirdparty/ir diff --check` | clean |
 
 ---
 

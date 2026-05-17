@@ -28,6 +28,9 @@
 #include "ast/type.h"
 #include "common/types.h"
 
+#include <ir.h>
+#include <ir_builder.h>
+
 #include <gtest/gtest.h>
 #include <vector>
 
@@ -51,6 +54,45 @@ TEST(IRBuilderTest, InitializationVoid) {
   auto Res = Builder.initialize(FuncType, Locals);
   ASSERT_TRUE(Res);
   ASSERT_NE(Builder.getIRContext(), nullptr);
+}
+
+TEST(IRBackendTest, SCCPPromotesPhiAfterConstTableGrowth) {
+  ir_ctx Ctx;
+  ir_ctx *ctx = &Ctx;
+  ir_init(ctx, IR_OPT_FOLDING | IR_OPT_CFG, 5, 64);
+
+  struct Cleanup {
+    ir_ctx *Ctx;
+    ~Cleanup() { ir_free(Ctx); }
+  } Guard{ctx};
+
+  ir_START();
+  ir_ref Cond = ir_PARAM(IR_I32, "x", 0);
+  ir_ref C254 = ir_CONST_I32(254);
+  ir_ref C255 = ir_CONST_I32(255);
+
+  ir_ref If = ir_IF(Cond);
+  ir_IF_TRUE(If);
+  ir_ref EndTrue = ir_END();
+  ir_IF_FALSE(If);
+  ir_ref EndFalse = ir_END();
+
+  ir_MERGE_2(EndTrue, EndFalse);
+  ir_ref Phi = ir_PHI_2(IR_I32, C254, C255);
+  ir_ref Trunc = ir_TRUNC_U8(Phi);
+  ir_RETURN(Trunc);
+
+  ir_build_def_use_lists(ctx);
+  ASSERT_TRUE(ir_sccp(ctx));
+
+  ASSERT_EQ(ctx->ir_base[Phi].op, IR_COND);
+  ASSERT_EQ(ctx->ir_base[Phi].type, IR_U8);
+  ASSERT_TRUE(IR_IS_CONST_REF(ctx->ir_base[Phi].op2));
+  ASSERT_TRUE(IR_IS_CONST_REF(ctx->ir_base[Phi].op3));
+  EXPECT_EQ(ctx->ir_base[ctx->ir_base[Phi].op2].type, IR_U8);
+  EXPECT_EQ(ctx->ir_base[ctx->ir_base[Phi].op3].type, IR_U8);
+  EXPECT_EQ(ctx->ir_base[ctx->ir_base[Phi].op2].val.u8, 254);
+  EXPECT_EQ(ctx->ir_base[ctx->ir_base[Phi].op3].val.u8, 255);
 }
 
 TEST(IRBuilderTest, InitializationWithParams) {
@@ -911,4 +953,3 @@ int main(int argc, char **argv) {
   
   return result;
 }
-
