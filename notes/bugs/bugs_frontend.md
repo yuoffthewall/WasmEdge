@@ -190,3 +190,114 @@ before the bounds check commit.
 - Debug and fix regex kernel failure (miscompiled at O1+ with bounds checking)
 - Investigate ForceO0 mystery
 - Debug and fix bz2 at O1
+
+---
+
+## Bug 4: OSR Locals-Store Widening Creates CSE Substrate for Cross-Branch Miscompile
+
+**Status: FIXED**
+
+### Syndrome
+
+With `WASMEDGE_OSR_THRESHOLD > 0` and the Phase-2 locals-serialisation
+sequence in `WasmToIRBuilder::emitLoopBackEdge()` emitting
+`ir_ZEXT_U64` / `ir_BITCAST_U64` widening plus `ir_STORE` for each
+local into `OsrLocalsFrame`, 13 of 33 sightglass kernels regressed at
+O2: SIGSEGV / wasm trap / timeout / golden mismatch across
+blake3-scalar, bz2, gcc-loops, pulldown-cmark, rust-html-rewriter,
+rust-protobuf, blind-sig, rust-compression, rust-json, regex,
+shootout-ed25519, shootout-keccak, shootout-random.
+
+The bug reproduced with `WASMEDGE_OSR_THRESHOLD=100000000` — the cold
+snapshot stores never executed, so the symptom was from compile-time
+IR shape rather than the runtime OSR transition.
+
+### Root Cause
+
+`dstogov/ir` folds "foldable" ops — IR opcodes up to `IR_COPY`,
+including `IR_ZEXT` and `IR_BITCAST` — through a CSE table
+(`_ir_fold_cse` in `thirdparty/ir/ir.c`). The OSR diamond emitted
+stores on two sibling control-flow branches (the transition TRUE path
+and the threshold-hit TRUE path), each widening the *same* wasm local
+via `ir_ZEXT_U64(local)` / `ir_BITCAST_U64(local)`. CSE saw the two
+widening ops as equivalent (same opcode + same operand) and
+deduplicated them to a single SSA def.
+
+That single def was then consumed by stores in two *disjoint* control
+branches. Downstream, GCM chose a placement (typically the common
+dominator above both branches), and later passes (schedule / coalesce
+/ regalloc) emitted code where the widened value's live range spanned
+code paths that may not define it. The result was wrong codegen on
+the non-threshold back-edge path — the path that ran every iteration
+— even though the stores themselves were semantically reachable only
+once per loop lifetime.
+
+### Fix
+
+`lib/vm/ir_builder.cpp` `emitLoopBackEdge()`: replace widening +
+8-byte store with a **type-native store** — `ir_STORE(slot, val)` at
+the local's natural IR type (4 bytes for i32/f32, 8 bytes for
+i64/f64). The upper 4 bytes of the slot are left stale for i32/f32,
+but the OSR thunk (`tier2_compiler.cpp emitFwdThunk`) reads the full
+u64 slot and then `LLVMBuildTrunc`s to the native parameter type, so
+the high bits are ignored.
+
+```cpp
+for (const auto &[LocalIdx, Val] : Locals) {
+  if (LocalIdx >= OSR_LOCALS_FRAME_SLOTS) break;
+  ir_ref SlotAddr = ir_ADD_A(
+      OsrLocalsFramePtr,
+      ir_CONST_ADDR(static_cast<uintptr_t>(LocalIdx) * sizeof(uint64_t)));
+  ir_STORE(SlotAddr, Val);   // native width; no ZEXT/BITCAST
+}
+```
+
+Removing the widening ops removes the CSE substrate. `ir_STORE` is
+not foldable — two stores to different addresses in disjoint branches
+cannot be deduped — so the problematic single-def-feeding-two-branches
+shape can no longer form.
+
+Additionally, the redundant locals snapshot on the threshold-hit path
+(originally Phase 2 behavior) was removed: the transition path
+re-stores locals fresh on every iteration once the OSR entry is
+ready, so nothing downstream reads from a pre-entry snapshot.
+Emitting those stores did nothing useful and re-introduced the exact
+CSE shape above. The threshold-hit path now only calls
+`jit_osr_notify`; the transition path owns the snapshot.
+
+### Verification
+
+- 33/33 sightglass-strong kernels pass at O2 with
+  `WASMEDGE_TIER2_ENABLE=1 WASMEDGE_TIER2_THRESHOLD=10
+  WASMEDGE_OSR_THRESHOLD=5000`. Exit 0, no
+  `dumped|error|failed|mismatch|warning` grep hits (modulo the
+  harmless "unreachable trap stubs" info line).
+- Golden output unchanged across every kernel.
+- No WT regression on non-looping functions.
+
+### Latent Backend Bugs Exposed
+
+The locals-store IR shape put atypical pressure on the IR backend
+(register allocation, liveness analysis, DESSA) and surfaced several
+latent backend bugs. All three are fixed:
+
+- **blind-sig SIGSEGV** — DESSA parallel-copy at a back-edge
+  coalesced two PHI inputs to the same spill slot; the emitter
+  sequenced the moves in an order that violated read-before-overwrite.
+  Fix in `thirdparty/ir/ir_emit.c` (`ir_emit_dessa_moves`):
+  canonicalize spill-slot-aliased labels before handing them to
+  `ir_dessa_parallel_copy`. See `bugs_x86_code_emission.md` Bug 9.
+
+- **sqlite3 SIGSEGV (paradoxically when OSR is *off*)** — a narrow
+  byte spill reload was recorded as satisfying a wider coalesced use.
+  OSR's extra stores perturbed live ranges enough to dodge the bad
+  coalescing, so the bug surfaced only without OSR enabled. Fix in
+  `thirdparty/ir/ir_ra.c`. See `bugs_register_allocation.md` Bug 8.
+
+- **tract-onnx wasm trap / GCM crash** — discovered after migrating
+  to type-native stores: a separate DESSA scratch-clobbering bug and
+  a GCM partial-dead-split crash on unpinned dead PHIs, both
+  triggered by the same cold-snapshot store IR shape. Fixes in
+  `thirdparty/ir/ir_emit.c` and `thirdparty/ir/ir_gcm.c`. See Bug 10
+  in `bugs_x86_code_emission.md` and Bug 5 in
+  `bugs_sccp_optimization.md`.

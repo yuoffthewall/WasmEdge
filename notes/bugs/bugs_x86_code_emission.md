@@ -984,3 +984,118 @@ spill slot.
    same slot.
 4. **Native code verification:** Disassembly at 0xb91–0xba6 shows the lost copy
    sequence described above.
+
+---
+
+## Bug 10: DESSA Scratch Register Clobbers Finalized Destination
+
+**Status: FIXED**
+
+### Syndrome
+
+Under tier-1 OSR instrumentation at O2,
+`tract-onnx-image-classification` produced wrong values at runtime,
+triggering a wasm `unreachable, Code: 0x40a` trap. The failure
+reproduced with `WASMEDGE_OSR_THRESHOLD=1000000000`, so the OSR
+transition was never executed — the IR shape from the cold OSR
+snapshot stores alone was enough to expose the bug.
+
+Narrowed repro (FuncIdx=11825, dump id 11810 = 11825 − 15 imports):
+
+```bash
+WASMEDGE_SIGHTGLASS_DIR=sightglass-strong \
+WASMEDGE_SIGHTGLASS_KERNEL=tract-onnx-image-classification \
+WASMEDGE_SIGHTGLASS_MODE=IR_JIT \
+WASMEDGE_IR_JIT_OPT_LEVEL=2 \
+WASMEDGE_TIER2_ENABLE=1 WASMEDGE_TIER2_THRESHOLD=10 \
+WASMEDGE_OSR_THRESHOLD=1000000000 \
+WASMEDGE_OSR_MIN_FUNC=11825 WASMEDGE_OSR_MAX_FUNC=11825 \
+WASMEDGE_OSR_MIN_LOOP=0 WASMEDGE_OSR_MAX_LOOP=0 \
+./build/test/ir/wasmedgeIRBenchmarkTests --gtest_filter='*SightglassSuite*'
+```
+
+O0 passes, O2 fails. `WASMEDGE_OSR_SKIP_STORES=1` also passes — the
+cold locals-snapshot stores are the trigger.
+
+### Root Cause
+
+`ir_dessa_parallel_copy()` (`ir_emit.c`) picks `tmp_reg` / `tmp_fp_reg`
+as the scratch register for memory-to-memory and constant-to-memory
+moves. The selection enforced `tmp ∉ srcs` (line ~802) but did not
+forbid `tmp` from being a *destination* of some copy.
+
+When `tmp_reg` is also a copy destination, the algorithm processes the
+final write to `tmp_reg` first (register indices come before stack-slot
+indices in the ready bitset, so they pop first). After that, `tmp_reg`
+holds its finalized value. Subsequent memory-to-memory moves in the
+same phase still use `tmp_reg` as scratch, loading from the source
+slot and storing to the destination — clobbering the finalized value.
+
+On the failing tract-onnx OSR back-edge, two DESSA moves were needed:
+
+```text
+d_237 -> d_254
+d_238 -> d_253
+```
+
+`d_254` was assigned `%edi`. The buggy emitter produced:
+
+```asm
+mov 0x2f8(%rsp), %edi   ; load d_237 for d_254 (final write to %edi)
+mov 0xd8(%rsp), %edi    ; clobber %edi while copying d_238 → spill
+mov %edi, 0x2f8(%rsp)
+mov %edi, %esi          ; uses clobbered d_254
+```
+
+### Fix
+
+`thirdparty/ir/ir_emit.c`, `ir_dessa_parallel_copy()` and new helper
+`ir_emit_dessa_move_protected_tmp()`:
+
+1. While building `pred[]`, track whether `tmp_reg` or `tmp_fp_reg` is
+   a destination of any copy (`tmp_reg_is_dst`, `tmp_fp_reg_is_dst`)
+   and record its destination type.
+2. Wrap each `ir_emit_dessa_move` call site with the new helper. The
+   helper checks whether the current move uses scratch (target is a
+   stack slot AND source is a stack slot or constant); if scratch is
+   needed AND `tmp` is a destination whose final write has already
+   happened (i.e., target removed from `todo`), save `tmp` to a stack
+   slot before the move and restore after.
+3. Apply the same save/restore around `ir_dessa_resolve_cycle` when
+   the cycle's scratch class is a finalized destination.
+
+The save slot uses the x86-64 SysV red zone —
+`IR_MEM_BO(IR_REG_STACK_POINTER, -16)` for int and `-32` for fp.
+Non-SysV targets (Windows x64, AArch64) would need a different
+scheme.
+
+Fixed asm shape:
+
+```asm
+mov 0x2f8(%rsp), %edi
+mov %edi, -0x10(%rsp)   ; preserve finalized scratch destination
+mov 0xd8(%rsp), %edi
+mov %edi, 0x2f8(%rsp)
+mov -0x10(%rsp), %edi   ; restore d_254
+mov %edi, %esi
+```
+
+### Related
+
+This bug surfaced alongside the GCM partial-dead-split bug in the same
+tract-onnx OSR investigation (see Bug 5 in
+`bugs_sccp_optimization.md`). With only the GCM fix in place, this
+DESSA miscompile still produced a wasm `unreachable` trap at runtime;
+with only the DESSA fix in place, the GCM crash still happened at
+compile time. Both fixes are required.
+
+This is the third DESSA-related correctness bug in this file:
+
+- Bug 6: two labels mapping to the same physical register.
+- Bug 9: two distinct labels mapping to the same physical spill slot.
+- Bug 10: a label serving as both the destination and the scratch
+  resource.
+
+All three arose from `ir_dessa_parallel_copy()` reasoning about copies
+in terms of vreg labels that don't fully capture the underlying
+physical state.
