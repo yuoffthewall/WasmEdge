@@ -705,3 +705,118 @@ implementations:
 | `/tmp/wasm_jit_563_disas.txt` | funcIdx 577 O2 x86 disassembly |
 | `/tmp/wasm_jit_564_disas.txt` | funcIdx 578 O2 x86 disassembly |
 | `/tmp/wasm_jit_601_disas.txt` | funcIdx 615 O2 x86 disassembly |
+
+---
+
+## Bug 8: Narrow Spill Reload Wrongly Satisfies Wider Coalesced Use
+
+**Status: FIXED**
+
+### Syndrome
+
+`sightglass-strong/sqlite3` deterministically SIGSEGVs at IR JIT O2 under
+`WASMEDGE_TIER2_ENABLE=1` + `WASMEDGE_OSR_THRESHOLD=0`:
+
+```bash
+WASMEDGE_SIGHTGLASS_DIR=sightglass-strong \
+WASMEDGE_SIGHTGLASS_KERNEL=sqlite3 \
+WASMEDGE_SIGHTGLASS_MODE=IR_JIT \
+WASMEDGE_IR_JIT_OPT_LEVEL=2 \
+WASMEDGE_TIER2_ENABLE=1 \
+WASMEDGE_TIER2_THRESHOLD=10 \
+WASMEDGE_OSR_THRESHOLD=0 \
+./build/test/ir/wasmedgeIRBenchmarkTests --gtest_filter='*SightglassSuite*'
+```
+
+5/5 runs SIGSEGV. Any IR-shape perturbation around loops or memory
+accesses (`WASMEDGE_OSR_THRESHOLD≥1` *or* `WASMEDGE_IR_JIT_BOUND_CHECK=1`)
+masks it — those knobs add `LOAD`/`STORE`/`CALL` ops that shift LSRA
+live-range starts and ends through the loop body, either avoiding the
+bad coalescing or landing the buggy availability decision on an
+innocuous interval. Neither path is a real fix.
+
+The crash surfaced in leaf functions `wasm_jit_2552` and `wasm_jit_1818`
+(host stack overflow / wasm `__stack_pointer` wrap respectively), but
+those functions were *not* miscompiled — their post-opt IR and native
+were byte-identical between passing and failing configs. The actual
+miscompile was upstream in sqlite3 FuncIdx 1482, whose corrupted compare
+made a recursion base case unreachable and leaked wasm SP across
+repeated calls until it wrapped below zero.
+
+### Root Cause
+
+When an i32 SSA value is coalesced with a `TRUNC(i32)→u8` sub-use, the
+narrow byte reload (`movb spill, %cl`) was recorded as having satisfied
+the wider use too. A later same-block `cmpl %ecx, …` then consumed the
+register as i32 with **stale upper bits** left over after an
+intervening caller-saved-clobbering CALL.
+
+The LSRA tracks "this block already has a spill reload available" via
+the `available` bitset and `prev_use_ref`. The check that gated those
+updates did not consider the *type width* of the satisfying use. A
+`movb` reload followed by a `cmpl` of the same vreg looks correct at
+the IR level (both read the same vreg), but the byte load leaves bits
+8–31 of the register untouched. A CALL between the two reads can — and
+in FuncIdx 1482 did — trash those upper bits.
+
+### Fix
+
+`thirdparty/ir/ir_ra.c`. New helper `ir_spill_load_preserves_interval`
+returns false when an integer use is narrower than the coalesced
+interval:
+
+```c
+static bool ir_spill_load_preserves_interval(ir_ctx *ctx,
+    ir_live_interval *ival, ir_use_pos *use_pos)
+{
+    /* … */
+    input_type = ctx->ir_base[input].type;
+    if (IR_IS_TYPE_INT(ival->type)
+     && IR_IS_TYPE_INT(input_type)
+     && ir_type_size[input_type] < ir_type_size[ival->type]) {
+        return 0;  /* narrow use of wider coalesced interval */
+    }
+    return 1;
+}
+```
+
+Called from `assign_regs()` at the spill-load decision point:
+
+```c
+bool preserves_interval =
+    ir_spill_load_preserves_interval(ctx, top_ival, use_pos);
+
+if (ir_ival_covers(ival, …) && preserves_interval && !ir_is_dead_load(...)) {
+    ir_bitset_incl(available, use_b);
+}
+prev_use_ref = preserves_interval ? ref : IR_UNUSED;
+```
+
+Two effects when the helper returns false:
+
+1. The current block is not added to `available`, so successor blocks
+   correctly see the wider value as needing a fresh spill load.
+2. `prev_use_ref` is set to `IR_UNUSED`, so subsequent same-block uses
+   don't treat the narrow `movb` reload as having satisfied a wider
+   read.
+
+Both are necessary. (2) catches the same-block case that broke FuncIdx
+1482 — a `cmpl %ecx, %esi` immediately after a `movb` reload of the
+same vreg. (1) catches cross-block analogues where the wider read is
+in a successor of the byte-reload block.
+
+This is in the same family as Bug 4 (`prev_use_ref` skipping spill
+reload for same-instruction duplicate args) and Bug 5 (dead load
+skipping spill reload across CFG paths): all three are LSRA decisions
+that conflate "we already loaded this vreg" with "the loaded bits
+satisfy every subsequent use of this vreg". Each bug refines the
+condition under which the optimization is sound.
+
+### Verification
+
+| Check | Result |
+|---|---|
+| `tests/x86_64/ra_016.irt` (new) | passes with fix, fails without |
+| Full `tests/x86_64/` suite (171 tests) | 171/171 pass |
+| Original sqlite3 repro, 5/5 runs | all exit 0 |
+| Asm diff (buggy → fixed) | exactly `+movl 0x1c(%rsp), %ecx` before `cmpl %ecx, %esi` |
