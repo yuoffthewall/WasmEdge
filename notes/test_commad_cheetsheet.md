@@ -205,7 +205,7 @@ for wasm in ../test/ir/testdata/sightglass-strong/*/benchmark.wasm; do
   WASMEDGE_IR_JIT_OPT_LEVEL=2 \
   WASMEDGE_TIER2_ENABLE=1 \
   WASMEDGE_TIER2_THRESHOLD=10 \
-  WASMEDGE_OSR_THRESHOLD=1000 \
+  WASMEDGE_OSR_THRESHOLD=5000 \
   stdbuf -oL timeout 60 ./test/ir/wasmedgeIRBenchmarkTests --gtest_filter='*SightglassSuite*' 2>&1
 done | tee /tmp/wasm-tier2-osr.log
 echo $?
@@ -258,8 +258,10 @@ Two are checked in:
   benchmarks at `bench/upstream/sightglass/benchmarks/...` (cloned by
   `utils/setup_bench_deps.sh`). Regenerate if upstream sightglass changes.
 - `bench/wasmedge-strong.suite` — the **in-tree strong set** at
-  `test/ir/testdata/sightglass-strong/<kernel>/benchmark.wasm` (39 kernels,
-  workTimeUs ~5–10 s, wasmtime-oracled goldens). No upstream clone needed.
+  `test/ir/testdata/sightglass-strong/<kernel>/benchmark.wasm` (42 kernels,
+  mostly workTimeUs ~5–10 s, wasmtime-oracled goldens). `image-classification`
+  still needs the WASI-NN OpenVINO plugin and OpenVINO runtime;
+  `tract-onnx-image-classification` runs pure-Wasm inference via tract.
   Use for paper-grade measurements.
 
 Run the strong suite through the same driver:
