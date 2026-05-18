@@ -40,16 +40,17 @@ on purpose:
 - `noop` — harness-overhead reference point (~1 µs `workTimeUs`); intentionally
   outside the band.
 - `spidermonkey-json`, `spidermonkey-markdown`, `spidermonkey-regex`,
-  `tinygo-json`, `image-classification` — strengthening was attempted but
+  `tinygo-json`, `image-classification`, `sqlite3`,
+  `tract-onnx-image-classification` — strengthening was attempted but
   produced tier-2/tier-1 ratios within 0.05× of 1.0× (and often *below* 1.0×;
-  see [Why five kernels were left at upstream size](#why-five-kernels-were-left-at-upstream-size)
+  see [Why seven kernels were left at upstream size](#why-seven-kernels-were-left-at-upstream-size)
   below). They are kept at upstream size as **negative-result evidence**:
   documented but excluded from the aggregates.
 
-The `splay` and `sqlite3` kernels from `test/ir/testdata/sightglass-strong/`
-are also in the directory but are excluded from the active strengthening list
-because of separate IR JIT or tier-2 bugs not in scope for this pass; see the
-respective bug notes.
+The `splay` kernel from `test/ir/testdata/sightglass-strong/` is also in the
+directory but is excluded from the active strengthening list because of a
+separate IR JIT bug (wasm-gc kernel segfaults at tier-1; see the respective
+bug note).
 
 ## Per-kernel strengthening changes
 
@@ -192,11 +193,12 @@ moved outside the loop so the golden stays single-line-deterministic.
     (`That took %lf seconds.\n` varies per run). Replaced with `printf("Done.\n")`
     and dropped the `currentTime()` before/after captures.
 
-### Why five kernels were left at upstream size
+### Why seven kernels were left at upstream size
 
-Five upstream-size kernels are intentionally retained without strengthening:
+Seven upstream-size kernels are intentionally retained without strengthening:
 `spidermonkey-json`, `spidermonkey-markdown`, `spidermonkey-regex`,
-`tinygo-json`, and `image-classification`. Each was strengthened to land in
+`tinygo-json`, `image-classification`, `sqlite3`, and
+`tract-onnx-image-classification`. Each was strengthened to land in
 `[5s, 10s]`, measured against tier-2 (regular) and tier-2+OSR, and reverted
 because the tier-2/tier-1 ratio came in within ±0.05× of flat — often *below*
 flat. Single-run WTs (Release IR JIT O2, `WASMEDGE_TIER2_THRESHOLD=10`,
@@ -209,11 +211,13 @@ flat. Single-run WTs (Release IR JIT O2, `WASMEDGE_TIER2_THRESHOLD=10`,
 | spidermonkey-regex (ITERS=350) | 8,105,837 | 8,747,908 | 7,884,831 | 0.93× | 1.03× |
 | tinygo-json (ITERS=120) | 7,895,398 | 7,844,385 | 7,826,273 | 1.01× | 1.01× |
 | image-classification (ITERS=3500) | 5,067,486 | 5,059,485 | 4,937,057 | 1.00× | 1.03× |
+| sqlite3 (ITERS=10) | 8,208,141 | 7,962,978 | 8,672,875 | 1.03× | 0.95× |
+| tract-onnx-image-classification (ITERS=30) | 7,720,191 | 7,974,772 | 8,284,838 | 0.97× | 0.93× |
 | **tinygo-regex (ITERS=7)** | 8,468,501 | 6,185,582 | 6,231,380 | **1.37×** | **1.36×** |
 
-`tinygo-regex` is the only one of the six newly added kernels where the
+`tinygo-regex` is the only one of the eight newly added kernels where the
 strengthened workload produces a real tier-2 win, so it is the only one
-retained at strengthened size. The other five would inflate the suite's
+retained at strengthened size. The other seven would inflate the suite's
 geomean toward 1.0× without telling us anything new — they are documented
 here as negative-result evidence and left at upstream size in
 `test/ir/testdata/sightglass-strong/`.
@@ -244,6 +248,26 @@ Why each flat kernel resists tier-2 (root causes, in plain words):
   an opaque function pointer whose target depends on values they cannot
   constant-fold. Most of what makes Go's JSON slow is also what hides
   specialization opportunities from the JIT.
+- **sqlite3** — interpreter-shaped wasm (like SpiderMonkey, but smaller).
+  SQLite's VDBE is itself a bytecode interpreter: `sqlite3VdbeExec` is a
+  giant computed-goto / switch dispatch loop in C, already pushed through
+  Emscripten `-O3` when SQLite was compiled to wasm. The hot inner loop is
+  VDBE opcode-fetch + dispatch, bottlenecked by branch prediction. The
+  remaining wasm-side cycles spread thinly across many small functions
+  (parser, btree, pager) — the per-function hotness is below the tier-2
+  promotion threshold for most of them, so tier-2 promotes only a handful
+  of functions and the geomean win is in the noise.
+- **tract-onnx-image-classification** — compile-cost-dominates failure mode.
+  Tract's tensor ops produce large wasm functions (model.run lowers to many
+  per-op functions). Tier-2's per-function LLVM compile cost is steep:
+  enabling tier-2 inflated the harness's Comp column from 3.5 s to 8.3 s,
+  meaning the swap to LLVM code happens late in the ~8 s bench window and
+  leaves almost no post-swap runway. The whole-module LLVM JIT row tells
+  the same story from the other side: 138 s of upfront compile to produce
+  167 ms of execution. There *is* headroom (LLVM/T1 ratio = 0.61×), but
+  tier-2's background-recompile model cannot capture it on a kernel where
+  the function set is large and individually expensive — it would need
+  either a much longer bench window or a more selective promotion policy.
 - **tinygo-regex (kept)** — direct-called scalar code. `regexp.MustCompile`
   builds a DFA, and `FindAllString` is a tight inner loop over a `[]byte`
   doing scalar comparisons and byte loads. Direct calls, regular loops,
@@ -252,12 +276,15 @@ Why each flat kernel resists tier-2 (root causes, in plain words):
   memchr-like scan).
 
 This is a useful negative result for the tier-2 story: the patterns that
-fight a two-tier wasm JIT — native FFI hops, wasm-compiled interpreters,
-and indirect dispatch over runtime type info — are the same patterns that
-keep multi-tier JITs in native runtimes (V8, JSC, .NET) from getting linear
-speedups on app-style workloads. The kernels where tier-2 already wins big
-in the existing suite (`shootout-*`, `blake3`, `gcc-loops`, `rust-*`) have
-the opposite shape: direct-called numerical kernels.
+fight a two-tier wasm JIT — native FFI hops, wasm-compiled interpreters
+(SpiderMonkey, SQLite VDBE), indirect dispatch over runtime type info
+(Go reflection), and large-function workloads with high per-function
+compile cost (tract-onnx) — are the same patterns that keep multi-tier
+JITs in native runtimes (V8, JSC, .NET) from getting linear speedups on
+app-style workloads. The kernels where tier-2 already wins big in the
+existing suite (`shootout-*`, `blake3`, `gcc-loops`, `rust-*`,
+`tinygo-regex`) have the opposite shape: direct-called numerical kernels
+with concentrated hotness.
 
 ### Harness plumbing (`test/ir/` and the verify-kernels skill)
 
