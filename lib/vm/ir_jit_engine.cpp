@@ -238,7 +238,27 @@ Expect<void> IRJitEngine::invoke(void *NativeFunc,
     ~TlsRestore() { g_tier2_current_env = Prev; }
   } TlsRestore_{SavedTlsEnv};
 
+  // Save/restore the thread-local termination jmp_buf for re-entrancy. When
+  // tier-2 LLVM code calls back into tier-1 via jit_host_call, jitCallFunction
+  // recurses into IRJitEngine::invoke; the inner setjmp would clobber the
+  // outer frame's saved state. After the inner invoke returns and the outer
+  // wasm later traps (e.g. through Fault::emitFault) longjmp would land on
+  // the inner's popped frame and glibc's __longjmp_chk would abort with
+  // "longjmp causes uninitialized stack frame".
   void *termBuf = wasmedge_ir_jit_get_termination_buf();
+  jmp_buf SavedTermBuf;
+  if (termBuf) {
+    std::memcpy(&SavedTermBuf, termBuf, sizeof(jmp_buf));
+  }
+  struct TermBufRestore {
+    void *Buf;
+    jmp_buf *Saved;
+    ~TermBufRestore() {
+      if (Buf)
+        std::memcpy(Buf, Saved, sizeof(jmp_buf));
+    }
+  } TermBufRestore_{termBuf, &SavedTermBuf};
+
   if (termBuf) {
     int jmpVal = setjmp(*static_cast<jmp_buf *>(termBuf));
     if (jmpVal == 3) {
