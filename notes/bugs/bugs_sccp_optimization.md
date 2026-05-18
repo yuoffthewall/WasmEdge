@@ -465,3 +465,122 @@ call.
 The `IR_OPT_INLINE` pass should correctly handle IF/THEN/ELSE patterns
 with indirect calls and PHI merges. Likely a bug in how the pass
 handles memory effects of calls in diamond control flow.
+
+---
+
+## Bug 5: GCM Partial-Dead Split Walks Through Unpinned Dead PHI
+
+**Status: FIXED**
+
+### Syndrome
+
+`tract-onnx-image-classification` SIGSEGVs during IR-JIT compilation at
+O2 under tier-1 OSR instrumentation. The crash happens at compile
+time, before any generated code runs. GDB backtrace:
+
+```text
+ir_sparse_set_in(n=179287296)
+_push_predecessors()
+ir_split_partially_dead_node(ref=93, scheduled_to=BB21)
+ir_gcm_schedule_late()
+ir_gcm()
+```
+
+Narrowed repro (FuncIdx=12467, dump id 12452 = 12467 − 15 imports):
+
+```bash
+WASMEDGE_SIGHTGLASS_DIR=sightglass-strong \
+WASMEDGE_SIGHTGLASS_KERNEL=tract-onnx-image-classification \
+WASMEDGE_SIGHTGLASS_MODE=IR_JIT \
+WASMEDGE_IR_JIT_OPT_LEVEL=2 \
+WASMEDGE_TIER2_ENABLE=1 WASMEDGE_TIER2_THRESHOLD=10 \
+WASMEDGE_OSR_THRESHOLD=1000000000 \
+WASMEDGE_OSR_MIN_FUNC=12467 WASMEDGE_OSR_MAX_FUNC=12467 \
+WASMEDGE_OSR_MIN_LOOP=0 WASMEDGE_OSR_MAX_LOOP=0 \
+./build/test/ir/wasmedgeIRBenchmarkTests --gtest_filter='*SightglassSuite*'
+```
+
+The impossible OSR threshold (1e9) shows the crash is from compile-time
+IR shape, not from the OSR transition ever firing. The standalone
+`thirdparty/ir/ir` tool reproduces the crash from the saved IR dump.
+
+### Root Cause
+
+`ir_split_partially_dead_node()` (`ir_gcm.c`) walks the use-list of a
+value `ref` and seeds a `totally_useful` block set. The non-PHI branch
+of that walk already skipped uses with `cfg_map[use] == 0` (the use is
+unpinned, e.g. SCCP removed its only live consumer). The PHI branch
+did not.
+
+In the failing IR:
+
+```text
+d_93  = ADD(d_92, c_26)
+d_125 = PHI(l_122, d_93, d_1598)
+```
+
+SCCP had removed the only live consumer of `d_125`, so `d_125` was an
+unpinned dead PHI — it still existed in `d_93`'s use-list, but had no
+CFG block (`cfg_map[d_125] == 0`). The PHI branch treated `d_125` as a
+live use, pulled `d_93`'s position in the PHI into `totally_useful` via
+the MERGE-input mapping, and `_push_predecessors` then walked back from
+those blocks until reaching `START`, whose `predecessors_count` is
+zero.
+
+Debug builds assert in `_push_predecessors` (`IR_ASSERT(n > 0)`).
+Release builds — including the wasmedge consumer where `IR_ASSERT` is
+empty — read past the end of the predecessors array and SIGSEGV.
+
+### Fix
+
+`thirdparty/ir/ir_gcm.c`, `ir_split_partially_dead_node()`: refuse to
+split when any PHI consumer has `cfg_map[use] == 0`. Match the
+scheduler's existing rule for unpinned uses already in place for
+non-PHI uses a few lines below.
+
+```c
+use_list = &ctx->use_lists[ref];
+n = use_list->count;
+for (p = &ctx->use_edges[use_list->refs]; n > 0; p++, n--) {
+    use = *p;
+    insn = &ctx->ir_base[use];
+    if (insn->op == IR_PHI) {
+        if (!ctx->cfg_map[use]) {
+            return 0;
+        }
+        /* … existing PHI handling … */
+    } else {
+        i = ctx->cfg_map[use];
+        if (!i) {
+            continue;
+        }
+        /* … */
+    }
+}
+```
+
+The bail-out (`return 0`) is more conservative than the non-PHI
+`continue`: it declines the whole split rather than dropping the dead
+PHI's contribution. Either form fixes the SEGV; the present form
+matches the spirit of "if any consumer is unpinned, the split's
+reachability set is ill-defined."
+
+### Regression Test
+
+`thirdparty/ir/tests/gcm_dead_phi_001.irt` — compact standalone IR
+where a value has both a real use and a PHI use, SCCP makes the PHI
+dead and unpinned, and GCM tries the split. Aborts in
+`_push_predecessors` (release: SIGSEGV, debug: assertion) without the
+fix. Passes under `--save-ir-after-gcm` with it.
+
+### Related
+
+This bug surfaced alongside the DESSA scratch-clobbering bug in the
+same tract-onnx OSR investigation (see Bug 10 in
+`bugs_x86_code_emission.md`). Both were exposed by the cold OSR
+locals-snapshot stores the tier-1 back-edge emits — they reproduce
+even at `WASMEDGE_OSR_THRESHOLD=1000000000`, so the symptom is from
+compile-time IR shape, not the runtime OSR transition. Both fixes
+are needed: with only the GCM fix, the DESSA miscompile still
+produces a wasm `unreachable` trap at runtime; with only the DESSA
+fix, the GCM crash still happens at compile time.
